@@ -8,17 +8,7 @@
  #endif
  
  #if ALTERNATE_DEBUGGER
-@@ -662,14 +663,17 @@
- #if HYPERVISOR
- 	kernel_bootstrap_thread_log("hv_support_init");
- 	hv_support_init();
-+	kprintf("SONGYUAN: after hv_support_init\n");
- #endif
- 
- #if CONFIG_TELEMETRY
- 	kernel_bootstrap_log("bootprofile_init");
- 	bootprofile_init();
-+	kprintf("SONGYUAN: after bootprofile_init\n");
+@@ -670,6 +671,7 @@
  #endif
  
  	kernel_startup_initialize_upto(STARTUP_SUB_SYSCTL);
@@ -26,7 +16,7 @@
  
  	/*
  	 * Initialize the globals used for permuting kernel
-@@ -683,10 +687,13 @@
+@@ -683,10 +685,13 @@
  	vm_kernel_addrperm_ext = (vm_offset_t)(early_random() | 1);
  	vm_kernel_addrhash_salt = early_random();
  	vm_kernel_addrhash_salt_ext = early_random();
@@ -40,7 +30,7 @@
  #endif
  
  	assert(ml_get_interrupts_enabled() == FALSE);
-@@ -696,6 +703,7 @@
+@@ -696,6 +701,7 @@
  	 * interrupts or preemption enabled may begin enforcement.
  	 */
  	kernel_startup_initialize_upto(STARTUP_SUB_EARLY_BOOT);
@@ -48,34 +38,17 @@
  
  #if SCHED_HYGIENE_DEBUG
  	// Reset interrupts masked timeout before we enable interrupts
-@@ -707,6 +715,7 @@
- 	 * This will start displaying progress to the user, start as early as possible
- 	 */
- 	initialize_screen(NULL, kPEAcquireScreen);
-+	kprintf("SONGYUAN: after initialize_screen\n");
- 
- 	/*
- 	 *	Initialize the shared region module.
 --- a/pexpert/arm/pe_init.c
 +++ b/pexpert/arm/pe_init.c
-@@ -246,7 +246,7 @@
- 	uint32_t        load_kernel_start_value = 0;
+@@ -247,6 +247,7 @@
  	uint32_t        populate_registry_time_value = 0;
  
--	PE_init_printf(TRUE);
-+	kprintf("SONGYUAN: skipped PE_init_printf/vcattach\n");
+ 	PE_init_printf(TRUE);
++	kprintf("SONGYUAN: pe_init_printf done\n");
  
  	printf("iBoot version: %s\n", iBoot_version);
  #if defined(TARGET_OS_OSX) && defined(__arm64__)
-@@ -271,6 +271,7 @@
- 	}
- 
- 	pe_prepare_images();
-+	kprintf("SONGYUAN: pe_prepare_images done\n");
- 
- 	scale = PE_state.video.v_scale;
- 	flip = 1;
-@@ -359,8 +360,11 @@
+@@ -359,7 +360,9 @@
  		KDBG_RELEASE(IOKDBG_CODE(DBG_BOOTER, 0), start_time_value, debug_wait_start_value, load_kernel_start_value, populate_registry_time_value);
  	}
  
@@ -83,7 +56,27 @@
  	InitIOKit(PE_state.deviceTreeHead);
 +	kprintf("SONGYUAN: after InitIOKit\n");
  	ConfigureIOKit();
-+	kprintf("SONGYUAN: after ConfigureIOKit\n");
  }
  
- void
+--- a/osfmk/console/video_console.c
++++ b/osfmk/console/video_console.c
+@@ -3051,6 +3051,7 @@
+ vcattach(void)
+ {
+ 	vm_initialized = TRUE;
++	kprintf("SONGYUAN: vcattach enter\n");
+ 
+ #if defined(CONFIG_VC_PROGRESS_METER_SUPPORT)
+ 	const boot_args * bootargs  = (typeof(bootargs))PE_state.bootArgs;
+@@ -3079,9 +3080,11 @@
+ 
+ 		if (gc_acquired) {
+ 			initialize_screen(NULL, kPEReleaseScreen);
++	kprintf("SONGYUAN: vcattach released\n");
+ 		}
+ 
+ 		initialize_screen(NULL, kPEAcquireScreen);
++	kprintf("SONGYUAN: vcattach acquired, replay %d\n", msgbufp->msg_bufx);
+ 
+ 		for (index = 0; index < msgbufp->msg_bufx; index++) {
+ 			if (msgbufp->msg_bufc[index] == '\0') {
