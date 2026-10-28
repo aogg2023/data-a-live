@@ -1,0 +1,64 @@
+name: gpu-userland
+on:
+  workflow_dispatch:
+
+jobs:
+  pack:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: download the turnip-ci release assets
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          mkdir -p u
+          gh release download turnip-ci -R ShueiTsuki/data-a-live -D u \
+            -p 'vktest' -p 'libvulkan_freedreno.dylib' -p 'NativeAdrenoMetal' \
+            -p 'NativeAdrenoMetal.Info.plist' -p 'mtltest' -p 'SHA256SUMS' -p 'SHA256SUMS.metal'
+          ls -l u
+          ( cd u && sha256sum -c SHA256SUMS || true )
+          ( cd u && sed -e 's|NativeAdrenoMetal.bundle/NativeAdrenoMetal$|NativeAdrenoMetal|' \
+                   -e 's|NativeAdrenoMetal.bundle/Info.plist$|NativeAdrenoMetal.Info.plist|' SHA256SUMS.metal > SHA256SUMS.metal.fixed && sha256sum -c SHA256SUMS.metal.fixed || true )
+
+      - name: GPU trust cache
+        run: |
+          python3 tools/pgputest/mktc.py gpu.tc u/vktest u/libvulkan_freedreno.dylib u/NativeAdrenoMetal u/mtltest
+          ls -l gpu.tc
+
+      - name: plugin clients and backboardd preferences
+        run: |
+          printf 'backboardd vktest mtltest\n' > NativeAdrenoMetal.clients
+          python3 tools/metal/backboardd_prefs.py com.apple.backboardd.plist
+          ls -l com.apple.backboardd.plist
+
+      - name: files.txt
+        run: |
+          E=/System/Library/Extensions
+          {
+            printf 'vktest 755 /usr/libexec/vktest\n'
+            printf 'libvulkan_freedreno.dylib 755 /usr/lib/libvulkan_freedreno.dylib\n'
+            printf -- '- 755 %s\n' "$E/NativeAdrenoMetal.bundle"
+            printf 'NativeAdrenoMetal 755 %s\n' "$E/NativeAdrenoMetal.bundle/NativeAdrenoMetal"
+            printf 'NativeAdrenoMetal.Info.plist 644 %s\n' "$E/NativeAdrenoMetal.bundle/Info.plist"
+            printf 'NativeAdrenoMetal.clients 644 %s\n' "$E/NativeAdrenoMetal.clients"
+            printf 'mtltest 755 /usr/libexec/mtltest\n'
+            printf 'com.apple.backboardd.plist 600 /private/var/mobile/Library/Preferences/com.apple.backboardd.plist\n'
+          } > files.txt
+          cat files.txt
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: gpu-userland
+          path: |
+            u/vktest
+            u/libvulkan_freedreno.dylib
+            u/NativeAdrenoMetal
+            u/NativeAdrenoMetal.Info.plist
+            u/mtltest
+            NativeAdrenoMetal.clients
+            com.apple.backboardd.plist
+            files.txt
+            gpu.tc
+          if-no-files-found: error
