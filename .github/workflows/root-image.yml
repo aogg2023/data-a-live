@@ -1,0 +1,79 @@
+name: songyuan-root
+on:
+  workflow_dispatch:
+    inputs:
+      ipsw_url:
+        description: iPhone X iOS 16.7.16 IPSW
+        default: https://updates.cdn-apple.com/2025FallFCS/fullrestores/122-77006/1158E502-D76D-4226-AA06-ED5E30CD1111/iPhone10,3,iPhone10,6_16.7.16_20H392_Restore.ipsw
+      root_size:
+        description: HFS+ image size
+        default: 12G
+
+jobs:
+  root:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential cmake libfuse3-dev fuse3 hfsprogs rsync \
+            zlib1g-dev libbz2-dev libattr1-dev git unzip wget curl zstd xz-utils python3
+
+      - name: apfs-fuse
+        run: |
+          git clone --depth 1 --recursive https://github.com/sgan81/apfs-fuse.git apfs-fuse
+          cd apfs-fuse && mkdir -p build && cd build
+          cmake -DUSE_FUSE3=ON .. >/dev/null && make -s -j"$(nproc)"
+          sudo install -m 755 apfs-fuse apfsutil /usr/local/bin/
+          command -v apfs-fuse
+
+      - name: IPSW
+        run: |
+          curl -L --retry 5 -o ipsw.zip "${{ inputs.ipsw_url }}"
+          ls -l ipsw.zip
+          unzip -o -q ipsw.zip 087-86698-044.dmg 087-86593-047.dmg 087-86715-047.dmg \
+            Firmware/all_flash/DeviceTree.d22ap.im4p BuildManifest.plist
+          ls -l *.dmg Firmware/all_flash/DeviceTree.d22ap.im4p
+
+      - name: mkiosroot tools
+        run: |
+          git clone --depth 1 https://github.com/bangprovn/ios-fuxi.git ios-fuxi
+          ls ios-fuxi/tools/mkiosroot.sh
+          sudo chmod +x ios-fuxi/tools/mkiosroot.sh
+
+      - name: build the HFS+ root image
+        run: |
+          sudo -E bash ios-fuxi/tools/mkiosroot.sh \
+            087-86698-044.dmg 087-86593-047.dmg 087-86715-047.dmg root.img "${{ inputs.root_size }}"
+          ls -l root.img
+          sudo chown "$(id -u):$(id -g)" root.img
+
+      - name: pinfile (NDK)
+        run: |
+          NDK=$(ls -d /usr/local/lib/android/sdk/ndk/* 2>/dev/null | tail -1)
+          echo "NDK=$NDK"
+          TC="$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/clang"
+          "$TC" --target=aarch64-linux-android31 -static -O2 -Wall -Wextra -Werror \
+            -o pinfile tools/pinfile/pinfile.c
+          sha256sum pinfile
+
+      - name: compress and split
+        run: |
+          zstd -T0 -19 -o root.img.zst root.img
+          rm -f root.img
+          split -b 1500M -d root.img.zst root.img.zst.part.
+          sha256sum root.img.zst.part.* pinfile > SHA256SUMS
+          ls -l root.img.zst.part.* pinfile SHA256SUMS
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: songyuan-root-image
+          path: |
+            root.img.zst.part.*
+            SHA256SUMS
+            pinfile
+          compression-level: 0
+          if-no-files-found: error
