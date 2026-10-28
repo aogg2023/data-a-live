@@ -1,0 +1,41 @@
+name: publish-root
+on:
+  workflow_dispatch:
+    inputs:
+      run_id:
+        description: Actions run id that holds songyuan-root-image
+        default: "40657960768"
+
+permissions:
+  contents: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - name: download the artifact
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh run download "${{ inputs.run_id }}" -n songyuan-root-image -D art -R "$GITHUB_REPOSITORY"
+          ls -l art
+
+      - name: publish as release assets (permanent, resumable)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="iosroot-16.7.16-20261028"
+          if ! gh release view "$TAG" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release create "$TAG" -R "$GITHUB_REPOSITORY" \
+              --title "songyuan iOS 16.7.16 root image" \
+              --notes "HFS+ root image built from the data-a-live pipeline (mkiosroot) for the songyuan port. Join the .part files, verify SHA256SUMS, then unzip."
+          fi
+          for f in art/*; do
+            name=$(basename "$f")
+            if gh release view "$TAG" -R "$GITHUB_REPOSITORY" --json assets -q '.assets[].name' | grep -qx "$name"; then
+              echo "already attached: $name"; continue
+            fi
+            gh release upload "$TAG" "$f" -R "$GITHUB_REPOSITORY"
+          done
+          gh release view "$TAG" -R "$GITHUB_REPOSITORY" --json assets -q '.assets[] | "\(.name) \(.size)"'
