@@ -22,6 +22,12 @@ jobs:
           sudo apt-get install -y build-essential cmake libfuse3-dev fuse3 hfsprogs rsync \
             zlib1g-dev libbz2-dev libattr1-dev git unzip wget curl zstd xz-utils python3
 
+      - name: hfsplus module
+        run: |
+          sudo apt-get install -y linux-modules-extra-"$(uname -r)" || sudo apt-get install -y linux-modules-extra-azure || true
+          sudo modprobe hfsplus || true
+          grep hfsplus /proc/filesystems || (echo 'hfsplus still missing' && exit 1)
+
       - name: apfs-fuse
         run: |
           git clone --depth 1 --recursive https://github.com/sgan81/apfs-fuse.git apfs-fuse
