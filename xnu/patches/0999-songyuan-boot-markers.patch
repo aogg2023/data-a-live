@@ -1,0 +1,28 @@
+--- a/osfmk/kern/startup.c
++++ b/osfmk/kern/startup.c
+@@ -653,6 +653,7 @@
+ #if MACH_KDP
+ 	kernel_bootstrap_log("kdp_init");
+ 	kdp_init();
++	kprintf("SONGYUAN: after kdp_init\n");
+ #endif
+ 
+ #if ALTERNATE_DEBUGGER
+@@ -662,14 +663,17 @@
+ #if HYPERVISOR
+ 	kernel_bootstrap_thread_log("hv_support_init");
+ 	hv_support_init();
++	kprintf("SONGYUAN: after hv_support_init\n");
+ #endif
+ 
+ #if CONFIG_TELEMETRY
+ 	kernel_bootstrap_log("bootprofile_init");
+ 	bootprofile_init();
++	kprintf("SONGYUAN: after bootprofile_init\n");
+ #endif
+ 
+ 	kernel_startup_initialize_upto(STARTUP_SUB_SYSCTL);
++	kprintf("SONGYUAN: after startup_initialize_upto\n");
+ 
+ 	/*
+ 	 * Initialize the globals used for permuting kernel
