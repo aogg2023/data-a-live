@@ -58,15 +58,16 @@
  	 *	Initialize the shared region module.
 --- a/pexpert/arm/pe_init.c
 +++ b/pexpert/arm/pe_init.c
-@@ -247,6 +247,7 @@
+@@ -246,7 +246,7 @@
+ 	uint32_t        load_kernel_start_value = 0;
  	uint32_t        populate_registry_time_value = 0;
  
- 	PE_init_printf(TRUE);
-+	kprintf("SONGYUAN: pe_init_printf done\n");
+-	PE_init_printf(TRUE);
++	kprintf("SONGYUAN: skipped PE_init_printf/vcattach\n");
  
  	printf("iBoot version: %s\n", iBoot_version);
  #if defined(TARGET_OS_OSX) && defined(__arm64__)
-@@ -271,6 +272,7 @@
+@@ -271,6 +271,7 @@
  	}
  
  	pe_prepare_images();
@@ -74,7 +75,7 @@
  
  	scale = PE_state.video.v_scale;
  	flip = 1;
-@@ -359,8 +361,11 @@
+@@ -359,8 +360,11 @@
  		KDBG_RELEASE(IOKDBG_CODE(DBG_BOOTER, 0), start_time_value, debug_wait_start_value, load_kernel_start_value, populate_registry_time_value);
  	}
  
