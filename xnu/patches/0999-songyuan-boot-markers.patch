@@ -35,7 +35,9 @@
  #ifdef  IOKIT
  	kernel_bootstrap_log("PE_init_iokit");
  	PE_init_iokit();
-+	kprintf("SONGYUAN: after PE_init_iokit\n");
++	kprintf("SONGYUAN: enter PE_init_iokit\n");
+	PE_init_iokit();
+	kprintf("SONGYUAN: after PE_init_iokit\n");
  #endif
  
  	assert(ml_get_interrupts_enabled() == FALSE);
@@ -55,3 +57,33 @@
  
  	/*
  	 *	Initialize the shared region module.
+--- a/pexpert/arm/pe_init.c
++++ b/pexpert/arm/pe_init.c
+@@ -247,6 +247,7 @@
+ 	uint32_t        populate_registry_time_value = 0;
+ 
+ 	PE_init_printf(TRUE);
++	kprintf("SONGYUAN: pe_init_printf done\n");
+ 
+ 	printf("iBoot version: %s\n", iBoot_version);
+ #if defined(TARGET_OS_OSX) && defined(__arm64__)
+@@ -271,6 +272,7 @@
+ 	}
+ 
+ 	pe_prepare_images();
++	kprintf("SONGYUAN: pe_prepare_images done\n");
+ 
+ 	scale = PE_state.video.v_scale;
+ 	flip = 1;
+@@ -360,7 +362,9 @@
+ 	}
+ 
+ 	InitIOKit(PE_state.deviceTreeHead);
++	kprintf("SONGYUAN: enter InitIOKit\n");
+	InitIOKit(PE_state.deviceTreeHead);
+	kprintf("SONGYUAN: after InitIOKit\n");
+ 	ConfigureIOKit();
++	kprintf("SONGYUAN: after ConfigureIOKit\n");
+ }
+ 
+ void
