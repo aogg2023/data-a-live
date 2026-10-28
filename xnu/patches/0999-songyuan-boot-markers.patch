@@ -26,7 +26,7 @@
  
  	/*
  	 * Initialize the globals used for permuting kernel
-@@ -683,10 +687,12 @@
+@@ -683,10 +687,13 @@
  	vm_kernel_addrperm_ext = (vm_offset_t)(early_random() | 1);
  	vm_kernel_addrhash_salt = early_random();
  	vm_kernel_addrhash_salt_ext = early_random();
@@ -34,14 +34,13 @@
  
  #ifdef  IOKIT
  	kernel_bootstrap_log("PE_init_iokit");
- 	PE_init_iokit();
 +	kprintf("SONGYUAN: enter PE_init_iokit\n");
-	PE_init_iokit();
-	kprintf("SONGYUAN: after PE_init_iokit\n");
+ 	PE_init_iokit();
++	kprintf("SONGYUAN: after PE_init_iokit\n");
  #endif
  
  	assert(ml_get_interrupts_enabled() == FALSE);
-@@ -696,6 +702,7 @@
+@@ -696,6 +703,7 @@
  	 * interrupts or preemption enabled may begin enforcement.
  	 */
  	kernel_startup_initialize_upto(STARTUP_SUB_EARLY_BOOT);
@@ -49,7 +48,7 @@
  
  #if SCHED_HYGIENE_DEBUG
  	// Reset interrupts masked timeout before we enable interrupts
-@@ -707,6 +714,7 @@
+@@ -707,6 +715,7 @@
  	 * This will start displaying progress to the user, start as early as possible
  	 */
  	initialize_screen(NULL, kPEAcquireScreen);
@@ -75,13 +74,13 @@
  
  	scale = PE_state.video.v_scale;
  	flip = 1;
-@@ -360,7 +362,9 @@
+@@ -359,8 +361,11 @@
+ 		KDBG_RELEASE(IOKDBG_CODE(DBG_BOOTER, 0), start_time_value, debug_wait_start_value, load_kernel_start_value, populate_registry_time_value);
  	}
  
- 	InitIOKit(PE_state.deviceTreeHead);
 +	kprintf("SONGYUAN: enter InitIOKit\n");
-	InitIOKit(PE_state.deviceTreeHead);
-	kprintf("SONGYUAN: after InitIOKit\n");
+ 	InitIOKit(PE_state.deviceTreeHead);
++	kprintf("SONGYUAN: after InitIOKit\n");
  	ConfigureIOKit();
 +	kprintf("SONGYUAN: after ConfigureIOKit\n");
  }
