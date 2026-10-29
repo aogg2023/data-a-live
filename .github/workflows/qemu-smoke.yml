@@ -34,7 +34,7 @@ jobs:
 
       - name: ios-sweet qemu tools
         run: |
-          git clone -q --depth 1 https://github.com/dip-studio/ios-sweet iossweet || true
+          git clone -q --depth 1 https://github.com/dipa-studio/ios-sweet iossweet || true
           ls iossweet/tools | head -20
 
       - name: build qemu payload (pandora twin ADT)
