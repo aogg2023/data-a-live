@@ -39,8 +39,11 @@ jobs:
 
       - name: symbolize
         run: |
-          DSC=$(find dsc -name 'dyld_shared_cache_arm64' | head -1)
-          echo "cache $DSC"; ls -l "$DSC"
+          ./t/ipsw dyld --help 2>&1 | head -20 || true
+          echo "== extracted:"; find dsc -maxdepth 3 | head -30
+          DSC=$(find dsc -type f -name 'dyld_shared_cache_arm64*' | head -1)
+          if [ -z "$DSC" ]; then DSC=$(find dsc -type d -name 'dyld_shared_cache_arm64*' | head -1); fi
+          echo "cache [$DSC]"; ls -ld "$DSC" || true
           : > syms.txt
           for a in ${{ inputs.addrs }}; do
             for s in ${{ inputs.slides }}; do
