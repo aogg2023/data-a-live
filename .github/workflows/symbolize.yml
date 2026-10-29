@@ -23,7 +23,7 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          gh release download --repo blacktop/ipsw --pattern '*linux_x86_64.tar.gz' --dir t --clobber
+          gh release download --repo blacktop/ipsw --pattern 'ipsw_*linux_x86_64.tar.gz' --dir t --clobber
           tar -xzf t/*linux_x86_64.tar.gz -C t
           find t -name ipsw -type f | head
           ./t/ipsw version || true
