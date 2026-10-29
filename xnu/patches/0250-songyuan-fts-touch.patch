@@ -12,10 +12,10 @@ index 98d9d17..7917dcc 100644
  bsd/dev/pandora_gpi.c			standard
 diff --git a/bsd/dev/songyuan_touch.c b/bsd/dev/songyuan_touch.c
 new file mode 100644
-index 0000000..d3854fe
+index 0000000..0fd4a33
 --- /dev/null
 +++ b/bsd/dev/songyuan_touch.c
-@@ -0,0 +1,2545 @@
+@@ -0,0 +1,2620 @@
 +/*
 + * SONGYUAN (Redmi K90 Pro Max, SM8850) main screen touch: FocalTech FT3683 on
 + * QUPv3 wrapper 4 SE0 (0x01a80000), polled through the wrapper's GPI DMA.
@@ -1870,6 +1870,80 @@ index 0000000..d3854fe
 +
 +
 +/*
++ * SPI by hand on the four pads, with the serial engine out of the loop: 48 is
++ * sampled, 49 and 50 are driven, 51 is the chip select, mode 0, ~200 kHz. This is
++ * the "does the chip answer at all" test that no GENI configuration can hide: the
++ * same two frames the driver uses (read 0xA3, and the FocalTech ROM boot-id
++ * sequence {0x55,0xAA} then command 0x90) are clocked out bit by bit.
++ */
++static void
++sy_bb_byte(const uint8_t out, uint8_t *in)
++{
++	uint8_t v = 0;
++	for (unsigned b = 0; b < 8; b++) {
++		sy_wr(sy.tlmm, SY_GPIO(49) + 4, ((out >> (7 - b)) & 1u) ? 2u : 0u);
++		delay(1);
++		sy_wr(sy.tlmm, SY_GPIO(50) + 4, 2);	/* clock high: sample */
++		delay(1);
++		v = (uint8_t)((v << 1) | (sy_rd(sy.tlmm, SY_GPIO(48) + 4) & 1u));
++		sy_wr(sy.tlmm, SY_GPIO(50) + 4, 0);	/* clock low */
++		delay(1);
++	}
++	*in = v;
++}
++
++static void
++sy_bb_frame(const uint8_t *tx, unsigned n, uint8_t *rx)
++{
++	sy_wr(sy.tlmm, SY_GPIO(51) + 4, 0);	/* chip select low */
++	delay(2);
++	for (unsigned i = 0; i < n; i++) {
++		sy_bb_byte(tx[i], &rx[i]);
++	}
++	delay(2);
++	sy_wr(sy.tlmm, SY_GPIO(51) + 4, 2);	/* chip select high */
++	delay(150);				/* the 150 us the frame needs */
++}
++
++static void
++sy_bitbang_probe(void)
++{
++	static const uint8_t rd_a3[10] = {0xa3, 0xa0, 0x00, 0x01, 0, 0, 0, 0, 0, 0};
++	static const uint8_t start[8] = {0x55, 0x00, 0x00, 0x01, 0, 0, 0, 0xaa};
++	static const uint8_t rd_rom[11] = {0x90, 0xa0, 0x00, 0x02, 0, 0, 0, 0, 0, 0, 0};
++	uint8_t rx[11];
++
++	printf("SONGYUAN TOUCH: bit-bang SPI probe on GPIO 48-51 (~200 kHz, engine unused)\n");
++	sy_gpio(48, 0, 3, 4, -1, true);		/* MISO: input, pull-up */
++	sy_gpio(49, 0, 0, 4, 0, true);		/* MOSI: output low */
++	sy_gpio(50, 0, 0, 4, 0, true);		/* CLK: output low */
++	sy_gpio(51, 0, 3, 4, 1, true);		/* CS: output high */
++	delay(100);
++	memset(rx, 0, sizeof(rx));
++	sy_bb_frame(rd_a3, sizeof(rd_a3), rx);
++	printf("SONGYUAN TOUCH: bit-bang read 0xA3:");
++	sy_hex(" rx", rx, sizeof(rd_a3));
++	printf(" (status %02x, id at byte 7: %02x)\n", rx[3], rx[7]);
++	/* Only when the plain read did not answer: {0x55,0xAA} puts a FocalTech chip
++	 * into its ROM bootloader, so it is not sent to a chip that just answered. */
++	if (rx[7] == 0x00 || rx[7] == 0xff) {
++		memset(rx, 0, sizeof(rx));
++		sy_bb_frame(start, sizeof(start), rx);
++		delay(12000);			/* FTS_CMD_START_DELAY = 12 ms */
++		memset(rx, 0, sizeof(rx));
++		sy_bb_frame(rd_rom, sizeof(rd_rom), rx);
++		printf("SONGYUAN TOUCH: bit-bang ROM boot-id:");
++		sy_hex(" rx", rx, sizeof(rd_rom));
++		printf(" (id at bytes 7-8: %02x %02x)\n", rx[7], rx[8]);
++	}
++	/* Back to qup4_se0 function 1 for the serial engine. */
++	sy_gpio(48, SY_FUNC_QUP4_SE0, 0, 6, -1, true);
++	sy_gpio(49, SY_FUNC_QUP4_SE0, 0, 6, -1, true);
++	sy_gpio(50, SY_FUNC_QUP4_SE0, 0, 4, -1, true);
++	sy_gpio(51, SY_FUNC_QUP4_SE0, 3, 6, -1, true);
++}
++
++/*
 + * Is the chip's firmware running? After reset a FocalTech controller streams
 + * frames and pulls its IRQ line low again and again (Android's dmesg shows a
 + * continuous THP stream after reset). Count the edges on GPIO 158 for ~20 ms: no
@@ -2475,6 +2549,7 @@ index 0000000..d3854fe
 +	sy_power_on(rpmh != 0);
 +	sy_pad_probe();		/* are the pads driven, and by whom, with the chip powered */
 +	sy_irq_activity();	/* does the chip's firmware pull IRQ at all */
++	sy_bitbang_probe();	/* the same frames by hand, engine unused */
 +	if ((err = sy_fts_setup())) {
 +		printf("SONGYUAN TOUCH: FTS start failed %d\n", err);
 +		sy_pins_dump("after failed start");
