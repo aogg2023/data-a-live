@@ -12,10 +12,10 @@ index 98d9d17..7917dcc 100644
  bsd/dev/pandora_gpi.c			standard
 diff --git a/bsd/dev/songyuan_touch.c b/bsd/dev/songyuan_touch.c
 new file mode 100644
-index 0000000..db62167
+index 0000000..85905aa
 --- /dev/null
 +++ b/bsd/dev/songyuan_touch.c
-@@ -0,0 +1,2261 @@
+@@ -0,0 +1,2407 @@
 +/*
 + * SONGYUAN (Redmi K90 Pro Max, SM8850) main screen touch: FocalTech FT3683 on
 + * QUPv3 wrapper 4 SE0 (0x01a80000), polled through the wrapper's GPI DMA.
@@ -879,6 +879,32 @@ index 0000000..db62167
 +	sy_wr(sy.se, SE_M_CLK_CFG, (div << SE_CLK_DIV_SHIFT) | SE_SER_CLK_EN);
 +}
 +
++/*
++ * Select the engine's transfer mode: FIFO/PIO (path 1, GeniSpi.c:99-101) or the
++ * SE's own DMA master (path 0, GeniSpi.c:113-118). Kept separate because the
++ * boot self-test runs both modes to find out which one actually carries data.
++ */
++static void
++sy_engine_select(unsigned path)
++{
++	sy_wr(sy.se, SE_M_IRQ_CLR, 0xffffffffu);
++	sy_wr(sy.se, SE_S_IRQ_CLR, 0xffffffffu);
++	sy_wr(sy.se, SE_DMA_TX_CLR, 0xffffffffu);
++	sy_wr(sy.se, SE_DMA_RX_CLR, 0xffffffffu);
++	sy_wr(sy.se, SE_GSI_EVENT_EN, 0);
++	if (path == 0) {
++		sy_wr(sy.se, SE_M_IRQ_EN, sy_rd(sy.se, SE_M_IRQ_EN) &
++		    ~(SE_M_CMD_DONE | SE_M_TX_FIFO_WATERMARK | SE_M_RX_FIFO_WATERMARK |
++		    SE_M_RX_FIFO_LAST));
++		sy_wr(sy.se, SE_DMA_MODE, sy_rd(sy.se, SE_DMA_MODE) | 1u);
++	} else {
++		sy_wr(sy.se, SE_M_IRQ_EN, sy_rd(sy.se, SE_M_IRQ_EN) |
++		    (SE_M_CMD_DONE | SE_M_TX_FIFO_WATERMARK | SE_M_RX_FIFO_WATERMARK |
++		    SE_M_RX_FIFO_LAST));
++		sy_wr(sy.se, SE_DMA_MODE, sy_rd(sy.se, SE_DMA_MODE) & ~1u);
++	}
++}
++
 +/* GeniSpi.c:199-209: poll one of the M interrupt status bits, clearing what is latched. */
 +static int
 +sy_geni_wait(uint32_t bits, unsigned limit)
@@ -1175,22 +1201,7 @@ index 0000000..db62167
 +		    ~SE_SPI_CS_TOGGLE);
 +		sy_geni_word_len();
 +		sy_geni_clock();
-+		sy_wr(sy.se, SE_M_IRQ_CLR, 0xffffffffu);
-+		sy_wr(sy.se, SE_DMA_TX_CLR, 0xffffffffu);
-+		sy_wr(sy.se, SE_DMA_RX_CLR, 0xffffffffu);
-+		if (sy.path == 0) {
-+			/* GeniSpi.c:113-118: FIFO interrupt sources off, engine's DMA master on. */
-+			sy_wr(sy.se, SE_M_IRQ_EN, sy_rd(sy.se, SE_M_IRQ_EN) &
-+			    ~(SE_M_CMD_DONE | SE_M_TX_FIFO_WATERMARK |
-+			    SE_M_RX_FIFO_WATERMARK | SE_M_RX_FIFO_LAST));
-+			sy_wr(sy.se, SE_DMA_MODE, sy_rd(sy.se, SE_DMA_MODE) | 1u);
-+		} else {
-+			/* GeniSpi.c:99-101: FIFO/PIO mode for the variant sweep. */
-+			sy_wr(sy.se, SE_M_IRQ_EN, sy_rd(sy.se, SE_M_IRQ_EN) |
-+			    (SE_M_CMD_DONE | SE_M_TX_FIFO_WATERMARK |
-+			    SE_M_RX_FIFO_WATERMARK | SE_M_RX_FIFO_LAST));
-+			sy_wr(sy.se, SE_DMA_MODE, sy_rd(sy.se, SE_DMA_MODE) & ~1u);
-+		}
++		sy_engine_select(sy.path);
 +	} else {
 +		/* PAND:504-520 unchanged: geni_se_select_mode(GENI_GPI_DMA). */
 +		sy_wr(sy.se, SE_GSI_EVENT_EN, 0);
@@ -1710,6 +1721,104 @@ index 0000000..db62167
 +	return err;
 +}
 +
++/*
++ * Engine self-test, before the chip is touched: with SE_SPI_LOOPBACK set the
++ * serial engine returns its own MOSI on MISO, so a frame whose RX equals TX
++ * proves the packing, clock, TX/RX DMA and the cache maintenance are right. This
++ * is what separates "our SE configuration is wrong" from "the chip does not
++ * answer": it runs on every boot and prints one line.
++ */
++static void
++sy_self_test(void)
++{
++	static const uint8_t tx[6] = {0xa5, 0x5a, 0x11, 0x22, 0x33, 0x44};
++	uint8_t rx[6];
++	bool dma_ok = false, fifo_ok = false;
++	unsigned saved;
++
++	if (sy.path == 2) {
++		printf("SONGYUAN TOUCH: engine self-test skipped on the GPI path\n");
++		return;
++	}
++	/* Same frame through both engine modes, each with the SE's loopback on, so the
++	 * result says which mode carries TX back on RX (and whether the SE DMA path
++	 * itself is the problem). FIFO is programmed here only for the test. */
++	saved = sy.path;
++	sy.path = 0;
++	sy_engine_select(0);
++	memset(rx, 0, sizeof(rx));
++	{
++		static const char *nm = "SE DMA";
++		int err;
++		bool same = true;
++		sy_wr(sy.se, SE_SPI_LOOPBACK, 1);
++		err = sy_spi_dma(tx, rx, sizeof(tx));
++		sy_wr(sy.se, SE_SPI_LOOPBACK, 0);
++		for (unsigned i = 0; i < sizeof(tx); i++) {
++			same = same && tx[i] == rx[i];
++		}
++		printf("SONGYUAN TOUCH: loopback %s err %d %s:", nm, err, same ? "RX==TX" : "RX!=TX");
++		sy_hex(" tx", tx, sizeof(tx));
++		sy_hex(" rx", rx, sizeof(rx));
++		printf("\n");
++		dma_ok = same;
++	}
++	sy.path = 1;
++	sy_engine_select(1);
++	memset(rx, 0, sizeof(rx));
++	{
++		int err;
++		bool same = true;
++		sy_wr(sy.se, SE_SPI_LOOPBACK, 1);
++		err = sy_spi_fifo(tx, rx, sizeof(tx));
++		sy_wr(sy.se, SE_SPI_LOOPBACK, 0);
++		for (unsigned i = 0; i < sizeof(tx); i++) {
++			same = same && tx[i] == rx[i];
++		}
++		printf("SONGYUAN TOUCH: loopback FIFO err %d %s:", err, same ? "RX==TX" : "RX!=TX");
++		sy_hex(" tx", tx, sizeof(tx));
++		sy_hex(" rx", rx, sizeof(rx));
++		printf("\n");
++		fifo_ok = same;
++	}
++	sy.path = saved;
++	sy_engine_select(sy.path);
++	if (!dma_ok && fifo_ok && sy.path == 0) {
++		printf("SONGYUAN TOUCH: SE DMA loopback is broken but FIFO/PIO loopback works; "
++		    "using the FIFO/PIO data path\n");
++		sy.path = 1;
++	}
++	sy_engine_select(sy.path);
++}
++
++/*
++ * The four SPI pads as plain TLMM inputs with each pull setting: a pad that the
++ * chip (or another block) drives reads the same with pull-up and pull-down, one
++ * that is floating follows the pull. This tells whether the chip drives MISO at
++ * all, and which of the four is the chip's output, without a scope.
++ */
++static void
++sy_pad_probe(void)
++{
++	static const unsigned pins[4] = {48, 49, 50, 51};
++	printf("SONGYUAN TOUCH: pads (up/down):");
++	for (unsigned i = 0; i < 4; i++) {
++		uint32_t up, down;
++		sy_gpio(pins[i], 0, 3, 6, -1, true);	/* input, pull-up */
++		delay(50);
++		up = sy_rd(sy.tlmm, SY_GPIO(pins[i]) + 4) & 1u;
++		sy_gpio(pins[i], 0, 1, 6, -1, true);	/* input, pull-down */
++		delay(50);
++		down = sy_rd(sy.tlmm, SY_GPIO(pins[i]) + 4) & 1u;
++		printf(" %u=%u/%u", pins[i], up, down);
++	}
++	printf("\n");
++	sy_gpio(48, SY_FUNC_QUP4_SE0, 0, 6, -1, true);
++	sy_gpio(49, SY_FUNC_QUP4_SE0, 0, 6, -1, true);
++	sy_gpio(50, SY_FUNC_QUP4_SE0, 0, 4, -1, true);
++	sy_gpio(51, SY_FUNC_QUP4_SE0, 3, 6, -1, true);
++}
++
 +
 +/* ---- FocalTech protocol ---------------------------------------------------------- */
 +
@@ -1833,23 +1942,33 @@ index 0000000..db62167
 +}
 +
 +/*
-+ * Power-on in the stock order (MYRONC:230-245): reset level low before its
-+ * output enable (no glitch high), 2 ms, avdd on (GPIO 117 high), 3 ms, the
-+ * iovdd vote through the apps RSC (L4I_E0 1.8 V, PAND:1430-1433 votes it before
-+ * the reset is released too), reset high, then 200 ms of firmware boot. The pins
-+ * are muxed first: SPI 48-51 as qup4_se0 function 1 with the board data's drive
-+ * and pull (MYRON:48-50), IRQ as an input with a pull-up (MYRON:51), reset and
-+ * avdd as outputs (MYRON:52). avdd is the pin (MYRON:45); iovdd is the rail
-+ * nothing else has voted, so without it the chip never answers.
++ * Mux the touch pins: SPI 48-51 as qup4_se0 function 1 with the board data's
++ * drive and pull (MYRON:48-50), IRQ as an input with a pull-up (MYRON:51). Kept
++ * apart from the power sequence so the engine self-test can run with the pads on
++ * the serial engine (a pad-level loopback needs them) before the chip is up.
 + */
 +static void
-+sy_power_on(bool vote)
++sy_pins_config(void)
 +{
 +	sy_gpio(48, SY_FUNC_QUP4_SE0, 0, 6, -1, true);		/* MISO, 6 mA, no pull */
 +	sy_gpio(49, SY_FUNC_QUP4_SE0, 0, 6, -1, true);		/* MOSI */
 +	sy_gpio(50, SY_FUNC_QUP4_SE0, 0, 4, -1, true);		/* CLK, 4 mA */
 +	sy_gpio(51, SY_FUNC_QUP4_SE0, 3, 6, -1, true);		/* CS, 6 mA, pull-up */
 +	sy_gpio(SY_IRQ, 0, 3, 2, -1, false);			/* input, pull-up */
++}
++
++/*
++ * Power-on in the stock order (MYRONC:230-245): reset level low before its
++ * output enable (no glitch high), 2 ms, avdd on (GPIO 117 high), 3 ms, the
++ * iovdd vote through the apps RSC (L4I_E0 1.8 V, PAND:1430-1433 votes it before
++ * the reset is released too), reset high, then 200 ms of firmware boot. reset
++ * and avdd are outputs (MYRON:52). avdd is the pin (MYRON:45); iovdd is the rail
++ * nothing else has voted, so without it the chip never answers.
++ */
++static void
++sy_power_on(bool vote)
++{
++	sy_pins_config();
 +	sy_gpio(SY_RESET, 0, 0, 4, 0, false);			/* level low first */
 +	sy_sleep(2);
 +	sy_gpio(SY_AVDD, 0, 0, 4, 1, false);			/* avdd on */
@@ -2098,12 +2217,36 @@ index 0000000..db62167
 +	return 0;
 +}
 +
++/*
++ * The FocalTech reference driver's other way to ask "is this chip alive": when the
++ * normal chip id (0xA3/0x9F) does not answer it reads the ROM bootloader's id with
++ * {0x55, 0xAA} then command 0x90 (focaltech_core.c:536-567, focaltech_common.h:75-
++ * 80: FTS_CMD_START1/2, START_DELAY 12 ms, FTS_CMD_READ_ID 0x90, 4-byte cmd).
++ * The frame shapes are the ordinary write/read ones, so the normal helpers send
++ * them: write address 0x55 with the single data byte 0xAA, then read two bytes
++ * from 0x90. Diagnostic only - the caller has already decided the chip id failed.
++ */
++static void
++sy_fts_rom_id(void)
++{
++	static const uint8_t start = 0xaa;
++	uint8_t id[2] = {0, 0};
++	int w, r;
++
++	w = sy_fts_write(0x55, &start, 1);
++	delay(12000);		/* FTS_CMD_START_DELAY = 12 ms, in microseconds */
++	r = sy_fts_read(0x90, id, 2);
++	printf("SONGYUAN TOUCH: ROM boot-id probe: start command err %d, command 0x90 err %d, "
++	    "id %02x %02x\n", w, r, id[0], id[1]);
++}
++
 +/* Identify and TIC, without touching reset: what follows sy_power_on(). */
 +static int
 +sy_fts_setup(void)
 +{
 +	int err;
 +	if ((err = sy_fts_chip_id())) {
++		sy_fts_rom_id();	/* diagnostic: chip in its ROM loader, or mute? */
 +		return err;
 +	}
 +	return sy_fts_tic();
@@ -2189,8 +2332,11 @@ index 0000000..db62167
 +		printf("SONGYUAN TOUCH: engine set-up failed %d\n", err);
 +		goto out;
 +	}
++	sy_pins_config();	/* pads on the serial engine before the loopback test */
++	sy_self_test();		/* engine loopback, both modes, independent of the chip */
 +	sy_pins_dump("before");
 +	sy_power_on(rpmh != 0);
++	sy_pad_probe();		/* are the pads driven, and by whom, with the chip powered */
 +	if ((err = sy_fts_setup())) {
 +		printf("SONGYUAN TOUCH: FTS start failed %d\n", err);
 +		sy_pins_dump("after failed start");
