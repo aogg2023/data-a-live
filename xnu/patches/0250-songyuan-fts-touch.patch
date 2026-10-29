@@ -12,7 +12,7 @@ index 98d9d17..7917dcc 100644
  bsd/dev/pandora_gpi.c			standard
 diff --git a/bsd/dev/songyuan_touch.c b/bsd/dev/songyuan_touch.c
 new file mode 100644
-index 0000000..0cde18b
+index 0000000..218f663
 --- /dev/null
 +++ b/bsd/dev/songyuan_touch.c
 @@ -0,0 +1,1263 @@
@@ -60,7 +60,7 @@ index 0000000..0cde18b
 + * compiles to nothing and songyuan_touch_init() fails to link - a loud failure,
 + * but the flag itself is not in the evidence read for this port.
 + */
-+#if defined(SONGYUAN)
++#if defined(SONGYUAN) || defined(PANDORA)
 +#include <sys/param.h>
 +#include <sys/systm.h>
 +#include <sys/errno.h>
@@ -1278,7 +1278,7 @@ index 0000000..0cde18b
 +		printf("SONGYUAN TOUCH: no thread\n");
 +	}
 +}
-+#endif /* SONGYUAN */
++#endif /* SONGYUAN || PANDORA */
 diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
 index 716d6c2..7aea6f8 100644
 --- a/bsd/dev/sweet_ufs.c
