@@ -2,61 +2,50 @@ name: symbolize
 on:
   workflow_dispatch:
     inputs:
-      run_id:
-        description: run holding songyuan-root-image
-        default: "40791129964"
+      addrs:
+        description: space separated addresses
+        default: "0x211591ad0 0x220a88140 0x1d0c097b8 0x1d0b70bc0 0x1d0c36238 0x1d0b5fbb8 0x1d0b5fb20 0x23fb78c64 0x1dcccf0f4 0x23fb78bf4 0x1d0c36238 0x1dcb18780 0x1dcafaa50 0x23fb77af4 0x211591030 0x2115a2b18 0x2115a2db8 0x211591524 0x1d5ddc148 0x1d5ddd2e0 0x1d5de1d20 0x1009b7e40 0x1f35a4344"
+      slides:
+        description: candidate slides (space separated)
+        default: "0x4ef80000 0x0"
 
 jobs:
   sym:
     runs-on: ubuntu-24.04
-    timeout-minutes: 90
+    timeout-minutes: 120
     steps:
-      - uses: actions/checkout@v4
-
       - name: deps
         run: |
           sudo apt-get update
-          sudo apt-get install -y hfsprogs zstd unzip curl
-          sudo apt-get install -y linux-modules-extra-"$(uname -r)" || true
-          sudo modprobe hfsplus || true
-          grep hfsplus /proc/filesystems
-
-      - name: root image
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          gh run download "${{ inputs.run_id }}" -n songyuan-root-image -D art -R "$GITHUB_REPOSITORY"
-          cat art/root.img.zst.part.* > root.img.zst
-          zstd -d -q -o root.img root.img.zst
-          ls -l root.img
-
-      - name: dyld shared cache
-        run: |
-          sudo mkdir -p /mnt/ios
-          sudo mount -t hfsplus -o loop,force root.img /mnt/ios
-          ls /mnt/ios/System/Library/Caches/com.apple.dyld/ | head
-          ls -l /mnt/ios/System/Library/Caches/com.apple.dyld/dyld_shared_cache_arm64
+          sudo apt-get install -y curl unzip gh jq
 
       - name: ipsw tool
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          gh release download --repo blacktop/ipsw --pattern 'ipsw_linux_amd64.tar.gz' --dir ipswdl --clobber
-          tar -xzf ipswdl/ipsw_linux_amd64.tar.gz -C ipswdl
-          find ipswdl -name ipsw -type f -exec cp {} ./ipsw \;
-          chmod +x ipsw && ./ipsw version || true
-          ./ipsw dyld a2s --help 2>&1 | head -20 || true
+          gh release download --repo blacktop/ipsw --pattern '*linux_x86_64.tar.gz' --dir t --clobber
+          tar -xzf t/*linux_x86_64.tar.gz -C t
+          find t -name ipsw -type f | head
+          ./t/ipsw version || true
 
-      - name: symbolize the sampled addresses
+      - name: download + extract dyld cache
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          DSC=/mnt/ios/System/Library/Caches/com.apple.dyld/dyld_shared_cache_arm64
-          addrs="0x211591ad0 0x220a88140 0x1d0c097b8 0x1d0b70bc0 0x1d0c36238 0x1d0b5fbb8 0x1d0b5fb20 0x23fb78c64 0x1dcccf0f4 0x23fb78bf4 0x23fb786c4 0x23fb7864c 0x23fb78338 0x23fb77b38 0x1dcb18780 0x1dcafaa50 0x23fb77af4 0x211591030 0x2115a2b18 0x2115a2db8 0x211591524 0x1d5ddc148 0x1d5ddd2e0 0x1d5de1d20 0x1009b7e40 0x1f35a4344 0x1dcaea308 0x1dcaea694 0x220b6e0ec 0x1d018c224 0x1d0125cb0 0x1d01246e0 0x1d012461c 0x1d0c30f4c 0x1d0b798e8"
-          slides="0x4ef80000 0x0 0x4e980000 0x4f000000"
+          ./t/ipsw download ipsw --device iPhone10,3 --version 16.7.16 -y 2>&1 | tail -5
+          ls -l *.ipsw
+          ./t/ipsw extract --dyld --dyld-arch arm64 -o dsc *.ipsw 2>&1 | tail -10
+          find dsc -name 'dyld_shared_cache*' | head
+
+      - name: symbolize
+        run: |
+          DSC=$(find dsc -name 'dyld_shared_cache_arm64' | head -1)
+          echo "cache $DSC"; ls -l "$DSC"
           : > syms.txt
-          for a in $addrs; do
-            for s in $slides; do
+          for a in ${{ inputs.addrs }}; do
+            for s in ${{ inputs.slides }}; do
               u=$(python3 -c "print(hex(int('$a',16)-int('$s',16)))")
-              out=$(./ipsw dyld a2s "$DSC" "$u" 2>&1 | head -3 | tr '\n' ' ')
+              out=$(./t/ipsw dyld a2s "$DSC" "$u" 2>&1 | head -4 | tr '\n' ' ')
               echo "$a slide=$s unslid=$u -> $out" >> syms.txt
             done
           done
