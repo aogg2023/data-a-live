@@ -25,6 +25,7 @@ jobs:
       - name: inspect dmg contents
         run: |
           sudo mkdir -p /m/os /m/sysos /m/appos
+          {
           sudo apfs-fuse 087-86698-044.dmg /m/os 2>&1 | tail -3 || true
           sudo apfs-fuse 087-86593-047.dmg /m/sysos 2>&1 | tail -3 || true
           sudo apfs-fuse 087-86715-047.dmg /m/appos 2>&1 | tail -3 || true
@@ -36,7 +37,11 @@ jobs:
             sudo find /m/$label -maxdepth 9 -name 'Assets.car' -path '*UIKitCore*' -exec ls -l {} \; 2>/dev/null | head
             echo '-- BoundingPath files:'
             sudo find /m/$label -maxdepth 9 -name 'BoundingPath*' -exec ls -l {} \; 2>/dev/null | head
+            echo '-- root listing:'
+            sudo ls /m/$label 2>/dev/null
           done
+          } 2>&1 | tee /tmp/inspect.txt
+          sudo tee -a "$GITHUB_STEP_SUMMARY" < /tmp/inspect.txt > /dev/null
       - name: unmount
         if: always()
         run: |
