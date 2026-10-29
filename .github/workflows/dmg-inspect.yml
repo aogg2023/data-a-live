@@ -41,7 +41,15 @@ jobs:
             sudo ls /m/$label 2>/dev/null
           done
           } 2>&1 | tee /tmp/inspect.txt
-          sudo tee -a "$GITHUB_STEP_SUMMARY" < /tmp/inspect.txt > /dev/null
+          python3 - <<'PY'
+import re, subprocess
+t = open('/tmp/inspect.txt', encoding='utf-8', errors='replace').read()
+t = re.sub(r'[\x00-\x08\x0b-\x1f]', ' ', t)
+chunks = [t[i:i+900] for i in range(0, len(t), 900)][:8]
+for i, c in enumerate(chunks):
+    c = c.replace('%', '%25').replace('\r', '').replace('\n', '%0A')
+    print(f'::notice title=inspect{i}::{c}')
+PY
       - name: unmount
         if: always()
         run: |
