@@ -29,18 +29,18 @@ jobs:
           sudo apfs-fuse 087-86593-047.dmg /m/sysos 2>&1 | tail -2 || true
           sudo apfs-fuse 087-86715-047.dmg /m/appos 2>&1 | tail -2 || true
           {
-          for label in os sysos appos; do
-            echo "== $label root:"; sudo ls -la /m/$label 2>/dev/null | head -12
-            echo "== $label UIKitCore dirs:"; sudo find /m/$label -name 'UIKitCore.framework' -print 2>/dev/null | head -5
-            echo "== $label Assets.car under UIKitCore:"; sudo find /m/$label -path '*UIKitCore*' -name 'Assets.car' -exec ls -l {} \; 2>/dev/null | head -5
-            echo "== $label BoundingPathData:"; sudo find /m/$label -name 'BoundingPathData.bundle' -print 2>/dev/null | head -5
-          done
-          echo "== car catalogs containing the iPhone X asset:"
-          find /m/os /m/sysos /m/appos -name '*.car' -size -2M 2>/dev/null | while read -r f; do
-            if grep -q 'BoundingPathBitmap-1125x2436-375x812-3.00x' "$f" 2>/dev/null; then echo "HIT $f"; ls -l "$f"; fi
-          done | head -40
+          echo "== catalogs containing the iPhone X asset (first 20):"
+          find /m/os /m/sysos /m/appos -name '*.car' -size -4M 2>/dev/null | while read -r f; do
+            if grep -q 'BoundingPathBitmap-1125x2436-375x812-3.00x' "$f" 2>/dev/null; then echo "HIT $f"; fi
+          done | head -20
+          echo "== UIKitCore.framework dirs per volume:"
+          for label in os sysos appos; do echo "-- $label"; sudo find /m/$label -name 'UIKitCore.framework' -print 2>/dev/null | head -3; done
+          echo "== Assets.car directly under a UIKitCore.framework:"
+          for label in os sysos appos; do echo "-- $label"; sudo find /m/$label -path '*UIKitCore.framework/Assets.car' -exec ls -l {} \; 2>/dev/null | head -3; done
+          echo "== cryptex roots:"
+          for label in sysos appos; do echo "-- $label"; sudo ls /m/$label/root 2>/dev/null; done
           } 2>&1 | tee /tmp/inspect.txt
-          fold -w 900 /tmp/inspect.txt | sed -n '1,8p' | while IFS= read -r c; do echo "::notice title=inspect2::$c"; done
+          fold -w 900 /tmp/inspect.txt | sed -n '1,12p' | while IFS= read -r c; do echo "::notice title=inspect3::$c"; done
       - name: unmount
         if: always()
         run: |
