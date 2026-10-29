@@ -1,0 +1,23 @@
+name: fetch-log
+on:
+  workflow_dispatch:
+    inputs:
+      run_id:
+        description: run whose logs to fetch
+        required: true
+
+jobs:
+  fetch:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: download run logs
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh api "repos/$GITHUB_REPOSITORY/actions/runs/${{ inputs.run_id }}/logs" > logs.zip
+          ls -l logs.zip
+      - uses: actions/upload-artifact@v4
+        with:
+          name: run-logs
+          path: logs.zip
+          if-no-files-found: error
