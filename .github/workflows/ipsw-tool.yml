@@ -11,7 +11,7 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           mkdir -p out
-          gh release download --repo blacktop/ipsw --pattern '*Windows*x86_64*' --dir out --clobber
+          gh release download --repo blacktop/ipsw --pattern '*windows_x86_64.zip' --dir out --clobber
           ls -l out
       - uses: actions/upload-artifact@v4
         with:
