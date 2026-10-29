@@ -502,7 +502,7 @@ index a0c916e..716d6c2 100644
  extern void pandora_gpu_init(void);
  extern void pandora_cpu_init(void);
  #endif
-+#if defined(SONGYUAN)
++#if defined(SONGYUAN) || defined(PANDORA)
 +extern void songyuan_haptic_init(void);
 +#endif
  extern void fuxi_wlan_init(void);
@@ -512,7 +512,7 @@ index a0c916e..716d6c2 100644
  	pandora_gpu_init();
  	/* CPU performance probe, boot-arg pandora_cpu (bsd/dev/pandora_cpu.c). */
  	pandora_cpu_init();
-+#if defined(SONGYUAN)
++#if defined(SONGYUAN) || defined(PANDORA)
 +	/* Vibration motor, PMIC hv-haptics read-only survey (bsd/dev/songyuan_haptic.c). */
 +	songyuan_haptic_init();
 +#endif
