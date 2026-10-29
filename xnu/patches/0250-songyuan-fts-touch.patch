@@ -9610,10 +9610,10 @@ index 0000000..b6ce5c4
 +};
 diff --git a/bsd/dev/songyuan_touch.c b/bsd/dev/songyuan_touch.c
 new file mode 100644
-index 0000000..6b70a7e
+index 0000000..fa94ce8
 --- /dev/null
 +++ b/bsd/dev/songyuan_touch.c
-@@ -0,0 +1,2888 @@
+@@ -0,0 +1,2909 @@
 +/*
 + * SONGYUAN (Redmi K90 Pro Max, SM8850) main screen touch: FocalTech FT3683 on
 + * QUPv3 wrapper 4 SE0 (0x01a80000), polled through the wrapper's GPI DMA.
@@ -11459,7 +11459,7 @@ index 0000000..6b70a7e
 +sy_pad_probe(void)
 +{
 +	static const unsigned pins[4] = {48, 49, 50, 51};
-+	printf("SONGYUAN TOUCH: pads (up/down):");
++	printf("SONGYUAN TOUCH: pads (up/down, swapped meaning 48=MOSI 49=MISO 50=CLK 51=CS):");
 +	for (unsigned i = 0; i < 4; i++) {
 +		uint32_t up, down;
 +		sy_gpio(pins[i], 0, 3, 6, -1, false);	/* input, pull-up */
@@ -11479,25 +11479,29 @@ index 0000000..6b70a7e
 +
 +
 +/*
-+ * SPI by hand on the four pads, with the serial engine out of the loop: 48 is
-+ * sampled, 49 and 50 are driven, 51 is the chip select, mode 0, ~200 kHz, bits
-+ * MSB first (the packing of the engine path is MSB first too). This is the "does
-+ * the chip answer at all" test that no GENI configuration can hide. It first does
-+ * the plain runtime-id read (0xA3) and, only if that does not answer, the same
-+ * boot-ROM handshake the engine path uses (fts_enter_into_boot @0x13d9c): reset
-+ * low 1 ms -> high, 12 + 2*i ms, the bare one-byte command 0x55 ({55 00 00 00},
-+ * no data byte, no CRC), 12 ms, then read two bytes from 0x90, expect 58 83.
++ * SPI by hand on the four pads, with the serial engine out of the loop: the two
++ * data lanes are parameters, the clock is GPIO 50 and the chip select GPIO 51,
++ * mode 0, ~200 kHz, bits MSB first (the packing of the engine path is MSB first
++ * too). This is the "does the chip answer at all" test no GENI configuration can
++ * hide, and it runs both lane assignments: round 1 with GPIO 49 as MISO and GPIO
++ * 48 as MOSI, round 2 the other way (the redwood reference tries both directions
++ * as well; our engine log shows the RX bytes correlated with TX, which is what
++ * sampling the MOSI lane looks like).
++ * Each direction does the plain runtime-id read (0xA3) and, only if that does not
++ * answer, three boot-ROM rounds like fts_enter_into_boot @0x13d9c: reset low
++ * 1 ms -> high, 12 + 2*i ms, the bare one-byte command 0x55 ({55 00 00 00}, no
++ * data byte, no CRC), 12 ms, then read two bytes from 0x90, expect 58 83.
 + */
 +static void
-+sy_bb_byte(const uint8_t out, uint8_t *in)
++sy_bb_byte(unsigned miso, unsigned mosi, const uint8_t out, uint8_t *in)
 +{
 +	uint8_t v = 0;
 +	for (unsigned b = 0; b < 8; b++) {
-+		sy_wr(sy.tlmm, SY_GPIO(49) + 4, ((out >> (7 - b)) & 1u) ? 2u : 0u);
++		sy_wr(sy.tlmm, SY_GPIO(mosi) + 4, ((out >> (7 - b)) & 1u) ? 2u : 0u);
 +		delay(1);
 +		sy_wr(sy.tlmm, SY_GPIO(50) + 4, 2);	/* clock high: sample */
 +		delay(1);
-+		v = (uint8_t)((v << 1) | (sy_rd(sy.tlmm, SY_GPIO(48) + 4) & 1u));
++		v = (uint8_t)((v << 1) | (sy_rd(sy.tlmm, SY_GPIO(miso) + 4) & 1u));
 +		sy_wr(sy.tlmm, SY_GPIO(50) + 4, 0);	/* clock low */
 +		delay(1);
 +	}
@@ -11505,12 +11509,12 @@ index 0000000..6b70a7e
 +}
 +
 +static void
-+sy_bb_frame(const uint8_t *tx, unsigned n, uint8_t *rx)
++sy_bb_frame(unsigned miso, unsigned mosi, const uint8_t *tx, unsigned n, uint8_t *rx)
 +{
 +	sy_wr(sy.tlmm, SY_GPIO(51) + 4, 0);	/* chip select low */
 +	delay(2);
 +	for (unsigned i = 0; i < n; i++) {
-+		sy_bb_byte(tx[i], &rx[i]);
++		sy_bb_byte(miso, mosi, tx[i], &rx[i]);
 +	}
 +	delay(2);
 +	sy_wr(sy.tlmm, SY_GPIO(51) + 4, 2);	/* chip select high */
@@ -11518,7 +11522,18 @@ index 0000000..6b70a7e
 +}
 +
 +static void
-+sy_bitbang_probe(void)
++sy_bb_configure(unsigned miso, unsigned mosi)
++{
++	sy_gpio(miso, 0, 3, 4, -1, false);	/* MISO: input, pull-up */
++	sy_gpio(mosi, 0, 0, 4, 0, false);	/* MOSI: output low */
++	sy_gpio(50, 0, 0, 4, 0, false);		/* CLK: output low */
++	sy_gpio(51, 0, 3, 4, 1, false);		/* CS: output high */
++	delay(100);
++}
++
++/* One lane assignment. Returns true when the boot id (0x58 0x83) was read. */
++static bool
++sy_bb_direction(const char *tag, unsigned miso, unsigned mosi)
 +{
 +	static const uint8_t rd_a3[10] = {0xa3, 0xa0, 0x00, 0x01, 0, 0, 0, 0, 0, 0};
 +	static const uint8_t cmd55[4] = {0x55, 0x00, 0x00, 0x00};	/* bare command */
@@ -11526,15 +11541,10 @@ index 0000000..6b70a7e
 +	uint8_t rx[11], id[2] = {0, 0};
 +	bool ok = false;
 +
-+	printf("SONGYUAN TOUCH: bit-bang SPI probe on GPIO 48-51 (~200 kHz, engine unused)\n");
-+	sy_gpio(48, 0, 3, 4, -1, false);	/* MISO: input, pull-up */
-+	sy_gpio(49, 0, 0, 4, 0, false);		/* MOSI: output low */
-+	sy_gpio(50, 0, 0, 4, 0, false);		/* CLK: output low */
-+	sy_gpio(51, 0, 3, 4, 1, false);		/* CS: output high */
-+	delay(100);
++	sy_bb_configure(miso, mosi);
 +	memset(rx, 0, sizeof(rx));
-+	sy_bb_frame(rd_a3, sizeof(rd_a3), rx);
-+	printf("SONGYUAN TOUCH: bit-bang read 0xA3:");
++	sy_bb_frame(miso, mosi, rd_a3, sizeof(rd_a3), rx);
++	printf("SONGYUAN TOUCH: bit-bang[%s] read 0xA3:", tag);
 +	sy_hex(" rx", rx, sizeof(rd_a3));
 +	printf(" (status %02x, id at byte 7: %02x)\n", rx[3], rx[7]);
 +	if (rx[7] == 0x00 || rx[7] == 0xff) {
@@ -11544,22 +11554,33 @@ index 0000000..6b70a7e
 +			sy_gpio(SY_RESET, 0, 0, 4, 1, false);	/* reset high */
 +			sy_sleep(12 + i * 2);
 +			memset(rx, 0, sizeof(rx));
-+			sy_bb_frame(cmd55, sizeof(cmd55), rx);
++			sy_bb_frame(miso, mosi, cmd55, sizeof(cmd55), rx);
 +			sy_sleep(12);
 +			memset(rx, 0, sizeof(rx));
-+			sy_bb_frame(rd_rom, sizeof(rd_rom), rx);
++			sy_bb_frame(miso, mosi, rd_rom, sizeof(rd_rom), rx);
 +			id[0] = rx[7];
 +			id[1] = rx[8];
-+			printf("SONGYUAN TOUCH: bit-bang boot ROM round %u: id %02x %02x "
-+			    "(want %02x %02x)\n", i, id[0], id[1], SY_FTS_ID_A3,
++			printf("SONGYUAN TOUCH: bit-bang[%s] ROM round %u: id %02x %02x "
++			    "(want %02x %02x)\n", tag, i, id[0], id[1], SY_FTS_ID_A3,
 +			    SY_FTS_ID_9F);
 +			if (id[0] == SY_FTS_ID_A3 && id[1] == SY_FTS_ID_9F) {
 +				ok = true;
 +			}
 +		}
-+		printf("SONGYUAN TOUCH: bit-bang %s (engine out of the loop)\n",
-+		    ok ? "boot id matches" : "no boot id either");
++		printf("SONGYUAN TOUCH: bit-bang[%s] %s (engine out of the loop)\n", tag,
++		    ok ? "boot id matches" : "no boot id");
 +	}
++	return ok;
++}
++
++static void
++sy_bitbang_probe(void)
++{
++	printf("SONGYUAN TOUCH: bit-bang SPI probe on GPIO 48-51 (~200 kHz, engine unused), "
++	    "both lane assignments\n");
++	/* First the swapped wiring (49 = MISO, 48 = MOSI), then the original. */
++	(void)sy_bb_direction("swapped", 49, 48);
++	(void)sy_bb_direction("original", 48, 49);
 +	/* Back to qup4_se0 function 1 for the serial engine. */
 +	sy_gpio(48, SY_FUNC_QUP4_SE0, 0, 6, -1, false);
 +	sy_gpio(49, SY_FUNC_QUP4_SE0, 0, 6, -1, false);
