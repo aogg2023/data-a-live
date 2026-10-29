@@ -1,0 +1,584 @@
+diff --git a/bsd/conf/files b/bsd/conf/files
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -118,6 +118,7 @@ bsd/dev/qcom/QcomSmp2p.c		standard
+ bsd/dev/qcom/QcomGlink.c		standard
+ bsd/dev/qcom/ShengGpr.c			standard
+ bsd/dev/qcom/FatVolume.c		standard
++bsd/dev/pandora_ipcrtr.c		standard
+ bsd/dev/pandora_files.c			standard
+ bsd/dev/pandora_gpu.c			standard
+ bsd/dev/pandora_cpu.c			standard
+diff --git a/bsd/dev/pandora_adsp.c b/bsd/dev/pandora_adsp.c
+index 3a98dc6..9a0dd62 100644
+--- a/bsd/dev/pandora_adsp.c
++++ b/bsd/dev/pandora_adsp.c
+@@ -30,8 +30,9 @@
+  * GLINK on every pass. pandora_adsp_gpr=2: we open "adsp_apps" (default: the DSP opens it).
+  * The DSP's bus vote (bcm_vote): LP0 only, see there; pandora_adsp_wait=MS waits longer than
+  * Linux's 5 s for the ready bit. The battery: the SOCCP's battery manager over PMIC GLINK ("the
+- * battery" below), boot-arg pandora_battery=1. Not done yet: the IPCRTR router channel. PLAN.md
+- * "扬声器路线".
++ * battery" below), boot-arg pandora_battery=1. The routing channel those reads carry (the "IPCRTR
++ * router channel" this file still owed) is bsd/dev/pandora_ipcrtr.c, boot-arg pandora_ipcrtr=1.
++ * PLAN.md "扬声器路线".
+  */
+ #if defined(PANDORA)
+ #include <sys/param.h>
+@@ -53,6 +54,7 @@
+ #include "qcom/ShengGpr.h"
+ #include "qcom/FatVolume.h"
+ #include "pandora_battery.h"
++#include "pandora_ipcrtr.h"
+ 
+ extern kern_return_t thread_terminate(thread_t);
+ extern vm_offset_t ml_io_map_unmappable(vm_offset_t, vm_size_t, uint32_t);
+@@ -1706,6 +1708,8 @@ bm_state(void *ctx, QcomGlinkChannel *ch, int up)
+ 	(void)ch;
+ 	bm.up = up != 0;
+ 	bm.changed = true;
++	/* SONGYUAN IPCRTR: the routing channel's own state, and its survey when boot-arg asks. */
++	pandora_ipcrtr_state(up);
+ }
+ 
+ static void
+@@ -1713,6 +1717,9 @@ bm_receive(void *ctx, QcomGlinkChannel *ch, const uint8_t *data, uint32_t len)
+ {
+ 	(void)ctx;
+ 	(void)ch;
++	/* SONGYUAN IPCRTR: the routing channel takes its own messages (0230's framing) out of the same
++	 * receive callback; everything else on this channel it leaves alone. */
++	pandora_ipcrtr_receive(data, len);
+ 	inbox_put(&bm.in, data, len);
+ }
+ 
+@@ -1928,6 +1935,9 @@ soccp_attach(void)
+ 	static const QcomGlinkClient client = {bm_state, bm_receive};
+ 	bm.ch = qcom_glink_channel(&e->gl, "PMIC_RTR_SOCCP_APPS", BM_INTENT, BM_INTENTS, bm.storage, &client, NULL,
+ 	    open_now);
++	/* SONGYUAN IPCRTR: the routing channel over this same GLINK channel (pandora_ipcrtr.c); the
++	 * client above hands it every message, so there is one channel and one opener. */
++	pandora_ipcrtr_attach(&e->gl, bm.ch);
+ 	clock_interval_to_deadline(5000, NSEC_PER_MSEC, &bm.open_by);
+ 	gl_service(e);
+ 	gl_report(e, true);
+@@ -2276,6 +2286,7 @@ adsp_thread(void *arg, wait_result_t result)
+ 		gpr_step();
+ 		spk_step();
+ 		bm_step();
++		pandora_ipcrtr_step();
+ 		now = mach_absolute_time();
+ 		for (unsigned i = 0; i < 2; i++) {
+ 			gl_report(ad_edges[i], now >= next_report);
+diff --git a/bsd/dev/pandora_ipcrtr.c b/bsd/dev/pandora_ipcrtr.c
+new file mode 100644
+index 0000000..b29a000
+--- /dev/null
++++ b/bsd/dev/pandora_ipcrtr.c
+@@ -0,0 +1,439 @@
++/*
++ * SONGYUAN IPCRTR: the routing channel the SOCCP battery manager is read over, on the PMIC GLINK
++ * edge ("PMIC_RTR_SOCCP_APPS") that 0230-soccp-battery.patch attaches to, and the framing of the
++ * reads it carries. 0230's own note: "Not done yet: the IPCRTR router channel".
++ *
++ * Layers, from the SMEM FIFO up (REPORT.md has the evidence line of every field):
++ *  - GLINK, all of it qcom/QcomGlink.c, untouched: an 8-byte command header {u16 cmd, u16 param1,
++ *    u32 param2} (there: command()), and for data a 16-byte header {u16 cmd = QCOM_GLINK_TX_DATA
++ *    (9), u16 lcid, u32 the remote's intent id, u32 this chunk's bytes, u32 bytes after it} that
++ *    qcom_glink_send() writes before the payload; the message is padded to 8 bytes (tx_write()), and
++ *    a send of this size is one chunk, so "bytes after it" is 0. This file never writes those
++ *    headers: it hands qcom_glink_send() the payload below and the link adds them.
++ *  - The routing header 0230 uses, 12 bytes little endian: {owner, type, opcode}; owner 32778 is the
++ *    battery manager, type 1 a request or an answer and 2 a notification, opcode 0x30 the battery
++ *    and 0x32 the USB path (0x07 a notification).
++ *  - What 0230 puts after the header: a read is {0, property, 0} (word 3 is "battery 0"), 24 bytes
++ *    in all, and the answer is expected as {property, value, result}: property at word 3, value at
++ *    word 4, result at word 5, at least 24 bytes (0230's bm_next() and bm_handle()).
++ *
++ * What the SOCCP answers a 24-byte read with is not settled by the evidence. 0230 expects the 24
++ * bytes above; 0234's note on the same reads says each came back as a 280-byte answer, which the
++ * code it replaced did not take. So only 0230's layout is used and every other length is logged
++ * (REPORT.md, "could not determine"): one boot with pandora_ipcrtr=1 shows which it is.
++ *
++ * All of this runs in the links' thread (0232): the entry points are called from pandora_adsp.c's
++ * bm_state(), bm_receive() and adsp_thread(), and the GLINK poll that produces the messages runs
++ * there too, so no lock is taken here. Diagnostic lines start with "SONGYUAN IPCRTR:".
++ *
++ * A note on the name: the evidence calls two different things "IPCRTR". The channel the DSP opens
++ * on the ADSP link as "IPCRTR" is the QRTR service locator (PLAN.md:216, docs/SPEAKER_RESEARCH.md:45),
++ * which is not the SOCCP's and whose wire format no evidence file here gives (TODO: it stays
++ * unimplemented). The SOCCP's battery manager is on the PMIC GLINK channel "PMIC_RTR_SOCCP_APPS" and
++ * the routing header its reads carry is the one 0230 builds; that is what this file implements, and
++ * the boot-arg and the API keep the name 0230's note uses for the missing piece.
++ */
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/errno.h>
++#include <kern/clock.h>
++#include <pexpert/pexpert.h>
++#include "pandora_ipcrtr.h"
++
++#if defined(PANDORA)
++
++/* 0230's BM_OWNER, BM_TYPE_*, BM_OP_* (0230 uses owner 32778; 0234 spells the same as 0x800a). */
++#define IPCRTR_OWNER         32778u
++#define IPCRTR_TYPE_REQUEST  1u
++#define IPCRTR_TYPE_NOTIFY   2u
++#define IPCRTR_OP_BATTERY    0x30u
++#define IPCRTR_OP_USB        0x32u
++#define IPCRTR_OP_NOTIFY     0x07u
++
++/* 0230: the read is six little-endian words, the answer's property/value/result at words 3/4/5. */
++#define IPCRTR_REQUEST_BYTES 24u
++/* TODO: 0230 expects at least 24 bytes; 0234's note on the same reads says the SOCCP answered
++ * 280 bytes and that the code before it did not take them. The layout of a 280-byte answer is not
++ * in the evidence, so it is not parsed here: an answer of another length is logged with its words
++ * (see the "on the wire" line) and its length noted, and a device log must settle it before the
++ * parser is changed. */
++#define IPCRTR_ANSWER_BYTES  24u
++#define IPCRTR_ANSWER_MS     1000u                   /* 0230 BM_ANSWER_MS */
++#define IPCRTR_FRESH_NS      (20000ull * 1000000ull) /* 0230 BM_REFRESH_MS, 20 s */
++
++#define IPCRTR_BATTERY_PROPS PANDORA_IPCRTR_BATTERY_PROPS
++#define IPCRTR_USB_PROPS     PANDORA_IPCRTR_USB_PROPS
++#if IPCRTR_USB_PROPS > IPCRTR_BATTERY_PROPS
++#error "the USB property table is larger than the battery one"
++#endif
++
++/* The answers kept for the read API: one per opcode and property, the latest. */
++struct ipcrtr_answer {
++	uint32_t value, result;
++	uint64_t at;
++	uint8_t have;
++};
++
++static struct {
++	QcomGlink *gl;
++	QcomGlinkChannel *ch;
++	uint8_t up;                            /* the GLINK channel's state */
++	uint8_t pending, inflight;             /* built, not sent yet; sent, no answer yet */
++	uint8_t survey_on, surveying, asking_survey;
++	unsigned op, prop;                     /* the request built or in flight */
++	unsigned step;                         /* the survey's property: 0-23 battery, 24-31 USB */
++	uint64_t t0, answer_by;
++	uint8_t tx[IPCRTR_REQUEST_BYTES];
++	char line[2][640];                     /* the survey's answers: battery, USB */
++	struct ipcrtr_answer answer[2][IPCRTR_BATTERY_PROPS];   /* [battery 0 / USB 1][property] */
++	uint32_t asks, answers, timeouts, foreign, notes, unmatched, send_errors, odd_lengths;
++	uint8_t shown_request, shown_answer;   /* the framing is in the log once */
++} ipcrtr;
++
++static uint32_t
++ip_le32(const uint8_t *p)
++{
++	return (uint32_t)p[0] | (uint32_t)p[1] << 8 | (uint32_t)p[2] << 16 | (uint32_t)p[3] << 24;
++}
++
++static void
++ip_put32(uint8_t *p, uint32_t v)
++{
++	p[0] = (uint8_t)v;
++	p[1] = (uint8_t)(v >> 8);
++	p[2] = (uint8_t)(v >> 16);
++	p[3] = (uint8_t)(v >> 24);
++}
++
++static uint64_t
++ip_ms(uint64_t since)
++{
++	uint64_t ns;
++	absolutetime_to_nanoseconds(mach_absolute_time() - since, &ns);
++	return ns / 1000000;
++}
++
++/* Which messages the routing channel owns: an opcode of 0230's and a property in its table. */
++static int
++ip_valid(unsigned op, unsigned prop)
++{
++	if (op == IPCRTR_OP_BATTERY) {
++		return prop < IPCRTR_BATTERY_PROPS;
++	}
++	if (op == IPCRTR_OP_USB) {
++		return prop < IPCRTR_USB_PROPS;
++	}
++	return 0;
++}
++
++/*
++ * The wire, once, so a device log shows the framing whole: the GLINK TX_DATA header that
++ * qcom_glink_send() writes (QcomGlink.c) and the 24 bytes this file writes.
++ */
++static void
++ip_show_request(void)
++{
++	if (ipcrtr.shown_request || !ipcrtr.ch) {
++		return;
++	}
++	ipcrtr.shown_request = 1;
++	printf("SONGYUAN IPCRTR: a read on the wire: GLINK TX_DATA {cmd %u, lcid %u, their intent, chunk %u, left 0} "
++	    "then 24 bytes %08x %08x %08x %08x %08x %08x\n", (unsigned)QCOM_GLINK_TX_DATA, (unsigned)ipcrtr.ch->lcid,
++	    (unsigned)sizeof(ipcrtr.tx), ip_le32(ipcrtr.tx), ip_le32(ipcrtr.tx + 4), ip_le32(ipcrtr.tx + 8),
++	    ip_le32(ipcrtr.tx + 12), ip_le32(ipcrtr.tx + 16), ip_le32(ipcrtr.tx + 20));
++}
++
++/* 0230's bm_next(): {owner, type 1, opcode, battery 0, property, 0}, the answer timer set now. */
++static void
++ip_build(unsigned op, unsigned prop)
++{
++	bzero(ipcrtr.tx, sizeof(ipcrtr.tx));
++	ip_put32(ipcrtr.tx, IPCRTR_OWNER);
++	ip_put32(ipcrtr.tx + 4, IPCRTR_TYPE_REQUEST);
++	ip_put32(ipcrtr.tx + 8, op);
++	ip_put32(ipcrtr.tx + 12, 0);                   /* 0230: "battery 0" */
++	ip_put32(ipcrtr.tx + 16, prop);
++	ip_put32(ipcrtr.tx + 20, 0);
++	ipcrtr.op = op;
++	ipcrtr.prop = prop;
++	ipcrtr.pending = 1;
++	ipcrtr.inflight = 0;
++	ip_show_request();
++	/* 0230: the timer runs from the request being built, so waiting for an intent counts. */
++	clock_interval_to_deadline(IPCRTR_ANSWER_MS, NSEC_PER_MSEC, &ipcrtr.answer_by);
++}
++
++/* The survey's next read; 0 when the pass is over. */
++static int
++ip_survey_next(void)
++{
++	uint32_t op, prop;
++	if (ipcrtr.step >= IPCRTR_BATTERY_PROPS + IPCRTR_USB_PROPS) {
++		return 0;
++	}
++	op = ipcrtr.step < IPCRTR_BATTERY_PROPS ? IPCRTR_OP_BATTERY : IPCRTR_OP_USB;
++	prop = ipcrtr.step < IPCRTR_BATTERY_PROPS ? ipcrtr.step : ipcrtr.step - IPCRTR_BATTERY_PROPS;
++	ip_build(op, prop);
++	ipcrtr.asking_survey = 1;
++	ipcrtr.asks++;
++	return 1;
++}
++
++/* One entry of the survey's line: " 4=87", " 7=?", " 9=err3". */
++static void
++ip_survey_note(uint32_t op, uint32_t prop, const char *text)
++{
++	char one[48];
++	snprintf(one, sizeof(one), " %u=%s", prop, text);
++	strlcat(ipcrtr.line[op == IPCRTR_OP_BATTERY ? 0 : 1], one, sizeof(ipcrtr.line[0]));
++}
++
++void
++pandora_ipcrtr_attach(QcomGlink *gl, QcomGlinkChannel *ch)
++{
++	int survey = 0;
++	if (!gl || !ch) {
++		printf("SONGYUAN IPCRTR: no channel (glink %d, channel %d): the routing channel stays off\n", gl != NULL,
++		    ch != NULL);
++		return;
++	}
++	bzero(&ipcrtr, sizeof(ipcrtr));
++	ipcrtr.gl = gl;
++	ipcrtr.ch = ch;
++	ipcrtr.t0 = mach_absolute_time();
++	(void)PE_parse_boot_argn("pandora_ipcrtr", &survey, sizeof(survey));
++	ipcrtr.survey_on = survey != 0;
++	printf("SONGYUAN IPCRTR: routing channel bound to \"%s\": owner %u, type %u, opcode %#x battery %#x USB, reads "
++	    "of %u bytes; survey %s (pandora_ipcrtr=1)\n", ch->name, IPCRTR_OWNER, IPCRTR_TYPE_REQUEST,
++	    IPCRTR_OP_BATTERY, IPCRTR_OP_USB, (unsigned)IPCRTR_REQUEST_BYTES, ipcrtr.survey_on ? "on" : "off");
++	/* The channel may be up before the battery code hands it over (gl_service runs inside
++	 * soccp_attach): take the state it has now. */
++	if (ch->up) {
++		pandora_ipcrtr_state(1);
++	}
++}
++
++void
++pandora_ipcrtr_state(int up)
++{
++	if (!ipcrtr.gl || !ipcrtr.ch) {
++		return;
++	}
++	ipcrtr.up = up != 0;
++	ipcrtr.pending = ipcrtr.inflight = ipcrtr.asking_survey = 0;
++	ipcrtr.answer_by = 0;
++	if (!ipcrtr.up) {
++		if (ipcrtr.surveying) {
++			printf("SONGYUAN IPCRTR: channel down in the survey after %u of %u properties\n", ipcrtr.step,
++			    IPCRTR_BATTERY_PROPS + IPCRTR_USB_PROPS);
++			ipcrtr.surveying = 0;
++		}
++		return;
++	}
++	/* 0230: the first pass after the channel comes up reads every property once and logs it. */
++	if (ipcrtr.survey_on) {
++		ipcrtr.surveying = 1;
++		ipcrtr.step = 0;
++		ipcrtr.line[0][0] = 0;
++		ipcrtr.line[1][0] = 0;
++		printf("SONGYUAN IPCRTR: reading battery properties 0-%u and USB properties 0-%u once\n",
++		    IPCRTR_BATTERY_PROPS - 1, IPCRTR_USB_PROPS - 1);
++	}
++}
++
++int
++pandora_ipcrtr_ask(unsigned op, unsigned prop)
++{
++	if (!ipcrtr.gl || !ipcrtr.ch || !ipcrtr.up) {
++		return ENODEV;
++	}
++	if (!ip_valid(op, prop)) {
++		return EINVAL;
++	}
++	if (ipcrtr.pending || ipcrtr.inflight) {
++		return EAGAIN;
++	}
++	ip_build(op, prop);
++	ipcrtr.asks++;
++	return 0;
++}
++
++int
++pandora_ipcrtr_read(unsigned op, unsigned prop, uint32_t *value, uint32_t *result)
++{
++	struct ipcrtr_answer *a;
++	uint64_t ns;
++	if (!ipcrtr.gl || !ipcrtr.ch || !ipcrtr.up) {
++		return ENODEV;
++	}
++	if (!ip_valid(op, prop)) {
++		return EINVAL;
++	}
++	a = &ipcrtr.answer[op == IPCRTR_OP_USB ? 1 : 0][prop];
++	if (a->have) {
++		absolutetime_to_nanoseconds(mach_absolute_time() - a->at, &ns);
++		if (ns < IPCRTR_FRESH_NS) {
++			if (value) {
++				*value = a->value;
++			}
++			if (result) {
++				*result = a->result;
++			}
++			return 0;
++		}
++	}
++	/* Nothing fresh: ask, unless the link is busy or the survey has it, and let the caller ask again
++	 * on its next pass (the answer comes in through pandora_ipcrtr_receive). */
++	if (!ipcrtr.pending && !ipcrtr.inflight && !ipcrtr.surveying) {
++		ip_build(op, prop);
++		ipcrtr.asks++;
++	}
++	return EAGAIN;
++}
++
++int
++pandora_ipcrtr_battery_read(unsigned prop, uint32_t *value)
++{
++	return pandora_ipcrtr_read(IPCRTR_OP_BATTERY, prop, value, NULL);
++}
++
++int
++pandora_ipcrtr_usb_read(unsigned prop, uint32_t *value)
++{
++	return pandora_ipcrtr_read(IPCRTR_OP_USB, prop, value, NULL);
++}
++
++void
++pandora_ipcrtr_receive(const uint8_t *data, uint32_t length)
++{
++	struct ipcrtr_answer *a;
++	uint32_t owner, type, op, prop, value, result;
++	if (!data || length < 12) {
++		ipcrtr.foreign++;
++		return;
++	}
++	owner = ip_le32(data);
++	type = ip_le32(data + 4);
++	op = ip_le32(data + 8);
++	if (owner != IPCRTR_OWNER) {
++		ipcrtr.foreign++;
++		return;
++	}
++	if (type == IPCRTR_TYPE_NOTIFY) {
++		/* TODO: 0230 logs a notification as {header, number, 256 bytes} and 0234 as {header, number,
++		 * 256 bytes} too, but neither says what the number or the bytes mean, so nothing is acted on:
++		 * the words are logged and the survey is left alone. */
++		if (ipcrtr.notes++ < 8) {
++			printf("SONGYUAN IPCRTR: notification opcode %#x word3 %#x first word %#x (%u bytes)\n", op,
++			    length >= 16 ? ip_le32(data + 12) : 0, length >= 20 ? ip_le32(data + 16) : 0, length);
++		}
++		return;
++	}
++	if (type != IPCRTR_TYPE_REQUEST || (op != IPCRTR_OP_BATTERY && op != IPCRTR_OP_USB)) {
++		/* The same GLINK channel carries 0234's Xiaomi MCA frames (same owner, opcode 1, 280
++		 * bytes); they are counted here and left to that code's own parser. */
++		ipcrtr.foreign++;
++		return;
++	}
++	if (length < IPCRTR_ANSWER_BYTES) {
++		if (ipcrtr.unmatched++ < 8) {
++			printf("SONGYUAN IPCRTR: answer to opcode %#x is %u bytes, shorter than %u\n", op, length,
++			    (unsigned)IPCRTR_ANSWER_BYTES);
++		}
++		return;
++	}
++	prop = ip_le32(data + 12);
++	if (!(ipcrtr.pending || ipcrtr.inflight) || op != ipcrtr.op || prop != ipcrtr.prop) {
++		if (ipcrtr.unmatched++ < 8) {
++			printf("SONGYUAN IPCRTR: answer opcode %#x property %u while waiting for opcode %#x property %u (%u "
++			    "bytes)\n", op, prop, ipcrtr.op, ipcrtr.prop, length);
++		}
++		return;
++	}
++	/* 0230's bm_handle(): the answer's words 4 and 5. */
++	value = ip_le32(data + 16);
++	result = ip_le32(data + 20);
++	a = &ipcrtr.answer[op == IPCRTR_OP_USB ? 1 : 0][prop];
++	a->value = value;
++	a->result = result;
++	a->at = mach_absolute_time();
++	a->have = 1;
++	ipcrtr.answers++;
++	if (!ipcrtr.shown_answer) {
++		ipcrtr.shown_answer = 1;
++		printf("SONGYUAN IPCRTR: an answer on the wire: %u bytes %08x %08x %08x %08x %08x %08x\n", length,
++		    ip_le32(data), ip_le32(data + 4), ip_le32(data + 8), ip_le32(data + 12), ip_le32(data + 16),
++		    ip_le32(data + 20));
++	}
++	if (length != IPCRTR_ANSWER_BYTES && ipcrtr.odd_lengths++ < 8) {
++		printf("SONGYUAN IPCRTR: this answer is %u bytes where 0230 expects %u; words 4 and 5 (%08x %08x) were "
++		    "taken as value and result\n", length, (unsigned)IPCRTR_ANSWER_BYTES, ip_le32(data + 16),
++		    ip_le32(data + 20));
++	}
++	if (ipcrtr.asking_survey) {
++		char one[32];
++		if (result) {
++			snprintf(one, sizeof(one), "err%#x", result);
++		} else {
++			snprintf(one, sizeof(one), "%d", (int32_t)value);
++		}
++		ip_survey_note(op, prop, one);
++		ipcrtr.asking_survey = 0;
++		ipcrtr.step++;
++	} else if (result) {
++		printf("SONGYUAN IPCRTR: opcode %#x property %u: result %#x, value %d\n", op, prop, result, (int32_t)value);
++	} else {
++		printf("SONGYUAN IPCRTR: opcode %#x property %u = %d\n", op, prop, (int32_t)value);
++	}
++	ipcrtr.pending = ipcrtr.inflight = 0;
++	ipcrtr.answer_by = 0;
++}
++
++void
++pandora_ipcrtr_step(void)
++{
++	uint64_t now;
++	int rc;
++	if (!ipcrtr.gl || !ipcrtr.ch || !ipcrtr.up) {
++		return;
++	}
++	now = mach_absolute_time();
++	if (ipcrtr.answer_by && now >= ipcrtr.answer_by) {
++		/* 0230: one second per read, then the pass goes on with the value marked unknown. */
++		ipcrtr.timeouts++;
++		ipcrtr.pending = ipcrtr.inflight = 0;
++		ipcrtr.answer_by = 0;
++		if (ipcrtr.asking_survey) {
++			ipcrtr.asking_survey = 0;
++			ip_survey_note(ipcrtr.op, ipcrtr.prop, "?");
++			ipcrtr.step++;
++		}
++		printf("SONGYUAN IPCRTR: no answer to opcode %#x property %u in %u ms (timeouts %u)\n", ipcrtr.op,
++		    ipcrtr.prop, (unsigned)IPCRTR_ANSWER_MS, ipcrtr.timeouts);
++	}
++	/* The survey's next read, and the end of its pass. */
++	if (!ipcrtr.pending && !ipcrtr.inflight && ipcrtr.surveying && !ip_survey_next()) {
++		ipcrtr.surveying = 0;
++		printf("SONGYUAN IPCRTR: battery properties:%s\n", ipcrtr.line[0]);
++		printf("SONGYUAN IPCRTR: USB properties:%s\n", ipcrtr.line[1]);
++		printf("SONGYUAN IPCRTR: survey over after %llu ms: %u reads, %u answers, %u timeouts, %u not ours\n",
++		    ip_ms(ipcrtr.t0), ipcrtr.asks, ipcrtr.answers, ipcrtr.timeouts, ipcrtr.foreign);
++	}
++	if (ipcrtr.pending) {
++		rc = qcom_glink_send(ipcrtr.gl, ipcrtr.ch, ipcrtr.tx, sizeof(ipcrtr.tx));
++		if (rc == QcomGlinkOk) {
++			ipcrtr.pending = 0;
++			ipcrtr.inflight = 1;
++		} else if (rc != QcomGlinkAgain) {
++			/* Not open, too big or the link is broken: drop it and let the answer timer move the pass
++			 * on, as 0230's bm_step does with a request that cannot go out. */
++			ipcrtr.pending = 0;
++			if (ipcrtr.send_errors++ < 8) {
++				printf("SONGYUAN IPCRTR: read of opcode %#x property %u not sent: %d (%u so far)\n", ipcrtr.op,
++				    ipcrtr.prop, rc, ipcrtr.send_errors);
++			}
++		}
++	}
++}
++
++#endif /* PANDORA */
+diff --git a/bsd/dev/pandora_ipcrtr.h b/bsd/dev/pandora_ipcrtr.h
+new file mode 100644
+index 0000000..030e4ff
+--- /dev/null
++++ b/bsd/dev/pandora_ipcrtr.h
+@@ -0,0 +1,61 @@
++/*
++ * SONGYUAN IPCRTR: the routing channel on the SOCCP's PMIC GLINK edge, the message framing the
++ * battery manager's reads use, and a small API the battery read calls.
++ *
++ * The framing is 0230-soccp-battery.patch's: a 12-byte routing header {owner, type, opcode}
++ * little endian (owner 32778, type 1 request or answer, 2 notification, opcode 0x30 battery,
++ * 0x32 USB), then a read {0 (battery 0), property, 0} and an answer {property, value, result};
++ * below it qcom/QcomGlink.c's GLINK headers go on unchanged. Every constant and offset, and the
++ * evidence line for each, is in REPORT.md; nothing here is guessed.
++ *
++ * No waits, as the GLINK layer under it (qcom/QcomGlink.h): one request in flight at a time, the
++ * answer arrives in the channel's receive callback, and the link's thread calls
++ * pandora_ipcrtr_step() on every pass to run the answer timer and the send.
++ */
++#ifndef PANDORA_IPCRTR_H
++#define PANDORA_IPCRTR_H
++#include <stdint.h>
++#include "qcom/QcomGlink.h"
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++/* 0230: BM_OP_BATT_GET and BM_OP_USB_GET, the battery manager's two read opcodes. */
++#define PANDORA_IPCRTR_OP_BATTERY 0x30u
++#define PANDORA_IPCRTR_OP_USB     0x32u
++
++/* What one survey pass covers: 0230's BM_SURVEY_BATT (battery properties 0-23) and BM_SURVEY_USB
++ * (USB properties 0-7). 0230 says the numbering itself is not settled yet; the survey exists to
++ * settle it against Android's readings.
++ * TODO: the meaning of each property number. Nothing here assumes one; the survey logs all of
++ * them, and 0230's own table (capacity 4, voltage 7, current 9, ...) is 0230's guess to check, not
++ * a fact the evidence establishes. */
++#define PANDORA_IPCRTR_BATTERY_PROPS 24u
++#define PANDORA_IPCRTR_USB_PROPS     8u
++
++/* Binds the routing channel to an open GLINK channel (0230's "PMIC_RTR_SOCCP_APPS"). No traffic
++ * goes out until a read is asked for: the survey needs boot-arg pandora_ipcrtr=1, the SOCCP path
++ * itself boot-arg pandora_battery=1 (0230). */
++void pandora_ipcrtr_attach(QcomGlink *gl, QcomGlinkChannel *ch);
++/* The channel's up/down, from the GLINK client's state callback (bm_state in pandora_adsp.c). */
++void pandora_ipcrtr_state(int up);
++/* A message from the channel, from the GLINK client's receive callback (bm_receive). */
++void pandora_ipcrtr_receive(const uint8_t *data, uint32_t length);
++/* The link thread's pass: the answer timer, the survey's next read, and the send. */
++void pandora_ipcrtr_step(void);
++
++/* One property of the battery (opcode 0x30) or of the USB path (0x32). 0 and *value when an answer
++ * is in hand and younger than 20 s (0230 BM_REFRESH_MS); EAGAIN when a read has been asked for (or
++ * one is in flight) and the answer is not in yet, so the caller asks again on its next pass; ENODEV
++ * the channel is down; EINVAL the property is out of range. pandora_ipcrtr_read() also hands out
++ * the answer's result code (0230: 0 when the read worked). */
++int pandora_ipcrtr_battery_read(unsigned prop, uint32_t *value);
++int pandora_ipcrtr_usb_read(unsigned prop, uint32_t *value);
++int pandora_ipcrtr_read(unsigned op, unsigned prop, uint32_t *value, uint32_t *result);
++/* Queues one read: 0 queued, EAGAIN one is already in flight, ENODEV/EINVAL as above. */
++int pandora_ipcrtr_ask(unsigned op, unsigned prop);
++
++#ifdef __cplusplus
++}
++#endif
++#endif /* PANDORA_IPCRTR_H */
