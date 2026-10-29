@@ -1,0 +1,43 @@
+name: dmg-inspect
+on:
+  workflow_dispatch: {}
+
+jobs:
+  inspect:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - name: deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential cmake libfuse3-dev fuse3 git unzip curl
+      - name: apfs-fuse
+        run: |
+          git clone --depth 1 --recursive https://github.com/sgan81/apfs-fuse.git apfs-fuse
+          cd apfs-fuse && mkdir -p build && cd build
+          cmake -DUSE_FUSE3=ON .. >/dev/null && make -s -j"$(nproc)"
+          sudo install -m 755 apfs-fuse apfsutil /usr/local/bin/
+      - name: IPSW
+        run: |
+          curl -L --retry 5 -o ipsw.zip https://updates.cdn-apple.com/2025FallFCS/fullrestores/122-77006/1158E502-D76D-4226-AA06-ED5E30CD1111/iPhone10,3,iPhone10,6_16.7.16_20H392_Restore.ipsw
+          unzip -o -q ipsw.zip 087-86698-044.dmg 087-86593-047.dmg 087-86715-047.dmg
+          ls -l *.dmg
+      - name: inspect dmg contents
+        run: |
+          sudo mkdir -p /m/os /m/sysos /m/appos
+          sudo apfs-fuse 087-86698-044.dmg /m/os 2>&1 | tail -3 || true
+          sudo apfs-fuse 087-86593-047.dmg /m/sysos 2>&1 | tail -3 || true
+          sudo apfs-fuse 087-86715-047.dmg /m/appos 2>&1 | tail -3 || true
+          for label in os sysos appos; do
+            echo "===== $label ====="
+            sudo find /m/$label -maxdepth 8 -name 'UIKitCore.framework' -print 2>/dev/null | head
+            sudo find /m/$label -maxdepth 8 -name 'UIKitCore.framework' -exec ls -la {} \; 2>/dev/null | head -40
+            echo '-- Assets.car under UIKitCore:'
+            sudo find /m/$label -maxdepth 9 -name 'Assets.car' -path '*UIKitCore*' -exec ls -l {} \; 2>/dev/null | head
+            echo '-- BoundingPath files:'
+            sudo find /m/$label -maxdepth 9 -name 'BoundingPath*' -exec ls -l {} \; 2>/dev/null | head
+          done
+      - name: unmount
+        if: always()
+        run: |
+          sudo umount /m/os /m/sysos /m/appos 2>/dev/null || true
