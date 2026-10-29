@@ -12,10 +12,10 @@ index 98d9d17..7917dcc 100644
  bsd/dev/pandora_gpi.c			standard
 diff --git a/bsd/dev/songyuan_touch.c b/bsd/dev/songyuan_touch.c
 new file mode 100644
-index 0000000..3a4063e
+index 0000000..176203c
 --- /dev/null
 +++ b/bsd/dev/songyuan_touch.c
-@@ -0,0 +1,1269 @@
+@@ -0,0 +1,1551 @@
 +/*
 + * SONGYUAN (Redmi K90 Pro Max, SM8850) main screen touch: FocalTech FT3683 on
 + * QUPv3 wrapper 4 SE0 (0x01a80000), polled through the wrapper's GPI DMA.
@@ -47,12 +47,21 @@ index 0000000..3a4063e
 + *                         9600000 (MYRON:69: the DT allows 15 MHz, the first
 + *                         runs stay below it)
 + *   songyuan_ftsdelay=S   seconds before the first register access (default 5)
++ *   songyuan_ftsrpmh=0|1  vote iovdd (RPMh L4I_E0, 1.8 V, high power mode)
++ *                         through the apps RSC before reset is released;
++ *                         default 1. 0 skips the vote, for an A/B run that
++ *                         leaves the rail alone (it is then off, as boot
++ *                         leaves it, and every SPI read fails).
 + *
 + * Power: avdd is a fixed regulator enabled by TLMM GPIO 117, active high
-+ * (MYRON:45) - a pin, so no RPMh/RSC vote is needed and none is here (PAND's
-+ * RSC block voted an iovdd rail, not this avdd). iovdd (L4I, 1.8 V) *is* an
-+ * RPMh rail that XNU cannot switch (MYRONC:20); it is not touched here, which
-+ * is the first thing to suspect when the chip does not answer (REPORT.md).
++ * (MYRON:45) - a pin. iovdd (L4I, 1.8 V) is an RPMh LDO: myron's driver leaves
++ * it to Android (MYRONC:20), so on XNU nothing has voted it and the chip cannot
++ * answer ("all zeros"). The vote in sy_rpmh_vote() is pandora_touch.c:657-825
++ * (same SM8850, same QUP4 SE0, same PMH0110 PMIC, where it powers the panel),
++ * and every parameter is songyuan's own live DT
++ * (/soc/rsc@18900000/drv@2/rpmh-regulator-l4i-e0: qcom,resource-name "L4I_E0",
++ * pmic7-ldo, 1.8 V, qcom,init-mode 3). The stock order is kept: reset low, avdd
++ * on, iovdd vote, reset high, then the firmware's boot time.
 + */
 +/*
 + * TODO(REPORT.md U4): the songyuan machine config must define SONGYUAN, as
@@ -320,6 +329,272 @@ index 0000000..3a4063e
 +		    sy_rd(sy.tlmm, SY_GPIO(pins[i]) + 4) & 3u);
 +	}
 +	printf("\n");
++}
++
++/* ---- RPMh: L4I_E0 on (iovdd, 1.8 V) ---------------------------------------------- */
++
++/*
++ * iovdd (L4I, 1.8 V) is an RPMh LDO, so XNU has to vote it through the apps RSC
++ * before the chip can answer. This is pandora_touch.c:657-825 (same SM8850, same
++ * PMH0110 PMIC; there the same vote powers the panel) with this file's helpers.
++ * Everything it addresses is songyuan's own live DT, E:\songyuan\dl\live.dtb:
++ *   /soc/rsc@18900000: compatible "qcom,rpmh-rsc", reg-names "drv-0" "drv-1"
++ *       "drv-2", drv-2 at 0x18920000 size 0x10000; /drv@2: qcom,drv-id <2>,
++ *       qcom,tcs-offset <0xd00>, qcom,tcs-distance <0x2a0>;
++ *       /drv@2/channel@0: qcom,tcs-config = <2 3>,<0 2>,<1 2>,<3 0>,<4 1>. A
++ *       tuple is <type, count> and type 2 is ACTIVE (PAND:667 and UniXNU's
++ *       WifiProbe.cpp:303 read it the same way), so the ACTIVE TCSs are 0..2.
++ *   /reserved-memory/aop_cmd_db_region@81c60000: compatible "qcom,cmd-db",
++ *       reg 0x81c60000 size 0x20000 - the command database.
++ *   /soc/rsc@18900000/drv@2/rpmh-regulator-l4i-e0: qcom,resource-name
++ *       "L4I_E0", qcom,regulator-type "pmic7-ldo";
++ *       /regulator-pmh0110-i-l4: regulator-min/max-microvolt 0x1b7740
++ *       (1800000), qcom,init-mode 3.
++ * A VRM resource takes three commands at (cmd-db address + offset): voltage in
++ * millivolts at +0, enable at +4, mode at +8 (PAND:787; UniXNU's QcomRpmh
++ * comments "the mode (7: HPM ...), the voltage in millivolts, then the
++ * enable"). The TCS register layout follows the RSC's major version; PAND:659-
++ * 664 and QcomRpmh.c:53-57 hold the same two tables (v2: 2.7, v3: 3.0). A
++ * version that is neither is refused, never guessed.
++ */
++#define SY_RSC_PA	0x18920000u	/* live DT rsc@18900000 drv-2 */
++#define SY_RSC_SIZE	0x10000u	/* live DT drv-2 reg size */
++#define SY_CMDDB_PA	0x81c60000u	/* live DT aop_cmd_db_region@81c60000 */
++#define SY_CMDDB_SIZE	0x20000u	/* live DT aop_cmd_db_region size */
++#define SY_TCS_OFF	0xd00u		/* live DT qcom,tcs-offset */
++#define SY_TCS_STRIDE	0x2a0u		/* live DT qcom,tcs-distance */
++#define SY_TCS_ACTIVE	3u		/* live DT qcom,tcs-config: ACTIVE x3 */
++#define SY_RSC_DRV	2u		/* live DT qcom,drv-id */
++#define SY_VRM_MV	1800u		/* live DT regulator-min-microvolt */
++#define SY_VRM_MODE	7u		/* high power mode (PAND:787) */
++#define SY_VRM_ENABLE	1u		/* enable (PAND:787) */
++#define SY_RPMH_WRITE	(8u | (1u << 8) | (1u << 16))	/* PAND:669: write, 4-byte, ack */
++#define SY_RPMH_AMC	(1u << 16)	/* PAND:796: ACTIVE mode command */
++#define SY_RPMH_DONE	0x10100u	/* PAND:806: issued | complete */
++#define SY_RPMH_TRIGGER	(1u << 24)	/* PAND:799: start the TCS */
++#define SY_CMDDB_MAGIC	0x0c0330dbu	/* PAND:670 */
++#define SY_CMDDB_HEADER	144u		/* PAND:671 */
++#define SY_CMDDB_ENTRY	24u		/* PAND:672 */
++
++/* Register layout per RSC major version (PAND:660-664; QcomRpmh.c:55-56). */
++struct sy_rpmh_layout {
++	uint32_t wait, control, status, enable, msgid, addr, data, cmd_status, cmd_stride;
++};
++static const struct sy_rpmh_layout sy_rpmh_v2 = {0x10, 0x14, 0x18, 0x1c, 0x30, 0x34, 0x38, 0x3c, 20};
++static const struct sy_rpmh_layout sy_rpmh_v3 = {0x20, 0x24, 0x28, 0x2c, 0x34, 0x38, 0x3c, 0x40, 24};
++
++static vm_offset_t sy_rsc, sy_cmddb;
++static bool sy_rpmh_tried;	/* the vote runs once per boot */
++static int sy_rpmh_result;	/* 0: the vote landed, else its errno */
++
++static uint16_t
++sy_cmddb16(uint32_t off)
++{
++	return (uint16_t)(sy_rd(sy_cmddb, off & ~3u) >> (8u * (off & 3u)));
++}
++
++/* PAND:722-734: write, then read back until the register keeps the value. */
++static bool
++sy_rpmh_sync(uint32_t off, uint32_t v)
++{
++	sy_wr(sy_rsc, off, v);
++	for (unsigned i = 0; i < 1000; i++) {
++		if (sy_rd(sy_rsc, off) == v) {
++			return true;
++		}
++		delay(1);
++	}
++	return false;
++}
++
++/* PAND:682-720: the resource's RPMh address out of the cmd-db (slave 4 = VRM). */
++static int
++sy_rpmh_lookup(const char *res, uint32_t *address)
++{
++	uint32_t key[2] = {0, 0};
++	for (unsigned i = 0; i < 8 && res[i]; i++) {
++		key[i / 4] |= (uint32_t)(uint8_t)res[i] << (8u * (i % 4));
++	}
++	unsigned matches = 0;
++	for (unsigned i = 0; i < 8; i++) {
++		uint32_t h = 8u + 16u * i;
++		unsigned slave = sy_cmddb16(h);
++		if (!slave) {
++			break;
++		}
++		uint32_t entries = SY_CMDDB_HEADER + sy_cmddb16(h + 2);
++		unsigned count = sy_cmddb16(h + 6);
++		if ((entries & 3u) || entries + count * SY_CMDDB_ENTRY > SY_CMDDB_SIZE) {
++			printf("SONGYUAN TOUCH: cmd-db slave header %u malformed\n", i);
++			return EINVAL;
++		}
++		for (unsigned j = 0; j < count; j++) {
++			uint32_t e = entries + SY_CMDDB_ENTRY * j;
++			if (sy_rd(sy_cmddb, e) != key[0] || sy_rd(sy_cmddb, e + 4) != key[1]) {
++				continue;
++			}
++			uint32_t addr = sy_rd(sy_cmddb, e + 16);
++			printf("SONGYUAN TOUCH: cmd-db %s addr=%#x slave=%u\n", res, addr, slave);
++			if (slave == 4 && ((addr >> 16) & 7u) == 4 && !(addr & 15u)) {
++				*address = addr;
++				matches++;
++			}
++		}
++	}
++	if (matches != 1) {
++		printf("SONGYUAN TOUCH: cmd-db %s: %u VRM matches; not voting\n", res, matches);
++		return ENODEV;
++	}
++	return 0;
++}
++
++/*
++ * PAND:736-825: one ACTIVE TCS carries the three commands of the vote
++ * (voltage, mode, enable); the RSC is triggered and reports completion in the
++ * TCS status and in each command's status. Only this TCS's interrupt enable bit
++ * is touched, and it is put back. The first call's outcome is kept, so a second
++ * call cannot arm a second request for the same rail.
++ */
++static int
++sy_rpmh_vote(void)
++{
++	const struct sy_rpmh_layout *L = NULL;
++	uint32_t id = 0, config = 0, magic = 0, address = 0;
++	uint32_t major, minor, ntcs, ncpt, b = 0, bit = 0, irq_en = 0;
++	uint32_t word[3] = {0, 0, 0}, cs[3] = {0, 0, 0};
++	uint32_t vals[3] = {SY_VRM_MV, SY_VRM_MODE, SY_VRM_ENABLE};
++	static const uint32_t offs[3] = {0, 8, 4};	/* voltage, mode, enable */
++	unsigned t = 0;
++	int chosen = -1, rc = 0;
++	bool done = false;
++
++	if (sy_rpmh_tried) {
++		return sy_rpmh_result;
++	}
++	sy_rsc = ml_io_map(SY_RSC_PA, SY_RSC_SIZE);
++	sy_cmddb = ml_io_map(SY_CMDDB_PA, SY_CMDDB_SIZE);
++	if (!sy_rsc || !sy_cmddb) {
++		printf("SONGYUAN TOUCH: RPMh: RSC/cmd-db mapping failed\n");
++		rc = ENOMEM;
++		goto out;
++	}
++	id = sy_rd(sy_rsc, 0);
++	config = sy_rd(sy_rsc, 0x0c);
++	major = (id >> 16) & 0xffu;
++	minor = (id >> 8) & 0xffu;
++	ntcs = (config >> (6u * SY_RSC_DRV)) & 0x3fu;
++	ncpt = (config >> 27) & 0x1fu;
++	printf("SONGYUAN TOUCH: RPMh: rsc=%#x id=%#x (v%u.%u) solver=%#x config=%#x tcs=%u ncpt=%u\n",
++	    SY_RSC_PA, id, major, minor, sy_rd(sy_rsc, 4), config, ntcs, ncpt);
++	/* Linux uses the 3.0 layout for every major >= 3 (PAND:751-756). */
++	L = major >= 3 ? &sy_rpmh_v3 : (major == 2 ? &sy_rpmh_v2 : NULL);
++	if (!L || ntcs < SY_TCS_ACTIVE || ntcs > 16 || ncpt < 3 || ncpt > 16) {
++		printf("SONGYUAN TOUCH: RPMh: RSC v%u.%u layout/geometry not known (tcs %u, "
++		    "ncpt %u); not voting\n", major, minor, ntcs, ncpt);
++		rc = ENODEV;
++		goto out;
++	}
++	magic = sy_rd(sy_cmddb, 4);
++	printf("SONGYUAN TOUCH: RPMh: cmd-db %#x size %#x version=%#x magic=%#x\n",
++	    SY_CMDDB_PA, SY_CMDDB_SIZE, sy_rd(sy_cmddb, 0), magic);
++	if (magic != SY_CMDDB_MAGIC) {
++		printf("SONGYUAN TOUCH: RPMh: cmd-db magic %#x is not %#x; not voting\n",
++		    magic, SY_CMDDB_MAGIC);
++		rc = ENODEV;
++		goto out;
++	}
++	if ((rc = sy_rpmh_lookup("L4I_E0", &address))) {
++		goto out;
++	}
++	for (t = 0; t < SY_TCS_ACTIVE; t++) {
++		b = SY_TCS_OFF + t * SY_TCS_STRIDE;
++		uint32_t st = sy_rd(sy_rsc, b + L->status), ctl = sy_rd(sy_rsc, b + L->control);
++		uint32_t en = sy_rd(sy_rsc, b + L->enable), wt = sy_rd(sy_rsc, b + L->wait);
++		printf("SONGYUAN TOUCH: RPMh: ACTIVE TCS%u idle=%#x control=%#x enable=%#x wait=%#x\n",
++		    t, st, ctl, en, wt);
++		if (chosen < 0 && st != 0 && st != 0xffffffffu && ctl == 0 && en == 0 && wt == 0 &&
++		    !(sy_rd(sy_rsc, SY_TCS_OFF + 4) & (1u << t))) {
++			chosen = (int)t;
++		}
++	}
++	if (chosen < 0) {
++		printf("SONGYUAN TOUCH: RPMh: no free ACTIVE TCS; not voting\n");
++		rc = EBUSY;
++		goto out;
++	}
++	{
++		unsigned tc = (unsigned)chosen;
++		t = tc;
++		b = SY_TCS_OFF + tc * SY_TCS_STRIDE;
++		bit = 1u << tc;
++	}
++	irq_en = sy_rd(sy_rsc, SY_TCS_OFF);
++	if (!sy_rpmh_sync(SY_TCS_OFF, irq_en & ~bit)) {
++		printf("SONGYUAN TOUCH: RPMh: IRQ enable readback failed (want %#x, got %#x)\n",
++		    irq_en & ~bit, sy_rd(sy_rsc, SY_TCS_OFF));
++		rc = EIO;
++		goto out;
++	}
++	for (unsigned c = 0; c < 3; c++) {
++		uint32_t cmd = b + c * L->cmd_stride;
++		word[c] = address + offs[c];
++		if (!sy_rpmh_sync(cmd + L->msgid, SY_RPMH_WRITE) ||
++		    !sy_rpmh_sync(cmd + L->addr, word[c]) ||
++		    !sy_rpmh_sync(cmd + L->data, vals[c])) {
++			printf("SONGYUAN TOUCH: RPMh: command %u write failed: msgid %#x (want %#x), "
++			    "addr %#x (want %#x), data %#x (want %u); id=%#x (v%u.%u)\n", c,
++			    sy_rd(sy_rsc, cmd + L->msgid), SY_RPMH_WRITE,
++			    sy_rd(sy_rsc, cmd + L->addr), word[c],
++			    sy_rd(sy_rsc, cmd + L->data), vals[c], id, major, minor);
++			rc = EIO;
++			goto restore;
++		}
++	}
++	if (!sy_rpmh_sync(b + L->wait, 7) || !sy_rpmh_sync(b + L->enable, 7) ||
++	    !sy_rpmh_sync(b + L->control, 0) || !sy_rpmh_sync(b + L->control, SY_RPMH_AMC)) {
++		printf("SONGYUAN TOUCH: RPMh: TCS%u arm failed: wait=%#x enable=%#x control=%#x "
++		    "(want 7, 7, %#x), irq-enable=%#x, commands %#x/%#x/%#x = %u/%u/%u\n",
++		    t, sy_rd(sy_rsc, b + L->wait), sy_rd(sy_rsc, b + L->enable),
++		    sy_rd(sy_rsc, b + L->control), SY_RPMH_AMC, sy_rd(sy_rsc, SY_TCS_OFF),
++		    word[0], word[1], word[2], vals[0], vals[1], vals[2]);
++		rc = EIO;
++		goto restore;
++	}
++	sy_wr(sy_rsc, b + L->control, SY_RPMH_AMC | SY_RPMH_TRIGGER);
++	for (unsigned us = 0; us < 100000 && !done; us++) {
++		bool all = true;
++		for (unsigned c = 0; c < 3; c++) {
++			cs[c] = sy_rd(sy_rsc, b + L->cmd_status + c * L->cmd_stride);
++			all &= cs[c] != 0xffffffffu && (cs[c] & SY_RPMH_DONE) == SY_RPMH_DONE;
++		}
++		done = all && sy_rd(sy_rsc, b + L->status) != 0;
++		if (!done) {
++			delay(1);
++		}
++	}
++	printf("SONGYUAN TOUCH: RPMh: L4I_E0 %u mV/mode %u/enable on TCS%u done=%d irq=%#x "
++	    "status=%#x cmd-status=%#x/%#x/%#x\n", SY_VRM_MV, SY_VRM_MODE, t, done,
++	    sy_rd(sy_rsc, SY_TCS_OFF + 4), sy_rd(sy_rsc, b + L->status),
++	    cs[0], cs[1], cs[2]);
++	if (!done) {
++		printf("SONGYUAN TOUCH: RPMh: L4I_E0 vote timed out: rsc id=%#x (v%u.%u), "
++		    "commands %#x/%#x/%#x = %u/%u/%u, control=%#x status=%#x\n", id, major, minor,
++		    word[0], word[1], word[2], vals[0], vals[1], vals[2],
++		    sy_rd(sy_rsc, b + L->control), sy_rd(sy_rsc, b + L->status));
++		rc = ETIMEDOUT;
++	}
++restore:
++	/* Proven or not, return the TCS to idle and put the interrupt mask back. */
++	(void)sy_rpmh_sync(b + L->control, SY_RPMH_AMC);
++	(void)sy_rpmh_sync(b + L->control, 0);
++	(void)sy_rpmh_sync(b + L->enable, 0);
++	(void)sy_rpmh_sync(b + L->wait, 0);
++	sy_wr(sy_rsc, SY_TCS_OFF + 8, bit);	/* W1C: only our TCS's bit */
++	(void)sy_rpmh_sync(SY_TCS_OFF, irq_en);
++out:
++	sy_rpmh_tried = true;
++	sy_rpmh_result = rc;
++	return rc;
 +}
 +
 +/* ---- clocks and serial engine --------------------------------------------------- */
@@ -882,15 +1157,16 @@ index 0000000..3a4063e
 +
 +/*
 + * Power-on in the stock order (MYRONC:230-245): reset level low before its
-+ * output enable (no glitch high), 2 ms, avdd on (GPIO 117 high), 3 ms, reset
-+ * high, then 200 ms of firmware boot. The pins are muxed first: SPI 48-51 as
-+ * qup4_se0 function 1 with the board data's drive and pull (MYRON:48-50), IRQ
-+ * as an input with a pull-up (MYRON:51), reset and avdd as outputs (MYRON:52).
-+ * No RPMh/RSC vote: avdd is this pin (MYRON:45), and iovdd (L4I) is a rail XNU
-+ * cannot switch (MYRONC:20) - see REPORT.md, D2.
++ * output enable (no glitch high), 2 ms, avdd on (GPIO 117 high), 3 ms, the
++ * iovdd vote through the apps RSC (L4I_E0 1.8 V, PAND:1430-1433 votes it before
++ * the reset is released too), reset high, then 200 ms of firmware boot. The pins
++ * are muxed first: SPI 48-51 as qup4_se0 function 1 with the board data's drive
++ * and pull (MYRON:48-50), IRQ as an input with a pull-up (MYRON:51), reset and
++ * avdd as outputs (MYRON:52). avdd is the pin (MYRON:45); iovdd is the rail
++ * nothing else has voted, so without it the chip never answers.
 + */
 +static void
-+sy_power_on(void)
++sy_power_on(bool vote)
 +{
 +	sy_gpio(48, SY_FUNC_QUP4_SE0, 0, 6, -1, true);		/* MISO, 6 mA, no pull */
 +	sy_gpio(49, SY_FUNC_QUP4_SE0, 0, 6, -1, true);		/* MOSI */
@@ -901,7 +1177,11 @@ index 0000000..3a4063e
 +	sy_sleep(2);
 +	sy_gpio(SY_AVDD, 0, 0, 4, 1, false);			/* avdd on */
 +	sy_sleep(3);
-+	sy_gpio(SY_RESET, 0, 0, 4, 1, false);
++	if (vote) {
++		int err = sy_rpmh_vote();			/* iovdd (L4I_E0) on */
++		printf("SONGYUAN TOUCH: RPMh: iovdd vote -> %d\n", err);
++	}
++	sy_gpio(SY_RESET, 0, 0, 4, 1, false);			/* reset high */
 +	sy_sleep(200);
 +}
 +
@@ -1164,9 +1444,11 @@ index 0000000..3a4063e
 +{
 +	unsigned delay_s = 5;
 +	unsigned hz = SY_SPI_HZ;
++	unsigned rpmh = 1;
 +	(void)arg;
 +	(void)result;
 +	(void)PE_parse_boot_argn("songyuan_ftsdelay", &delay_s, sizeof(delay_s));
++	(void)PE_parse_boot_argn("songyuan_ftsrpmh", &rpmh, sizeof(rpmh));
 +	if (PE_parse_boot_argn("songyuan_ftshz", &hz, sizeof(hz)) &&
 +	    (hz < SY_SPI_HZ_MIN || hz > SY_SPI_HZ_MAX)) {
 +		printf("SONGYUAN TOUCH: songyuan_ftshz=%u outside %u..%u, keeping %u\n", hz,
@@ -1174,8 +1456,8 @@ index 0000000..3a4063e
 +		hz = SY_SPI_HZ;
 +	}
 +	sy_set_hz(hz);
-+	printf("SONGYUAN TOUCH: starting in %u s, SPI %u Hz (div %u, %u Hz)\n", delay_s,
-+	    sy.hz, sy.spi_div, sy.actual_hz);
++	printf("SONGYUAN TOUCH: starting in %u s, SPI %u Hz (div %u, %u Hz), iovdd vote %s\n",
++	    delay_s, sy.hz, sy.spi_div, sy.actual_hz, rpmh ? "on" : "off (songyuan_ftsrpmh=0)");
 +	sy_sleep(delay_s * 1000u);
 +	sy.gcc = ml_io_map(SY_GCC_PA, 0x1f0000);
 +	sy.tlmm = ml_io_map(SY_TLMM_PA, 0xa0000);
@@ -1198,7 +1480,7 @@ index 0000000..3a4063e
 +	}
 +	sy_se_dump("after");
 +	sy_pins_dump("before");
-+	sy_power_on();
++	sy_power_on(rpmh != 0);
 +	if ((err = sy_fts_setup())) {
 +		printf("SONGYUAN TOUCH: FTS start failed %d\n", err);
 +		sy_pins_dump("after failed start");
