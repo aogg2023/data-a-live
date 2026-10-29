@@ -12,10 +12,10 @@ index 98d9d17..7917dcc 100644
  bsd/dev/pandora_gpi.c			standard
 diff --git a/bsd/dev/songyuan_touch.c b/bsd/dev/songyuan_touch.c
 new file mode 100644
-index 0000000..218f663
+index 0000000..3a4063e
 --- /dev/null
 +++ b/bsd/dev/songyuan_touch.c
-@@ -0,0 +1,1263 @@
+@@ -0,0 +1,1269 @@
 +/*
 + * SONGYUAN (Redmi K90 Pro Max, SM8850) main screen touch: FocalTech FT3683 on
 + * QUPv3 wrapper 4 SE0 (0x01a80000), polled through the wrapper's GPI DMA.
@@ -905,7 +905,9 @@ index 0000000..218f663
 +	sy_sleep(200);
 +}
 +
-+/* Chip id (MYRONC:337-347): 0xA3 must read 0x36 and 0x9F 0x83 (FT3683); 0xA6 is
++/* Chip id (MYRONC:337-347): 0xA3 read 0x36 and 0x9F 0x83 on the FT3683 myron tested;
++ * songyuan's Android module is focaltech_touch_3685g_1.ko, so FT3685G may answer
++ * differently: values are logged and a mismatch no longer stops the driver. 0xA6 is
 + * the firmware version and only gets logged. Five tries, 200 ms apart. */
 +static int
 +sy_fts_chip_id(void)
@@ -915,16 +917,20 @@ index 0000000..218f663
 +	for (unsigned t = 1; t <= SY_FTS_ID_TRIES; t++) {
 +		r3 = sy_fts_read(SY_FTS_ADDR_ID_A3, &a3, 1);
 +		r9f = sy_fts_read(SY_FTS_ADDR_ID_9F, &id9f, 1);
-+		if (!r3 && !r9f && a3 == SY_FTS_ID_A3 && id9f == SY_FTS_ID_9F) {
-+			break;
++		if (!r3 && !r9f) {
++			break;   /* reads answered; FT3685G ids are logged, not enforced */
 +		}
 +		sy_sleep(200);
 +	}
 +	rfw = sy_fts_read(SY_FTS_ADDR_FW, &fw, 1);
 +	printf("SONGYUAN TOUCH: chip id A3 %02x (err %d), 9F %02x (err %d), fw A6 %02x (err %d), "
 +	    "want %02x/%02x\n", a3, r3, id9f, r9f, fw, rfw, SY_FTS_ID_A3, SY_FTS_ID_9F);
-+	if (r3 || r9f || a3 != SY_FTS_ID_A3 || id9f != SY_FTS_ID_9F) {
++	if (r3 || r9f) {
 +		return ENODEV;
++	}
++	if (a3 != SY_FTS_ID_A3 || id9f != SY_FTS_ID_9F) {
++		printf("SONGYUAN TOUCH: chip ids %02x/%02x differ from the FT3683 reference %02x/%02x; continuing (FT3685G)\n",
++		    a3, id9f, SY_FTS_ID_A3, SY_FTS_ID_9F);
 +	}
 +	return 0;
 +}
