@@ -40,7 +40,7 @@ jobs:
       - name: build qemu payload (pandora twin ADT)
         run: |
           mkdir -p t out
-set -o pipefail
+          set -o pipefail
           for f in adt.py mkadt.py mkpayload.py qemu-sweet.py; do tr -d '\r' < iossweet/tools/$f > t/$f; done
           tr -d '\r' < tools/mkadt_pandora.py > t/mkadt_pandora.py
           sed -i "s/virt_base = text\['vmaddr'\] & ~(0x2000000 - 1)/virt_base = min(s['vmaddr'] for s in segs) \& ~(0x2000000 - 1)/" t/mkpayload.py
