@@ -12,10 +12,10 @@ index 98d9d17..7917dcc 100644
  bsd/dev/pandora_gpi.c			standard
 diff --git a/bsd/dev/songyuan_touch.c b/bsd/dev/songyuan_touch.c
 new file mode 100644
-index 0000000..85905aa
+index 0000000..be920f1
 --- /dev/null
 +++ b/bsd/dev/songyuan_touch.c
-@@ -0,0 +1,2407 @@
+@@ -0,0 +1,2483 @@
 +/*
 + * SONGYUAN (Redmi K90 Pro Max, SM8850) main screen touch: FocalTech FT3683 on
 + * QUPv3 wrapper 4 SE0 (0x01a80000), polled through the wrapper's GPI DMA.
@@ -75,6 +75,11 @@ index 0000000..85905aa
 + *                           bit 8     LOOPBACK self-test: the engine echoes TX
 + *                                     back to RX, so a frame whose RX equals TX
 + *                                     proves the engine/packing/DMA path
++ *                           bit 9     chip select with the engine's own commands
++ *                                     (SPI_CS_ASSERT 8 / SPI_CS_DEASSERT 9) and
++ *                                     FRAGMENTATION on the transfer command, the
++ *                                     way Linux's FIFO path does it; default is
++ *                                     automatic CS per command
 + *
 + * Power: avdd is a fixed regulator enabled by TLMM GPIO 117, active high
 + * (MYRON:45) - a pin. iovdd (L4I, 1.8 V) is an RPMh LDO: myron's driver leaves
@@ -340,11 +345,11 @@ index 0000000..85905aa
 +	unsigned variant;		/* songyuan_ftsvariant: one build sweeps the frame/mode doubts */
 +	unsigned path;			/* 0 SE DMA, 1 FIFO/PIO, 2 GPI DMA */
 +	uint32_t read_opcode;		/* 0xa0 (MYRONC), 0x80, 0xc0 or 0x00 from the variant */
-+	bool manual_cs, tx_then_rx, loopback;
++	bool manual_cs, tx_then_rx, loopback, cs_cmds;
 +	unsigned spi_mode;		/* variant bits 6:5: CPHA/CPOL */
 +	unsigned dbg;			/* songyuan_ftsdbg: dump GENI before/after every transfer */
 +	unsigned qup_major, qup_minor, fifo_depth, fifo_bits, oversample, se_clk_div;
-+	unsigned dma_errors, spi_count;
++	unsigned dma_errors, spi_count, fifo_logs;
 +	uint32_t se_tx_in, se_rx_in;
 +	unsigned level;			/* DFS level the RCG is on (PAND:304) */
 +	unsigned hz, spi_div, actual_hz;
@@ -1363,6 +1368,22 @@ index 0000000..85905aa
 +}
 +
 +/*
++ * Chip select with the engine's own commands, as Linux's FIFO path does it:
++ * SPI_CS_ASSERT = 8 and SPI_CS_DEASSERT = 9 are M_CMD opcodes, and the transfer
++ * command then carries FRAGMENTATION (bit 2) so the engine does not touch CS
++ * itself (spi-geni-qcom.c:63-69, 287-331, 906; the driver only registers a
++ * set_cs callback for FIFO mode, "for dma (gsi) mode, the gsi will set cs based
++ * on params passed in TRE", :1145-1151). Variant bit 9 selects this.
++ */
++static int
++sy_cs_cmd(bool assert)
++{
++	sy_wr(sy.se, SE_M_IRQ_CLR, 0xffffffffu);
++	sy_wr(sy.se, SE_M_CMD0, (assert ? 8u : 9u) << SE_M_CMD0_OPCODE_SHIFT);
++	return sy_geni_wait(SE_M_CMD_DONE, 20000);
++}
++
++/*
 + * Program and poll one command of the SE's DMA master (GeniSpi.c:219-293).
 + * tx/rx select the directions; cmd_word is the fully shifted SE_GENI_M_CMD0
 + * value (permission: TX_RX for one full-duplex command, TX_ONLY|fragmentation
@@ -1461,6 +1482,10 @@ index 0000000..85905aa
 +	memset(rxb, 0x5a, n);
 +	clean_dcache64((addr64_t)(sy.dma_pa + SY_TXB_OFF), n, 1);	/* the engine reads our bytes */
 +	flush_dcache64((addr64_t)(sy.dma_pa + SY_RXB_OFF), n, 1);	/* no stale line may win */
++	if (sy.cs_cmds && sy_cs_cmd(true)) {
++		printf("SONGYUAN TOUCH: SPI CS assert command failed\n");
++		return EIO;
++	}
 +	if (sy.tx_then_rx) {
 +		/* First the header out with the chip select held (fragmentation = bit 2),
 +		 * then a read-only command that clocks the answer in. */
@@ -1471,8 +1496,12 @@ index 0000000..85905aa
 +			    SE_M_CMD_RX_ONLY << SE_M_CMD0_OPCODE_SHIFT, &tdone, &rdone);
 +		}
 +	} else {
-+		err = sy_dma_run(true, true, n, SE_M_CMD_TX_RX << SE_M_CMD0_OPCODE_SHIFT,
++		err = sy_dma_run(true, true, n,
++		    SE_M_CMD_TX_RX << SE_M_CMD0_OPCODE_SHIFT | (sy.cs_cmds ? (1u << 2) : 0u),
 +		    &tdone, &rdone);
++	}
++	if (sy.cs_cmds) {
++		(void)sy_cs_cmd(false);
 +	}
 +	if (!err) {
 +		flush_dcache64((addr64_t)(sy.dma_pa + SY_RXB_OFF), n, 1);
@@ -1581,15 +1610,30 @@ index 0000000..85905aa
 +		cmd = SE_M_CMD_TX_RX;
 +	}
 +	sy_wr(sy.se, SE_M_IRQ_CLR, 0xffffffffu);
++	if (sy.cs_cmds && sy_cs_cmd(true)) {
++		printf("SONGYUAN TOUCH: SPI FIFO CS assert command failed\n");
++		return EIO;
++	}
 +	if (tx) {
 +		sy_wr(sy.se, SE_SPI_TX_LEN, n);
 +	}
 +	if (rx) {
 +		sy_wr(sy.se, SE_SPI_RX_LEN, n);
 +	}
-+	sy_wr(sy.se, SE_M_CMD0, cmd << SE_M_CMD0_OPCODE_SHIFT);
++	sy_wr(sy.se, SE_M_CMD0,
++	    (cmd << SE_M_CMD0_OPCODE_SHIFT) | (sy.cs_cmds ? (1u << 2) : 0u));
 +	if (tx && sy_fifo_tx(tx, n, &tx_rem, bpw)) {
 +		sy_wr(sy.se, SE_TX_WM, 1);
++	}
++	/* Did the FIFO writes land? A TX FIFO status of 0 right after 10 bytes were
++	 * pushed into it means the CPU-side FIFO interface is dead (IF_DISABLE bit 0);
++	 * that is what decides whether FIFO mode is usable at all. */
++	if (sy.fifo_logs++ < 2 || sy.dbg) {
++		printf("SONGYUAN TOUCH: SPI FIFO[%u] n %u after prime: status=%#x m_irq=%#x "
++		    "tx_status=%#x rx_status=%#x cmd0=%#x if_disable=%#x\n", sy.fifo_logs, n,
++		    sy_rd(sy.se, SE_STATUS), sy_rd(sy.se, SE_M_IRQ),
++		    sy_rd(sy.se, SE_TX_STATUS), sy_rd(sy.se, SE_RX_STATUS),
++		    sy_rd(sy.se, SE_M_CMD0), sy_rd(sy.se, SE_IF_DISABLE));
 +	}
 +	for (unsigned i = 0; i < 200000; i++) {
 +		uint32_t st = sy_rd(sy.se, SE_M_IRQ);
@@ -1620,11 +1664,16 @@ index 0000000..85905aa
 +		}
 +		delay(1);
 +	}
++	if (sy.cs_cmds) {
++		(void)sy_cs_cmd(false);
++	}
 +	if (err) {
 +		printf("SONGYUAN TOUCH: SPI FIFO failed %d (n %u, left tx %u rx %u): m_cmd0=%#x "
-+		    "m_irq=%#x status=%#x fifo tx=%#x rx=%#x\n", err, n, tx_rem, rx_rem,
-+		    sy_rd(sy.se, SE_M_CMD0), sy_rd(sy.se, SE_M_IRQ), sy_rd(sy.se, SE_STATUS),
-+		    sy_rd(sy.se, SE_TX_STATUS), sy_rd(sy.se, SE_RX_STATUS));
++		    "m_irq=%#x m_irq_en=%#x status=%#x fifo tx=%#x rx=%#x clk_sel=%#x m_clk=%#x\n",
++		    err, n, tx_rem, rx_rem, sy_rd(sy.se, SE_M_CMD0), sy_rd(sy.se, SE_M_IRQ),
++		    sy_rd(sy.se, SE_M_IRQ_EN), sy_rd(sy.se, SE_STATUS),
++		    sy_rd(sy.se, SE_TX_STATUS), sy_rd(sy.se, SE_RX_STATUS),
++		    sy_rd(sy.se, SE_CLK_SEL), sy_rd(sy.se, SE_M_CLK_CFG));
 +	}
 +	return err;
 +}
@@ -1817,6 +1866,31 @@ index 0000000..85905aa
 +	sy_gpio(49, SY_FUNC_QUP4_SE0, 0, 6, -1, true);
 +	sy_gpio(50, SY_FUNC_QUP4_SE0, 0, 4, -1, true);
 +	sy_gpio(51, SY_FUNC_QUP4_SE0, 3, 6, -1, true);
++}
++
++
++/*
++ * Is the chip's firmware running? After reset a FocalTech controller streams
++ * frames and pulls its IRQ line low again and again (Android's dmesg shows a
++ * continuous THP stream after reset). Count the edges on GPIO 158 for ~20 ms: no
++ * edge at all means no running firmware, whatever the SPI does.
++ */
++static void
++sy_irq_activity(void)
++{
++	unsigned changes = 0, last;
++
++	last = sy_rd(sy.tlmm, SY_GPIO(SY_IRQ) + 4) & 1u;
++	for (unsigned i = 0; i < 2000; i++) {
++		unsigned now = sy_rd(sy.tlmm, SY_GPIO(SY_IRQ) + 4) & 1u;
++		if (now != last) {
++			changes++;
++			last = now;
++		}
++		delay(10);
++	}
++	printf("SONGYUAN TOUCH: IRQ GPIO %u: %u edge(s) in ~20 ms, level now %u\n",
++	    SY_IRQ, changes, last);
 +}
 +
 +
@@ -2295,6 +2369,7 @@ index 0000000..85905aa
 +	sy.spi_mode = (sy.variant >> 5) & 3u;
 +	sy.tx_then_rx = (sy.variant & (1u << 7)) != 0;
 +	sy.loopback = (sy.variant & (1u << 8)) != 0;
++	sy.cs_cmds = (sy.variant & (1u << 9)) != 0;
 +	if (sy.path == 2 && (sy.spi_mode || sy.loopback || sy.tx_then_rx)) {
 +		printf("SONGYUAN TOUCH: mode/loopback/tx-then-rx are the myron paths' knobs; "
 +		    "ignored on the GPI path\n");
@@ -2337,6 +2412,7 @@ index 0000000..85905aa
 +	sy_pins_dump("before");
 +	sy_power_on(rpmh != 0);
 +	sy_pad_probe();		/* are the pads driven, and by whom, with the chip powered */
++	sy_irq_activity();	/* does the chip's firmware pull IRQ at all */
 +	if ((err = sy_fts_setup())) {
 +		printf("SONGYUAN TOUCH: FTS start failed %d\n", err);
 +		sy_pins_dump("after failed start");
