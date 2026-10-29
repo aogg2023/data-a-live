@@ -12,10 +12,10 @@ index 98d9d17..7917dcc 100644
  bsd/dev/pandora_gpi.c			standard
 diff --git a/bsd/dev/songyuan_touch.c b/bsd/dev/songyuan_touch.c
 new file mode 100644
-index 0000000..be920f1
+index 0000000..d3854fe
 --- /dev/null
 +++ b/bsd/dev/songyuan_touch.c
-@@ -0,0 +1,2483 @@
+@@ -0,0 +1,2545 @@
 +/*
 + * SONGYUAN (Redmi K90 Pro Max, SM8850) main screen touch: FocalTech FT3683 on
 + * QUPv3 wrapper 4 SE0 (0x01a80000), polled through the wrapper's GPI DMA.
@@ -2314,6 +2314,65 @@ index 0000000..be920f1
 +	    "id %02x %02x\n", w, r, id[0], id[1]);
 +}
 +
++/*
++ * The chip did not answer the normal chip-id read. Instead of one reboot per
++ * variant, try the plausible SPI configurations in one boot and print the table:
++ * engine (SE DMA / FIFO) x chip select (automatic / engine CS commands) x SPI mode
++ * 0..3. On the first set whose 0xA3 and 0x9F reads both complete with a plausible
++ * non-0x00/0xFF pair the driver keeps that set and carries on, so this boot can
++ * still bring the panel up.
++ */
++static void
++sy_probe_matrix(void)
++{
++	static const char *eng[2] = {"SE DMA", "FIFO"};
++	uint8_t id[2];
++	unsigned saved_path = sy.path, saved_mode = sy.spi_mode;
++	bool saved_cs = sy.cs_cmds, found = false;
++
++	for (unsigned e = 0; e < 2 && !found; e++) {
++		for (unsigned c = 0; c < 2 && !found; c++) {
++			for (unsigned m = 0; m < 4 && !found; m++) {
++				int ra, rb;
++				sy.path = e;
++				sy.cs_cmds = c != 0;
++				sy.spi_mode = m;
++				sy_wr(sy.se, SE_SPI_CPHA, (m & 1u) ? SE_SPI_CPHA_BIT : 0u);
++				sy_wr(sy.se, SE_SPI_CPOL, (m & 2u) ? SE_SPI_CPOL_BIT : 0u);
++				sy_engine_select(e);
++				id[0] = id[1] = 0;
++				ra = sy_fts_read(SY_FTS_ADDR_ID_A3, &id[0], 1);
++				rb = sy_fts_read(SY_FTS_ADDR_ID_9F, &id[1], 1);
++				printf("SONGYUAN TOUCH: probe %s cs=%s mode %u: 0xA3 err %d id %02x, "
++				    "0x9F err %d id %02x\n", eng[e], c ? "cmd" : "auto", m, ra,
++				    id[0], rb, id[1]);
++				if ((sy_rd(sy.se, SE_STATUS) & 1u) || (sy_rd(sy.se, SE_M_IRQ) & SE_M_ERRORS)) {
++					sy_geni_recover();
++					sy_wr(sy.se, SE_DMA_TX_FSM_RST, 1);
++					sy_wr(sy.se, SE_DMA_RX_FSM_RST, 1);
++				}
++				if (!ra && !rb && id[0] != 0x00 && id[0] != 0xff &&
++				    id[1] != 0x00 && id[1] != 0xff) {
++					found = true;
++					printf("SONGYUAN TOUCH: probe found a working set: %s, "
++					    "cs=%s, mode %u, id %02x %02x\n", eng[e],
++					    c ? "cmd" : "auto", m, id[0], id[1]);
++				}
++			}
++		}
++	}
++	if (!found) {
++		sy.path = saved_path;
++		sy.spi_mode = saved_mode;
++		sy.cs_cmds = saved_cs;
++		sy_wr(sy.se, SE_SPI_CPHA, (saved_mode & 1u) ? SE_SPI_CPHA_BIT : 0u);
++		sy_wr(sy.se, SE_SPI_CPOL, (saved_mode & 2u) ? SE_SPI_CPOL_BIT : 0u);
++		sy_engine_select(sy.path);
++		printf("SONGYUAN TOUCH: probe matrix found no answer "
++		    "(check IRQ level, power, reset, Android dmesg)\n");
++	}
++}
++
 +/* Identify and TIC, without touching reset: what follows sy_power_on(). */
 +static int
 +sy_fts_setup(void)
@@ -2321,7 +2380,10 @@ index 0000000..be920f1
 +	int err;
 +	if ((err = sy_fts_chip_id())) {
 +		sy_fts_rom_id();	/* diagnostic: chip in its ROM loader, or mute? */
-+		return err;
++		sy_probe_matrix();	/* one boot, every plausible SPI configuration */
++		if ((err = sy_fts_chip_id())) {
++			return err;
++		}
 +	}
 +	return sy_fts_tic();
 +}
