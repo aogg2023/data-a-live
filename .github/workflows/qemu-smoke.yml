@@ -22,7 +22,7 @@ jobs:
       - name: deps
         run: |
           sudo apt-get update
-          sudo apt-get install -y qemu-system-arm python3 gh jq
+          sudo apt-get install -y qemu-system-arm python3 gh jq llvm
 
       - name: kernel artifact
         env:
