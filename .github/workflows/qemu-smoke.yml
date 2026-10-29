@@ -1,0 +1,65 @@
+name: qemu-smoke
+on:
+  workflow_dispatch:
+    inputs:
+      run_id:
+        description: xnu-songyuan run id whose xnu-kernel artifact to boot in QEMU
+        required: true
+      secs:
+        description: seconds to emulate
+        default: "60"
+      extra:
+        description: extra kernel cmdline
+        default: ""
+
+jobs:
+  smoke:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y qemu-system-arm python3 gh jq
+
+      - name: kernel artifact
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh run download "${{ inputs.run_id }}" -n xnu-kernel -D k -R "$GITHUB_REPOSITORY"
+          ls -l k | head
+          find k -name 'kernel.development.pandora' -o -name '*.unstripped*' | head -5
+
+      - name: ios-sweet qemu tools
+        run: |
+          git clone -q --depth 1 https://github.com/dip-studio/ios-sweet iossweet || true
+          ls iossweet/tools | head -20
+
+      - name: build qemu payload (pandora twin ADT)
+        run: |
+          mkdir -p t
+          for f in adt.py mkadt.py mkpayload.py qemu-sweet.py; do tr -d '\r' < iossweet/tools/$f > t/$f; done
+          tr -d '\r' < tools/mkadt_pandora.py > t/mkadt_pandora.py
+          sed -i "s/virt_base = text\['vmaddr'\] & ~(0x2000000 - 1)/virt_base = min(s['vmaddr'] for s in segs) \& ~(0x2000000 - 1)/" t/mkpayload.py
+          grep -q "virt_base = min(s\['vmaddr'\] for s in segs)" t/mkpayload.py
+          K=$(find k -name 'kernel.development.pandora' | head -1)
+          U=$(find k -name '*.unstripped*' | head -1); [ -n "$U" ] || U=$K
+          echo "kernel $K symbols $U"
+          python3 t/mkadt_pandora.py out/q.adt --qemu 2>&1 | tail -2
+          python3 t/mkpayload.py "$K" out/q.adt out/payload.bin --cmdline "debug=0xc serial=3 cpus=1 keepsyms=1 -enable_kprintf_spam -noprogress ${{ inputs.extra }}" 2>&1 | tail -3
+          echo "symbols=$U" >> $GITHUB_ENV
+
+      - name: emulate
+        run: |
+          python3 t/qemu-sweet.py out/payload.bin out/q --secs "${{ inputs.secs }}" --kernel "$symbols" 2>&1 | tail -25
+          echo '== result:' ; cat out/q/result.json 2>/dev/null
+          echo '== exceptions:'; grep -c 'Taking exception' out/q/qemu.log || true
+          echo '== fb text (tail):'; grep -v '^\s*$' out/q/fb.txt 2>/dev/null | tail -30 || true
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: qemu-out
+          path: out/q
+          if-no-files-found: error
