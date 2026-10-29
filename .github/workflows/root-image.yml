@@ -57,6 +57,14 @@ jobs:
           ls -l root.img
           sudo chown "$(id -u):$(id -g)" root.img
 
+      - name: stage the cryptexes into the root (fuxi-stage-root)
+        run: |
+          sudo mkdir -p /mnt/iosroot
+          sudo mount -t hfsplus -o loop,force root.img /mnt/iosroot
+          sudo python3 ios-fuxi/tools/fuxi-stage-root.py /mnt/iosroot
+          sudo umount /mnt/iosroot
+          sudo chown "$(id -u):$(id -g)" root.img
+
       - name: SWEET root tweaks (launchd/CommCenter, containers, migration, Setup skip, activation)
         run: |
           sudo mkdir -p /mnt/iosroot
