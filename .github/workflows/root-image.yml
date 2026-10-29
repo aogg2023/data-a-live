@@ -8,6 +8,9 @@ on:
       root_size:
         description: HFS+ image size
         default: 12G
+      variant:
+        description: optional staging variant (uikitcore-assets)
+        default: ''
 
 jobs:
   root:
@@ -73,6 +76,19 @@ jobs:
           sudo umount /mnt/iosroot
           sudo fsck.hfsplus -f -y root.img | grep -v 'Illegal name' || true
           sudo fsck.hfsplus -f -n root.img
+          sudo chown "$(id -u):$(id -g)" root.img
+
+      - name: variant - copy BoundingPath assets into UIKitCore.framework
+        if: inputs.variant == 'uikitcore-assets'
+        run: |
+          sudo mkdir -p /mnt/iosroot
+          sudo mount -t hfsplus -o loop,force root.img /mnt/iosroot
+          SRC=/mnt/iosroot/System/Library/PrivateFrameworks/UIKitCore.framework/BoundingPathData.bundle/Assets.car
+          DST=/mnt/iosroot/System/Library/PrivateFrameworks/UIKitCore.framework/Assets.car
+          sudo test -f "$SRC"
+          sudo cp -a "$SRC" "$DST"
+          ls -l "$DST"
+          sudo umount /mnt/iosroot
           sudo chown "$(id -u):$(id -g)" root.img
 
       - name: pinfile (NDK)
