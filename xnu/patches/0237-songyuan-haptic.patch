@@ -1,0 +1,520 @@
+diff --git a/bsd/conf/files b/bsd/conf/files
+index 920f8ce..98d9d17 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -121,6 +121,7 @@ bsd/dev/qcom/QcomGlink.c		standard
+ bsd/dev/qcom/ShengGpr.c			standard
+ bsd/dev/qcom/FatVolume.c		standard
+ bsd/dev/pandora_ipcrtr.c		standard
++bsd/dev/songyuan_haptic.c		standard
+ bsd/dev/pandora_files.c			standard
+ bsd/dev/pandora_gpu.c			standard
+ bsd/dev/pandora_cpu.c			standard
+diff --git a/bsd/dev/songyuan_haptic.c b/bsd/dev/songyuan_haptic.c
+new file mode 100644
+index 0000000..2abc089
+--- /dev/null
++++ b/bsd/dev/songyuan_haptic.c
+@@ -0,0 +1,477 @@
++/*
++ * SONGYUAN (Redmi K90 Pro Max, SM8850) vibration motor: the PMIC's "hv-haptics"
++ * block (qcom,hv-haptics), reached over SPMI on the PMIH010X at SPMI slave 7 --
++ * three peripherals, 0x7f0 the driver (HAP), 0x7f1 its pattern engine, 0x7f2
++ * its boost regulator (annibale_haptic.c:18-20, annibale_haptic_data.h:57-59).
++ *
++ * This is the REDMI K90 (annibale, SM8750) driver's level 1 -- a survey,
++ * reading only -- moved onto the SPMI PMIC arbiter v8 access layer that is
++ * already proven on songyuan (patches/0128-pandora-keys-spmi-v8-tlmm.patch:
++ * core 0x0c400000, chnl_map 0x0c403000, chnl_owner 0x0c42a000, observer
++ * 0x0c4c0000 + 0x20 * apid, APID lookup by PPID, EXT_READL commands).
++ * annibale's driver speaks the v7 layout; 0128 speaks v8, and only the latter
++ * is used here.
++ *
++ * Sources, per constant, are given next to it and tabulated in REPORT.md:
++ *   A     = E:\songyuan\ref\hkwork\xnu\files\bsd\dev\annibale_haptic.c
++ *   D     = E:\songyuan\ref\hkwork\xnu\files\bsd\dev\annibale_haptic_data.h
++ *   P128  = E:\songyuan\ref\data-a-live\xnu\patches\0128-pandora-keys-spmi-v8-tlmm.patch
++ *
++ * Confirmed for songyuan: the SPMI arbiter v8 and its addresses (0128 is
++ * already running there; the boot log shows "PANDORA KEYS: arbiter
++ * version=0x80000001 bus0 apids=2048"), and that a PMIH010X exists at SPMI
++ * slave 7 (base DT: /soc/pmic-arb-debug@11314000/spmi@1/pmih010x@7, reg
++ * <7 0>).
++ * NOT confirmed: that the haptics block is reachable from the AP, and every
++ * motor parameter -- songyuan's qcom,hv-haptics@f000 node lives in the
++ * overlay dtbo, so the base DT has no "hv-haptics" string at all (0 matches
++ * in canoe-base.dtb). See the TODO(songyuan) block below.
++ *
++ * The base DT puts PMIH010X@7 on spmi@1 (bus 1), while 0128 reads bus 0
++ * (PMK8850/PON, 2048 APIDs). The lookup therefore scans the whole 8192-entry
++ * chnl_map window (its size is 0x8000 in the DT, and 0128:35 has 8192 as
++ * PK_MAX_APIDS), preferring a bus-0 entry; a hit at APID >= bus0_count is
++ * printed as a bus-1 candidate, and its owner is not read because 0128
++ * defines only the bus-0 owner table.
++ *
++ * Boot-arg: songyuan_haptic=1. Nothing runs unless it is given: the driver is
++ * off by default, and level 1 is what it asks for. Levels 2..4 are named in
++ * annibale_haptic.c:33-41 but are NOT implemented here: they write the PMIC,
++ * and no write has been validated on songyuan. A wrong write to a PMIC can
++ * reset or brick the phone, which is why this port stops at reading.
++ *
++ * Read-only: the only store in this file is the EXT_READL command word in the
++ * arbiter's observer channel (P128:27-28), never a PMIC register. There is no
++ * write function in this file at all.
++ */
++#if defined(SONGYUAN) || defined(PANDORA)
++
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <kern/clock.h>
++#include <kern/thread.h>
++#include <kern/sched_prim.h>
++#include <machine/machine_routines.h>
++#include <pexpert/pexpert.h>
++
++extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
++extern kern_return_t thread_terminate(thread_t thread);
++
++void songyuan_haptic_init(void);
++
++/* ---- the SPMI PMIC arbiter v8, as 0128 uses it on this phone ---------------- */
++
++/* Windows of the first controller, qcom,canoe-spmi-pmic-arb (P128:30-35). The
++ * base DT's /soc/arbiter@c400000 has the same reg-names core|chnls|obsrvr|
++ * chnl_map with core 0x0c400000/0x3000, chnls 0x0c900000/0x40000, obsrvr
++ * 0x0c4c0000/0x40000, chnl_map 0x0c403000/0x8000. */
++#define SH_CORE_PA		0x0c400000u	/* P128:30 */
++#define SH_MAP_PA		0x0c403000u	/* P128:31 */
++#define SH_OWN_PA		0x0c42a000u	/* P128:32, bus 0 owner table */
++#define SH_OBS_PA		0x0c4c0000u	/* P128:33, EE 0 */
++#define SH_CORE_SIZE		0x1000u		/* P128:81 */
++#define SH_MAP_SIZE		0x8000u		/* P128:82; 8192 entries * 4 */
++#define SH_OWN_SIZE		0x8000u		/* P128:83 */
++#define SH_OBS_SIZE		0x40000u	/* P128:84; 8192 channels * 0x20 */
++
++#define SH_MAX_APIDS		8192u		/* P128:35 */
++#define SH_APID_MASK		0x1fffu		/* P128:21 (13 bits), P128:97 (mask) */
++#define SH_PPID_MASK		0x1fffu		/* P128:57, PPID[12:0] */
++#define SH_ARB_VERSION_8	0x80000000u	/* P128:99 */
++#define SH_EE			0u		/* D:28-29, the application processor; P128:33 EE 0 */
++
++#define SH_REG_ARB_VERSION	0x000u		/* P128:96 */
++#define SH_REG_ARB_FEATURES	0x004u		/* P128:97, [12:0] = bus 0 APIDs */
++
++/* One observer channel: same CMD/STATUS/RDATA0 as v7 (P128:24, D:33-50). */
++#define SH_CH_CMD		0x00u		/* D:35 */
++#define SH_CH_STATUS		0x08u		/* D:36 */
++#define SH_CH_RDATA0		0x18u		/* D:39 */
++#define SH_STATUS_DONE		0x01u		/* D:41 */
++#define SH_STATUS_FAILURE	0x02u		/* D:42 */
++#define SH_STATUS_DENIED	0x04u		/* D:43 */
++#define SH_STATUS_DROPPED	0x08u		/* D:44 */
++#define SH_STATUS_ERRORS	(SH_STATUS_FAILURE | SH_STATUS_DENIED | SH_STATUS_DROPPED)
++
++/* opcode 1 (EXT_READL) at bit 27, register offset [11:4], bytes - 1 in [2:0]:
++ * D:45-48; the command the v7 read loop 0128 reuses writes is (1u << 27) |
++ * (reg << 4) for one byte (see fuxi_keys.c's fk_read, 0092:100). */
++#define SH_CMD_EXT_READL	(1u << 27)
++#define SH_CMD_REG(reg)		(((uint32_t)(reg) & 0xffu) << 4)
++#define SH_POLL_LIMIT		1000u
++
++/* ---- the three peripherals of the PMIH010X at slave 7 (D:52-59, A:18-20) -- */
++
++#define SH_PPID_DRIVER		0x7f0u		/* D:57, driver/HAP, registers 0xf0xx */
++#define SH_PPID_PATTERN		0x7f1u		/* D:58, pattern engine, 0xf1xx */
++#define SH_PPID_BOOST		0x7f2u		/* D:59, boost regulator, 0xf2xx */
++
++/* ---- the driver block, PMIH010X function 0xf0 (D:60-84) --------------------- */
++
++#define SH_REG_DRIVER_REVISION	0xf000u		/* D:62, 2 bytes, minor low (A:354-356) */
++#define SH_REG_HPWR_INTF	0xf00bu		/* D:63 (A:365) */
++#define SH_REG_FAULT_STATUS	0xf00cu		/* D:64 (A:363, A:371) */
++#define SH_REG_RT_LRA_IMPED	0xf00eu		/* D:65, 2 bytes (A:366) */
++#define SH_REG_INT_RT_STS	0xf010u		/* D:66 (A:364) */
++#define SH_REG_EN_CTL		0xf046u		/* D:67-68, bit 7 = module enable (A:380-387) */
++#define SH_REG_VMAX		0xf048u		/* D:69, millivolts / 50 (A:411) */
++#define SH_REG_DRV_WF_SEL	0xf049u		/* D:70, [1:0] shape, bit 4 two's complement (A:430) */
++#define SH_REG_SPMI_PLAY	0xf04cu		/* D:72-75 (A:445-451) */
++#define SH_REG_BRAKE_MODE	0xf050u		/* D:76 (A:421) */
++#define SH_REG_TLRA_HIGH	0xf05cu		/* D:77, two bytes big-endian, steps of 5 us (A:414-419) */
++#define SH_REG_FAULT_CLR	0xf066u		/* D:78-79 (A:400-405) */
++
++/* ---- the pattern engine, PMIH010X function 0xf1 (D:81-84) ------------------ */
++
++#define SH_REG_PTN_REVISION	0xf100u		/* D:81 (A:357) */
++#define SH_REG_PTN_FIFO_READY	0xf108u		/* D:82 (A:367) */
++#define SH_REG_PTN_DIRECT_PLAY	0xf126u		/* D:83 (A:445, A:582) */
++#define SH_REG_PTN_BRAKE_SAMPLES 0xf170u	/* D:84 (A:424-429) */
++
++/* The boost regulator's revision: annibale reads two bytes at register 0
++ * (A:360); there is no named constant for it in D. */
++#define SH_REG_BOOST_REVISION	0x0000u		/* A:360 */
++
++/* -----------------------------------------------------------------------------
++ * TODO(songyuan): from annibale DT, unconfirmed for this phone
++ *
++ * songyuan's qcom,hv-haptics@f000 node is in the overlay dtbo, not in the base
++ * DT (canoe-base.dtb contains no "hv-haptics" string). So none of the motor's
++ * numbers is confirmed for this phone; every value below is annibale's. They
++ * are defined here, in one place, and are used only by the level-2+ sketch
++ * text: no code below writes them to the PMIC.
++ *
++ * annibale's device tree says: lra-period-us 0x1652 = 5714 us, vmax-mv 0x514
++ * = 1300 mV, qcom,brake-pattern ff 3f 1f, closed-loop brake mode 1, sine
++ * brake and drive waveforms, sine gain 0 (A:21-24, D:86-89). The two derived
++ * register bytes are annibale's encoding of those properties: brake mode
++ * (1 << 6) | 0x01 = 0x41 (A:421), drive waveform 0x10 | 0x01 = 0x11 (A:430).
++ * -------------------------------------------------------------------------- */
++#define SH_LRA_PERIOD_US	5714u		/* A:21, D:86: DT lra-period-us 0x1652 */
++#define SH_VMAX_MV		1300u		/* A:22, D:87: DT vmax-mv 0x514, in 50 mV steps */
++#define SH_BRAKE_MODE		0x41u		/* A:421: closed-loop brake (1 << 6), sine, gain 0 */
++#define SH_DRIVE_WAVE		0x11u		/* A:430: two's complement, sine drive */
++
++static const uint8_t sh_brake_samples[8] __unused = {
++	0xff, 0x3f, 0x1f, 0x00, 0x00, 0x00, 0x00, 0x00	/* A:23, D:84, D:89 */
++};
++
++/* ---- state ----------------------------------------------------------------- */
++
++struct sh_peripheral {
++	uint16_t	ppid;		/* slave << 8 | function, 0x7f0..0x7f2 */
++	uint16_t	revision_reg;	/* where its two-byte revision lives */
++	const char	*name;
++	uint16_t	apid;		/* the channel it is reached through */
++	unsigned	owner;		/* bus-0 owner, 7 when unknown */
++	unsigned	matches;	/* map entries carrying this PPID */
++	bool		on_bus0;	/* APID below the bus-0 count */
++	bool		found;
++};
++
++static struct sh_peripheral sh_peripherals[] = {
++	{ SH_PPID_DRIVER,  SH_REG_DRIVER_REVISION, "driver (HAP)",    0xffffu, 7, 0, false, false },
++	{ SH_PPID_PATTERN, SH_REG_PTN_REVISION,    "pattern engine",  0xffffu, 7, 0, false, false },
++	{ SH_PPID_BOOST,   SH_REG_BOOST_REVISION,  "boost regulator", 0xffffu, 7, 0, false, false },
++};
++
++static vm_offset_t sh_core, sh_map, sh_own, sh_obs;
++static uint32_t sh_last_status;
++static int sh_level;
++static bool sh_started;
++
++/* ---- the arbiter, read only ------------------------------------------------- */
++
++/* Before the first access to each register region: say which, then wait 2 s,
++ * so a reset from a protected region leaves its name on the screen (P128:42-48). */
++static void
++sh_step(const char *what, uint32_t pa)
++{
++	printf("SONGYUAN HAPTIC: next: first read of %s at %#x\n", what, pa);
++	delay_for_interval(2000, NSEC_PER_MSEC);
++}
++
++static uint32_t
++sh_rd(vm_offset_t base, uint32_t offset)
++{
++	uint32_t value = *(volatile uint32_t *)(base + offset);
++
++	__asm__ volatile("dmb oshld" ::: "memory");
++	return value;
++}
++
++/*
++ * One byte out of one peripheral, through the observer channel of its APID:
++ * the command word is EXT_READL (P128:27-28, 0128's only kind of store), the
++ * channel layout is v7's (D:33-50), and the poll loop is fk_read's (0092:104-
++ * 115), which 0128's v8 setup uses for its reads. Only one byte per command:
++ * EXT_READL is what 0128 uses.
++ */
++static bool
++sh_read_byte(uint16_t apid, uint16_t reg, uint8_t *out)
++{
++	vm_offset_t channel = sh_obs + 0x20u * (uint32_t)apid;	/* P128:23-24 */
++	uint32_t command = SH_CMD_EXT_READL | SH_CMD_REG(reg);
++
++	__asm__ volatile("dmb oshst" ::: "memory");
++	*(volatile uint32_t *)(channel + SH_CH_CMD) = command;
++	__asm__ volatile("dsb osh" ::: "memory");
++	for (unsigned i = 0; i < SH_POLL_LIMIT; i++) {
++		sh_last_status = sh_rd(channel, SH_CH_STATUS);
++		if (sh_last_status & SH_STATUS_DONE) {
++			if (sh_last_status & SH_STATUS_ERRORS) {
++				return false;
++			}
++			*out = (uint8_t)sh_rd(channel, SH_CH_RDATA0);
++			return true;
++		}
++		delay(1);
++	}
++	return false;
++}
++
++/* The register address is 16 bits for the log, but only its low byte travels
++ * in the SPMI command: the PPID already selects function 0xf0/0xf1/0xf2 (D:45-
++ * 46, A:416, A:425). Two-byte registers are read one byte at a time, low
++ * address first, which is how the driver composes a revision or impedance. */
++static bool
++sh_read(uint16_t ppid, uint16_t apid, uint16_t reg, uint8_t *bytes, uint32_t count)
++{
++	for (uint32_t i = 0; i < count; i++) {
++		if (!sh_read_byte(apid, (uint16_t)(reg + i), &bytes[i])) {
++			printf("SONGYUAN HAPTIC: reading PPID %#05x register %#06x failed: arbiter status %#x\n",
++			    ppid, reg + i, sh_last_status);
++			return false;
++		}
++	}
++	return true;
++}
++
++/*
++ * Which channel each PPID has. 0128:50-68 scans only the bus-0 APIDs and
++ * keeps an EE-0-owned entry; that preference is kept here, while the loop
++ * itself runs over the whole 8192-entry map window: the base DT sizes chnl_map
++ * at 0x8000 (8192 * 4), 0128:35 calls 8192 the maximum APID, and the base DT
++ * puts PMIH010X@7 on spmi@1 (bus 1), whose APIDs may lie above bus 0's 2048.
++ * A match at APID >= bus0_count is a bus-1 candidate; its owner is left at 7
++ */
++static uint16_t
++sh_find_apid(uint16_t ppid, uint32_t bus0_count, unsigned *owner_out, unsigned *matches_out, bool *on_bus0_out)
++{
++	uint16_t best = 0xffffu;
++	unsigned best_owner = 7;
++	bool best_on_bus0 = false;
++	unsigned matches = 0;
++
++	for (uint32_t i = 0; i < SH_MAX_APIDS; i++) {
++		uint32_t map = sh_rd(sh_map, 4u * i);
++
++		if (map == 0 || (map & SH_PPID_MASK) != ppid) {
++			continue;
++		}
++		matches++;
++		if (i < bus0_count) {
++			unsigned owner = sh_rd(sh_own, 4u * i) & 7u;
++
++			/* Prefer an EE-0-owned bus-0 entry, then any bus-0 entry. */
++			if (best == 0xffffu || !best_on_bus0 || owner == SH_EE) {
++				best = (uint16_t)i;
++				best_owner = owner;
++				best_on_bus0 = true;
++			}
++		} else if (best == 0xffffu) {
++			best = (uint16_t)i;
++			best_owner = 7;
++			best_on_bus0 = false;
++		}
++	}
++	*owner_out = best_owner;
++	*matches_out = matches;
++	*on_bus0_out = best_on_bus0;
++	return best;
++}
++
++/* ---- what the survey prints -------------------------------------------------- */
++
++static void
++sh_show_revision(const struct sh_peripheral *peripheral)
++{
++	uint8_t revision[2] = { 0, 0 };
++
++	if (!sh_read(peripheral->ppid, peripheral->apid, peripheral->revision_reg, revision, 2)) {
++		return;
++	}
++	printf("SONGYUAN HAPTIC: %s revision %#06x = %#02x.%#02x\n", peripheral->name, peripheral->revision_reg,
++	    revision[1], revision[0]);
++}
++
++static void
++sh_show_byte(const char *what, uint16_t ppid, uint16_t apid, uint16_t reg)
++{
++	uint8_t value = 0;
++
++	if (sh_read(ppid, apid, reg, &value, 1)) {
++		printf("SONGYUAN HAPTIC: %s %#06x = %#02x\n", what, reg, value);
++	}
++}
++
++static void
++sh_show_driver_state(void)
++{
++	struct sh_peripheral *driver = &sh_peripherals[0];
++	uint8_t fault = 0, impedance[2] = { 0, 0 };
++	unsigned mohm;
++
++	if (!driver->found) {
++		printf("SONGYUAN HAPTIC: the driver (0x7f0) was not found on the map: its status and fault registers cannot be read\n");
++		return;
++	}
++	if (sh_read(driver->ppid, driver->apid, SH_REG_FAULT_STATUS, &fault, 1)) {
++		printf("SONGYUAN HAPTIC: driver fault-status %#06x = %#02x\n", SH_REG_FAULT_STATUS, fault);
++		if (fault != 0) {
++			printf("SONGYUAN HAPTIC: a fault bit is set (under-voltage, over-current, over-temperature, or the boost's; A:371)\n");
++		}
++	}
++	sh_show_byte("driver int-rt-sts", driver->ppid, driver->apid, SH_REG_INT_RT_STS);
++	sh_show_byte("driver hpwr-intf", driver->ppid, driver->apid, SH_REG_HPWR_INTF);
++	if (sh_read(driver->ppid, driver->apid, SH_REG_RT_LRA_IMPED, impedance, 2)) {
++		mohm = (unsigned)impedance[0] | (unsigned)impedance[1] << 8;
++		printf("SONGYUAN HAPTIC: driver rt-lra-imped %#06x = %#06x (%u mohm)\n", SH_REG_RT_LRA_IMPED,
++		    mohm, mohm);
++	}
++	sh_show_byte("driver en-ctl", driver->ppid, driver->apid, SH_REG_EN_CTL);
++	if (sh_peripherals[1].found) {
++		sh_show_byte("pattern fifo-ready", sh_peripherals[1].ppid, sh_peripherals[1].apid, SH_REG_PTN_FIFO_READY);
++	}
++}
++
++static void
++sh_thread(void *parameter, wait_result_t result)
++{
++	struct sh_peripheral *first = NULL;
++	uint32_t version, bus0_count;
++	unsigned found = 0;
++
++	(void)parameter;
++	(void)result;
++
++	sh_core = ml_io_map(SH_CORE_PA, SH_CORE_SIZE);
++	sh_map = ml_io_map(SH_MAP_PA, SH_MAP_SIZE);
++	sh_own = ml_io_map(SH_OWN_PA, SH_OWN_SIZE);
++	sh_obs = ml_io_map(SH_OBS_PA, SH_OBS_SIZE);
++	if (sh_core == 0 || sh_map == 0 || sh_own == 0 || sh_obs == 0) {
++		printf("SONGYUAN HAPTIC: MMIO mapping failed (core %#x map %#x owner %#x observer %#x)\n",
++		    (uint32_t)sh_core, (uint32_t)sh_map, (uint32_t)sh_own, (uint32_t)sh_obs);
++		goto done;
++	}
++	printf("SONGYUAN HAPTIC: level %d: read-only survey (no PMIC register is written)\n", sh_level);
++
++	sh_step("arbiter core (version)", SH_CORE_PA);
++	version = sh_rd(sh_core, SH_REG_ARB_VERSION);
++	bus0_count = sh_rd(sh_core, SH_REG_ARB_FEATURES) & SH_APID_MASK;
++	printf("SONGYUAN HAPTIC: arbiter version=%#x bus0 apids=%u (map window %u entries)\n", version, bus0_count,
++	    SH_MAX_APIDS);
++	if (version < SH_ARB_VERSION_8 || bus0_count == 0 || bus0_count > SH_MAX_APIDS) {
++		printf("SONGYUAN HAPTIC: not an arbiter v8 (or no bus 0 APIDs): nothing more is done\n");
++		goto done;
++	}
++
++	sh_step("APID->PPID map (chnl_map)", SH_MAP_PA);
++	(void)sh_rd(sh_map, 0);
++	sh_step("bus 0 owner table", SH_OWN_PA);
++	(void)sh_rd(sh_own, 0);
++
++	for (unsigned i = 0; i < sizeof(sh_peripherals) / sizeof(sh_peripherals[0]); i++) {
++		struct sh_peripheral *peripheral = &sh_peripherals[i];
++		uint16_t apid;
++
++		apid = sh_find_apid(peripheral->ppid, bus0_count, &peripheral->owner, &peripheral->matches,
++		    &peripheral->on_bus0);
++		if (apid == 0xffffu) {
++			printf("SONGYUAN HAPTIC: no map entry has PPID %#05x (%s) in %u entries\n", peripheral->ppid,
++			    peripheral->name, SH_MAX_APIDS);
++			continue;
++		}
++		peripheral->apid = apid;
++		peripheral->found = true;
++		if (peripheral->on_bus0) {
++			printf("SONGYUAN HAPTIC: PPID %#05x -> APID %u (owner ee%u from the bus-0 table; %u map "
++			    "entries)\n", peripheral->ppid, apid, peripheral->owner, peripheral->matches);
++		} else {
++			printf("SONGYUAN HAPTIC: PPID %#05x -> APID %u (beyond bus 0's %u APIDs: bus-1 candidate, "
++			    "owner not read; %u map entries)\n", peripheral->ppid, apid, bus0_count, peripheral->matches);
++		}
++		if (first == NULL) {
++			first = peripheral;
++		}
++		found++;
++	}
++
++	if (found == 0) {
++		printf("SONGYUAN HAPTIC: the base DT puts PMIH010X@7 on spmi@1 (bus 1); 0128 defines only the bus-0 "
++		    "APID count and owner table, so reading a block that is not in this map needs bus-1 facts that "
++		    "are TODO(songyuan)\n");
++		goto done;
++	}
++
++	/* The first read of a peripheral: name the channel first (P128:110). */
++	sh_step("observer channel of the first haptics APID", SH_OBS_PA + 0x20u * (uint32_t)first->apid);
++	for (unsigned i = 0; i < sizeof(sh_peripherals) / sizeof(sh_peripherals[0]); i++) {
++		if (sh_peripherals[i].found) {
++			sh_show_revision(&sh_peripherals[i]);
++		}
++	}
++	sh_show_driver_state();
++	printf("SONGYUAN HAPTIC: survey done: %u of 3 PPIDs found, no PMIC register was written\n", found);
++
++	if (sh_level >= 2) {
++		/*
++		 * TODO(songyuan): levels 2..4 are NOT implemented. For the record,
++		 * annibale would now enable the module (0xf046 = 0x80, A:383-387),
++		 * clear the faults (0xf066 = 0x07, A:400-405), write VMAX
++		 * (0xf048 = 1300 / 50, A:411), the motor period (0xf05c, two bytes
++		 * big-endian = 5714 / 5, A:414-419), the brake mode (0xf050 = 0x41,
++		 * A:421), eight brake samples (0xf170, A:424-429) and the drive
++		 * waveform (0xf049 = 0x11, A:430), then play DIRECT_PLAY (0xf126)
++		 * with 0xf04c bit 7 (A:441-465). None of that is done here: the v8
++		 * write-channel base/stride is not in 0128 (which is read-only),
++		 * and a write to a PMIC can reset this phone.
++		 */
++		printf("SONGYUAN HAPTIC: level %d is TODO(songyuan)/unvalidated: levels 2..4 write the PMIC and are "
++		    "not implemented; only the survey ran. (Sketch, not executed: %u us, %u mV, brake %02x %02x %02x, "
++		    "brake-mode %#04x, drive-wave %#04x.)\n", sh_level, SH_LRA_PERIOD_US, SH_VMAX_MV,
++		    sh_brake_samples[0], sh_brake_samples[1], sh_brake_samples[2], SH_BRAKE_MODE, SH_DRIVE_WAVE);
++	}
++done:
++	(void)thread_terminate(current_thread());
++	thread_block(THREAD_CONTINUE_NULL);
++}
++
++void
++songyuan_haptic_init(void)
++{
++	thread_t thread;
++	int level = 0;
++
++	if (sh_started) {
++		return;
++	}
++	sh_started = true;
++	/* Off by default: nothing runs unless songyuan_haptic=1 (the gating shape
++	 * is fuxi_keys_init's, 0092:284-303, and 0132; opt-in here because this
++	 * pokes at a PMIC). */
++	if (!PE_parse_boot_argn("songyuan_haptic", &level, sizeof(level)) || level <= 0) {
++		return;
++	}
++	if (level > 4) {
++		level = 4;
++	}
++	sh_level = level;
++	if (kernel_thread_start(sh_thread, NULL, &thread) == KERN_SUCCESS) {
++		thread_deallocate(thread);
++	} else {
++		printf("SONGYUAN HAPTIC: kernel_thread_start failed\n");
++	}
++}
++
++#endif /* SONGYUAN || PANDORA */
+diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
+index a0c916e..716d6c2 100644
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -67,6 +67,9 @@ extern void pandora_files_init(void);
+ extern void pandora_gpu_init(void);
+ extern void pandora_cpu_init(void);
+ #endif
++#if defined(SONGYUAN)
++extern void songyuan_haptic_init(void);
++#endif
+ extern void fuxi_wlan_init(void);
+ extern void sweet_usb_probe(void);
+ 
+@@ -1578,6 +1581,10 @@ sweet_ufs_init(void)
+ 	pandora_gpu_init();
+ 	/* CPU performance probe, boot-arg pandora_cpu (bsd/dev/pandora_cpu.c). */
+ 	pandora_cpu_init();
++#if defined(SONGYUAN)
++	/* Vibration motor, PMIC hv-haptics read-only survey (bsd/dev/songyuan_haptic.c). */
++	songyuan_haptic_init();
++#endif
+ #endif
+ 	/* Power / volume keys (bsd/dev/fuxi_keys.c, SPMI arbiter v7). */
+ 	fuxi_keys_init();
