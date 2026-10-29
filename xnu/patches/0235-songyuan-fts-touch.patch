@@ -1,6 +1,18 @@
+diff --git a/bsd/conf/files b/bsd/conf/files
+index 920f8ce..f561fd3 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -110,6 +110,7 @@ bsd/dev/sweet_keys.c			standard
+ bsd/dev/sweet_touch.c			standard
+ bsd/dev/fuxi_touch.c			standard
+ bsd/dev/pandora_touch.c			standard
++bsd/dev/songyuan_touch.c		standard
+ bsd/dev/pandora_amp.c			standard
+ bsd/dev/pandora_csfw.c			standard
+ bsd/dev/pandora_gpi.c			standard
 diff --git a/bsd/dev/songyuan_touch.c b/bsd/dev/songyuan_touch.c
 new file mode 100644
-index 000000000..5f1a7c2d0
+index 0000000..0cde18b
 --- /dev/null
 +++ b/bsd/dev/songyuan_touch.c
 @@ -0,0 +1,1263 @@
@@ -48,7 +60,7 @@ index 000000000..5f1a7c2d0
 + * compiles to nothing and songyuan_touch_init() fails to link - a loud failure,
 + * but the flag itself is not in the evidence read for this port.
 + */
-+#if defined(SONGYUAN) || defined(PANDORA)
++#if defined(SONGYUAN)
 +#include <sys/param.h>
 +#include <sys/systm.h>
 +#include <sys/errno.h>
@@ -1266,45 +1278,41 @@ index 000000000..5f1a7c2d0
 +		printf("SONGYUAN TOUCH: no thread\n");
 +	}
 +}
-+#endif /* SONGYUAN || PANDORA */
-diff --git a/bsd/conf/files b/bsd/conf/files
---- a/bsd/conf/files
-+++ b/bsd/conf/files
-@@ -109,7 +109,8 @@ bsd/dev/sweet_sample.c			standard
- bsd/dev/sweet_keys.c			standard
- bsd/dev/sweet_touch.c			standard
- bsd/dev/fuxi_touch.c			standard
- bsd/dev/pandora_touch.c			standard
-+bsd/dev/songyuan_touch.c		standard
- bsd/dev/fuxi_adreno.c			standard
- bsd/dev/fuxi_perf.c			standard
- bsd/dev/fuxi_keys.c			standard
++#endif /* SONGYUAN */
 diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
+index a0c916e..4bb58e8 100644
 --- a/bsd/dev/sweet_ufs.c
 +++ b/bsd/dev/sweet_ufs.c
-@@ -57,8 +57,14 @@ extern void sweet_keys_init(void);
+@@ -58,6 +58,9 @@ extern void sweet_keys_init(void);
  extern void sweet_touch_init(void);
  extern void fuxi_touch_init(void);
  extern void fuxi_keys_init(void);
- #if defined(PANDORA)
- extern void pandora_touch_init(void);
-+#if defined(SONGYUAN) || defined(PANDORA)
++#if defined(SONGYUAN)
 +extern void songyuan_touch_init(void);
 +#endif
- #endif
- extern void fuxi_wlan_init(void);
- extern void sweet_usb_probe(void);
-@@ -1504,6 +1510,14 @@ sweet_ufs_init(void)
- #endif
+ #if defined(PANDORA)
+ extern void pandora_touch_init(void);
+ extern void pandora_amp_init(void);
+@@ -1564,8 +1567,10 @@ sweet_ufs_init(void)
  	/* Touch (bsd/dev/fuxi_touch.c; rails voted by the loader). */
  	fuxi_touch_init();
-+#if defined(SONGYUAN)
-+	/* Main screen touch, FocalTech FT3683 on QUP4 SE0 (bsd/dev/songyuan_touch.c).
-+	 * Boot-arg songyuan_fts=1; off by default until validated on songyuan. */
-+	songyuan_touch_init();
-+#else
- 	/* Main screen touch, Synaptics TouchComm (bsd/dev/pandora_touch.c). */
+ #if defined(PANDORA)
+-	/* Main screen touch, Synaptics TouchComm (bsd/dev/pandora_touch.c). */
++	/* Synaptics TouchComm is pandora's IC; songyuan's FocalTech sits on the same QUP4 SE0. */
++#if !defined(SONGYUAN)
  	pandora_touch_init();
 +#endif
+ 	/* Speaker amplifiers, I2C probe only (bsd/dev/pandora_amp.c). */
+ 	pandora_amp_init();
+ 	/* Input self-test, boot-arg pandora_selftest (bsd/dev/pandora_selftest.c). */
+@@ -1581,6 +1586,10 @@ sweet_ufs_init(void)
+ #endif
  	/* Power / volume keys (bsd/dev/fuxi_keys.c, SPMI arbiter v7). */
  	fuxi_keys_init();
++#if defined(SONGYUAN)
++	/* Main screen touch, FocalTech FT3683 on QUP4 SE0 (bsd/dev/songyuan_touch.c). */
++	songyuan_touch_init();
++#endif
+ 	/* WCN7850 PCIe0/MHI probe, boot-arg fuxiwlan (bsd/dev/fuxi_wlan.c). */
+ 	fuxi_wlan_init();
+ #else
