@@ -1,0 +1,20 @@
+name: ipsw-tool
+on:
+  workflow_dispatch: {}
+
+jobs:
+  fetch:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: download blacktop/ipsw Windows binary
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          mkdir -p out
+          gh release download --repo blacktop/ipsw --pattern '*Windows*x86_64*' --dir out --clobber
+          ls -l out
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ipsw-windows
+          path: out/*
+          if-no-files-found: error
