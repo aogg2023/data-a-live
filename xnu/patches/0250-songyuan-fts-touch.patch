@@ -12,10 +12,10 @@ index 98d9d17..7917dcc 100644
  bsd/dev/pandora_gpi.c			standard
 diff --git a/bsd/dev/songyuan_touch.c b/bsd/dev/songyuan_touch.c
 new file mode 100644
-index 0000000..0fd4a33
+index 0000000..872bc47
 --- /dev/null
 +++ b/bsd/dev/songyuan_touch.c
-@@ -0,0 +1,2620 @@
+@@ -0,0 +1,2691 @@
 +/*
 + * SONGYUAN (Redmi K90 Pro Max, SM8850) main screen touch: FocalTech FT3683 on
 + * QUPv3 wrapper 4 SE0 (0x01a80000), polled through the wrapper's GPI DMA.
@@ -2044,8 +2044,14 @@ index 0000000..0fd4a33
 +	return err;
 +}
 +
-+/* Register write (MYRONC:321-335): {addr, 0x00, len hi, len lo, 0, 0, 0} then
-+ * the bytes; no CRC. The status byte is checked the same way. */
++/*
++ * Register write (MYRONC:321-335; byte-for-byte the working redwood port's
++ * focaltech_write, redwood_focaltech_private.h:78-115): {addr, 0x00, len hi,
++ * len lo, 0, 0, 0} then the bytes; no CRC on writes. A bare command (n == 0) is
++ * the four header bytes only, which is also how the vendor's FTS writes an
++ * address-only command (focaltech_spi.c:213-221: the dummy bytes are added only
++ * when datalen > 0). The status byte is checked the same way.
++ */
 +static int
 +sy_fts_write(uint8_t addr, const uint8_t *data, unsigned n)
 +{
@@ -2118,14 +2124,23 @@ index 0000000..0fd4a33
 +{
 +	sy_pins_config();
 +	sy_gpio(SY_RESET, 0, 0, 4, 0, false);			/* level low first */
++	printf("SONGYUAN TOUCH: power_on: reset 66 asked low -> cfg=%#x io=%u, avdd 117 cfg=%#x io=%u\n",
++	    sy_rd(sy.tlmm, SY_GPIO(SY_RESET)), sy_rd(sy.tlmm, SY_GPIO(SY_RESET) + 4) & 3u,
++	    sy_rd(sy.tlmm, SY_GPIO(SY_AVDD)), sy_rd(sy.tlmm, SY_GPIO(SY_AVDD) + 4) & 3u);
 +	sy_sleep(2);
 +	sy_gpio(SY_AVDD, 0, 0, 4, 1, false);			/* avdd on */
++	printf("SONGYUAN TOUCH: power_on: avdd 117 asked high -> cfg=%#x io=%u, reset 66 cfg=%#x io=%u\n",
++	    sy_rd(sy.tlmm, SY_GPIO(SY_AVDD)), sy_rd(sy.tlmm, SY_GPIO(SY_AVDD) + 4) & 3u,
++	    sy_rd(sy.tlmm, SY_GPIO(SY_RESET)), sy_rd(sy.tlmm, SY_GPIO(SY_RESET) + 4) & 3u);
 +	sy_sleep(3);
 +	if (vote) {
 +		int err = sy_rpmh_vote();			/* iovdd (L4I_E0) on */
 +		printf("SONGYUAN TOUCH: RPMh: iovdd vote -> %d\n", err);
 +	}
 +	sy_gpio(SY_RESET, 0, 0, 4, 1, false);			/* reset high */
++	printf("SONGYUAN TOUCH: power_on: reset 66 asked high -> cfg=%#x io=%u, avdd 117 cfg=%#x io=%u\n",
++	    sy_rd(sy.tlmm, SY_GPIO(SY_RESET)), sy_rd(sy.tlmm, SY_GPIO(SY_RESET) + 4) & 3u,
++	    sy_rd(sy.tlmm, SY_GPIO(SY_AVDD)), sy_rd(sy.tlmm, SY_GPIO(SY_AVDD) + 4) & 3u);
 +	sy_sleep(200);
 +}
 +
@@ -2366,26 +2381,39 @@ index 0000000..0fd4a33
 +}
 +
 +/*
-+ * The FocalTech reference driver's other way to ask "is this chip alive": when the
-+ * normal chip id (0xA3/0x9F) does not answer it reads the ROM bootloader's id with
-+ * {0x55, 0xAA} then command 0x90 (focaltech_core.c:536-567, focaltech_common.h:75-
-+ * 80: FTS_CMD_START1/2, START_DELAY 12 ms, FTS_CMD_READ_ID 0x90, 4-byte cmd).
-+ * The frame shapes are the ordinary write/read ones, so the normal helpers send
-+ * them: write address 0x55 with the single data byte 0xAA, then read two bytes
-+ * from 0x90. Diagnostic only - the caller has already decided the chip id failed.
++ * FocalTech's boot-ROM handshake, exactly as the working redwood port has it
++ * (E:\songyuan\ref\hkwork\xnu\files\bsd\dev\redwood_focaltech_private.h:117-160,
++ * focaltech_enter_boot_rom/focaltech_read_boot_id):
++ *   reset low 1 ms, reset high, 12 ms,
++ *   write {0x55, 0xAA} (a framed write of the single data byte 0xAA to 0x55),
++ *   12 ms (FTS_CMD_START_DELAY),
++ *   read two bytes from command 0x90  -> the ROM boot id.
++ * The FT3685G's boot id is 0x58 0x83 (Android dmesg "fts_check_bootid: read boot
++ * id:0x58 0x83"); the redwood FT3680 reports 0x56 0x62. When the id is valid the
++ * firmware is in flash but not started, and the host must write the bare 0x08
++ * command (FTS_ROMBOOT_CMD_START_APP) to make the ROM jump to it.
++ * Returns 0 when the two-byte read itself succeeded; *hi/*lo carry the id.
 + */
-+static void
-+sy_fts_rom_id(void)
++static int
++sy_fts_rom_id(uint8_t *hi, uint8_t *lo)
 +{
 +	static const uint8_t start = 0xaa;
 +	uint8_t id[2] = {0, 0};
 +	int w, r;
 +
++	sy_gpio(SY_RESET, 0, 0, 4, 0, false);	/* reset low 1 ms */
++	delay(1000);
++	sy_gpio(SY_RESET, 0, 0, 4, 1, false);	/* then high */
++	delay(12000);				/* FTS_CMD_START_DELAY before the command */
 +	w = sy_fts_write(0x55, &start, 1);
-+	delay(12000);		/* FTS_CMD_START_DELAY = 12 ms, in microseconds */
++	delay(12000);				/* and again before the read */
 +	r = sy_fts_read(0x90, id, 2);
-+	printf("SONGYUAN TOUCH: ROM boot-id probe: start command err %d, command 0x90 err %d, "
-+	    "id %02x %02x\n", w, r, id[0], id[1]);
++	*hi = id[0];
++	*lo = id[1];
++	printf("SONGYUAN TOUCH: ROM boot-id: start command err %d, command 0x90 err %d, "
++	    "id %02x %02x (FT3685G expects %02x %02x)\n", w, r, id[0], id[1],
++	    SY_FTS_ID_A3, SY_FTS_ID_9F);
++	return (w || r) ? EIO : 0;
 +}
 +
 +/*
@@ -2447,17 +2475,54 @@ index 0000000..0fd4a33
 +	}
 +}
 +
-+/* Identify and TIC, without touching reset: what follows sy_power_on(). */
++/*
++ * Identify and TIC after power-on. The FT3685G comes out of reset in its ROM
++ * bootloader: the runtime id registers (0xA3/0x9F) read 0 there, and the only
++ * thing that answers is the boot-ROM handshake (0x55/0xAA -> 0x90). Android's
++ * own driver does the same ("fts_enter_into_boot: enter into boot environment",
++ * "fts_check_bootid: read boot id:0x58 0x83", "boot id check pass"), and the
++ * working redwood port confirms the sequence (redwood_focaltech_private.h:117-
++ * 160, 178-201). When the id is valid the firmware is in flash but not started,
++ * so the host writes the bare 0x08 command (FTS_ROMBOOT_CMD_START_APP); only then
++ * is the chip a touch controller. If it does not come up the probe matrix runs.
++ */
 +static int
 +sy_fts_setup(void)
 +{
++	uint8_t hi = 0, lo = 0;
 +	int err;
-+	if ((err = sy_fts_chip_id())) {
-+		sy_fts_rom_id();	/* diagnostic: chip in its ROM loader, or mute? */
-+		sy_probe_matrix();	/* one boot, every plausible SPI configuration */
-+		if ((err = sy_fts_chip_id())) {
-+			return err;
++
++	if (!(err = sy_fts_chip_id())) {
++		return sy_fts_tic();	/* firmware already running (warm boot) */
++	}
++	/* Runtime id did not answer: the chip should be in its ROM bootloader. */
++	if (!sy_fts_rom_id(&hi, &lo) && (hi != 0x00 || lo != 0x00)) {
++		static const uint8_t start_app = 0x08;	/* FTS_ROMBOOT_CMD_START_APP */
++		printf("SONGYUAN TOUCH: chip is in its boot ROM, boot id %02x %02x%s\n", hi, lo,
++		    (hi == SY_FTS_ID_A3 && lo == SY_FTS_ID_9F) ? ", the FT3685G boot id" : "");
++		err = sy_fts_write(start_app, NULL, 0);
++		if (!err) {
++			/* The firmware needs time to bring its peripherals up. */
++			sy_sleep(200);
++			for (unsigned t = 0; t < 3; t++) {
++				if (!(err = sy_fts_chip_id())) {
++					printf("SONGYUAN TOUCH: firmware started (attempt %u)\n",
++					    t + 1);
++					return sy_fts_tic();
++				}
++				sy_sleep(100);
++			}
++			printf("SONGYUAN TOUCH: firmware start (0x08) sent but the chip "
++			    "still does not answer\n");
++		} else {
++			printf("SONGYUAN TOUCH: firmware start (0x08) write failed %d\n", err);
 +		}
++	} else {
++		printf("SONGYUAN TOUCH: no valid ROM boot id; chip mute or still booting\n");
++	}
++	sy_probe_matrix();	/* one boot, every plausible SPI configuration */
++	if ((err = sy_fts_chip_id())) {
++		return err;
 +	}
 +	return sy_fts_tic();
 +}
@@ -2547,6 +2612,12 @@ index 0000000..0fd4a33
 +	sy_self_test();		/* engine loopback, both modes, independent of the chip */
 +	sy_pins_dump("before");
 +	sy_power_on(rpmh != 0);
++	printf("SONGYUAN TOUCH: after power_on (avdd 117 high, reset 66 high): reset cfg=%#x io=%u, "
++	    "avdd cfg=%#x io=%u, irq 158 cfg=%#x io=%u\n",
++	    sy_rd(sy.tlmm, SY_GPIO(SY_RESET)), sy_rd(sy.tlmm, SY_GPIO(SY_RESET) + 4) & 3u,
++	    sy_rd(sy.tlmm, SY_GPIO(SY_AVDD)), sy_rd(sy.tlmm, SY_GPIO(SY_AVDD) + 4) & 3u,
++	    sy_rd(sy.tlmm, SY_GPIO(SY_IRQ)), sy_rd(sy.tlmm, SY_GPIO(SY_IRQ) + 4) & 3u);
++	sy_pins_dump("after power_on");
 +	sy_pad_probe();		/* are the pads driven, and by whom, with the chip powered */
 +	sy_irq_activity();	/* does the chip's firmware pull IRQ at all */
 +	sy_bitbang_probe();	/* the same frames by hand, engine unused */
