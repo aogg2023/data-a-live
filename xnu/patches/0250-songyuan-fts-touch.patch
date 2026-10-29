@@ -12,10 +12,10 @@ index 98d9d17..7917dcc 100644
  bsd/dev/pandora_gpi.c			standard
 diff --git a/bsd/dev/songyuan_touch.c b/bsd/dev/songyuan_touch.c
 new file mode 100644
-index 0000000..a671a14
+index 0000000..9c44090
 --- /dev/null
 +++ b/bsd/dev/songyuan_touch.c
-@@ -0,0 +1,2745 @@
+@@ -0,0 +1,2746 @@
 +/*
 + * SONGYUAN (Redmi K90 Pro Max, SM8850) main screen touch: FocalTech FT3683 on
 + * QUPv3 wrapper 4 SE0 (0x01a80000), polled through the wrapper's GPI DMA.
@@ -2438,6 +2438,7 @@ index 0000000..a671a14
 +{
 +	uint8_t id[2] = {0, 0};
 +	bool ok = false;
++	int w = 0, r = 0;
 +
 +	*hi = 0;
 +	*lo = 0;
@@ -2445,8 +2446,8 @@ index 0000000..a671a14
 +		sy_fts_reset_proc(0);
 +		sy_sleep(12 + i * 2);
 +		for (unsigned k = 0; k < 3; k++) {
-+			int r = sy_fts_write(0x55, NULL, 0);	/* bare command 0x55 */
-+			if (r) {
++			w = sy_fts_write(0x55, NULL, 0);	/* bare command 0x55 */
++			if (w) {
 +				continue;
 +			}
 +			delay(12000);				/* msleep(12) */
@@ -2456,10 +2457,10 @@ index 0000000..a671a14
 +				break;
 +			}
 +		}
-+		if (i == 0) {
-+			printf("SONGYUAN TOUCH: boot-RAM round 0: id %02x %02x (want %02x %02x)\n",
-+			    id[0], id[1], SY_FTS_ID_A3, SY_FTS_ID_9F);
-+		}
++		/* Every round is logged, and a failed transfer never ends the loop: the
++		 * vendor code runs all 30 rounds x 3 tries. */
++		printf("SONGYUAN TOUCH: boot-RAM round %u: id %02x %02x (want %02x %02x, "
++		    "write %d read %d)\n", i, id[0], id[1], SY_FTS_ID_A3, SY_FTS_ID_9F, w, r);
 +	}
 +	*hi = id[0];
 +	*lo = id[1];
