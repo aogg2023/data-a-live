@@ -12,10 +12,10 @@ index 98d9d17..7917dcc 100644
  bsd/dev/pandora_gpi.c			standard
 diff --git a/bsd/dev/songyuan_touch.c b/bsd/dev/songyuan_touch.c
 new file mode 100644
-index 0000000..872bc47
+index 0000000..f50f886
 --- /dev/null
 +++ b/bsd/dev/songyuan_touch.c
-@@ -0,0 +1,2691 @@
+@@ -0,0 +1,2743 @@
 +/*
 + * SONGYUAN (Redmi K90 Pro Max, SM8850) main screen touch: FocalTech FT3683 on
 + * QUPv3 wrapper 4 SE0 (0x01a80000), polled through the wrapper's GPI DMA.
@@ -88,8 +88,11 @@ index 0000000..872bc47
 + * (same SM8850, same QUP4 SE0, same PMH0110 PMIC, where it powers the panel),
 + * and every parameter is songyuan's own live DT
 + * (/soc/rsc@18900000/drv@2/rpmh-regulator-l4i-e0: qcom,resource-name "L4I_E0",
-+ * pmic7-ldo, 1.8 V, qcom,init-mode 3). The stock order is kept: reset low, avdd
-+ * on, iovdd vote, reset high, then the firmware's boot time.
++ * pmic7-ldo, 1.8 V, qcom,init-mode 3). The power order is the shipping module's
++ * (fts_power_source_ctrl_simplify @0xa068): avdd (GPIO 117) high, reset (GPIO
++ * 66) high, then the iovdd vote, with no sleep in between; the chip's reset pulse
++ * is fts_reset_proc(0) inside the boot-ROM handshake (low 1 ms, high), and after
++ * the boot id (0x58 0x83) the bare 0x08 command starts the application firmware.
 + *
 + * Engine: the SPI half is myron's driver (UniXNU/NativeGeniSpi GeniSpi.c/h, the
 + * one that works on this phone): the word length, packing vectors and mode are
@@ -1871,10 +1874,13 @@ index 0000000..872bc47
 +
 +/*
 + * SPI by hand on the four pads, with the serial engine out of the loop: 48 is
-+ * sampled, 49 and 50 are driven, 51 is the chip select, mode 0, ~200 kHz. This is
-+ * the "does the chip answer at all" test that no GENI configuration can hide: the
-+ * same two frames the driver uses (read 0xA3, and the FocalTech ROM boot-id
-+ * sequence {0x55,0xAA} then command 0x90) are clocked out bit by bit.
++ * sampled, 49 and 50 are driven, 51 is the chip select, mode 0, ~200 kHz, bits
++ * MSB first (the packing of the engine path is MSB first too). This is the "does
++ * the chip answer at all" test that no GENI configuration can hide. It first does
++ * the plain runtime-id read (0xA3) and, only if that does not answer, the same
++ * boot-ROM handshake the engine path uses (fts_enter_into_boot @0x13d9c): reset
++ * low 1 ms -> high, 12 + 2*i ms, the bare one-byte command 0x55 ({55 00 00 00},
++ * no data byte, no CRC), 12 ms, then read two bytes from 0x90, expect 58 83.
 + */
 +static void
 +sy_bb_byte(const uint8_t out, uint8_t *in)
@@ -1909,9 +1915,10 @@ index 0000000..872bc47
 +sy_bitbang_probe(void)
 +{
 +	static const uint8_t rd_a3[10] = {0xa3, 0xa0, 0x00, 0x01, 0, 0, 0, 0, 0, 0};
-+	static const uint8_t start[8] = {0x55, 0x00, 0x00, 0x01, 0, 0, 0, 0xaa};
++	static const uint8_t cmd55[4] = {0x55, 0x00, 0x00, 0x00};	/* bare command */
 +	static const uint8_t rd_rom[11] = {0x90, 0xa0, 0x00, 0x02, 0, 0, 0, 0, 0, 0, 0};
-+	uint8_t rx[11];
++	uint8_t rx[11], id[2] = {0, 0};
++	bool ok = false;
 +
 +	printf("SONGYUAN TOUCH: bit-bang SPI probe on GPIO 48-51 (~200 kHz, engine unused)\n");
 +	sy_gpio(48, 0, 3, 4, -1, true);		/* MISO: input, pull-up */
@@ -1924,17 +1931,28 @@ index 0000000..872bc47
 +	printf("SONGYUAN TOUCH: bit-bang read 0xA3:");
 +	sy_hex(" rx", rx, sizeof(rd_a3));
 +	printf(" (status %02x, id at byte 7: %02x)\n", rx[3], rx[7]);
-+	/* Only when the plain read did not answer: {0x55,0xAA} puts a FocalTech chip
-+	 * into its ROM bootloader, so it is not sent to a chip that just answered. */
 +	if (rx[7] == 0x00 || rx[7] == 0xff) {
-+		memset(rx, 0, sizeof(rx));
-+		sy_bb_frame(start, sizeof(start), rx);
-+		delay(12000);			/* FTS_CMD_START_DELAY = 12 ms */
-+		memset(rx, 0, sizeof(rx));
-+		sy_bb_frame(rd_rom, sizeof(rd_rom), rx);
-+		printf("SONGYUAN TOUCH: bit-bang ROM boot-id:");
-+		sy_hex(" rx", rx, sizeof(rd_rom));
-+		printf(" (id at bytes 7-8: %02x %02x)\n", rx[7], rx[8]);
++		for (unsigned i = 0; i < 3 && !ok; i++) {
++			sy_gpio(SY_RESET, 0, 0, 4, 0, false);	/* reset low 1 ms */
++			delay(1000);
++			sy_gpio(SY_RESET, 0, 0, 4, 1, false);	/* reset high */
++			sy_sleep(12 + i * 2);
++			memset(rx, 0, sizeof(rx));
++			sy_bb_frame(cmd55, sizeof(cmd55), rx);
++			sy_sleep(12);
++			memset(rx, 0, sizeof(rx));
++			sy_bb_frame(rd_rom, sizeof(rd_rom), rx);
++			id[0] = rx[7];
++			id[1] = rx[8];
++			printf("SONGYUAN TOUCH: bit-bang boot ROM round %u: id %02x %02x "
++			    "(want %02x %02x)\n", i, id[0], id[1], SY_FTS_ID_A3,
++			    SY_FTS_ID_9F);
++			if (id[0] == SY_FTS_ID_A3 && id[1] == SY_FTS_ID_9F) {
++				ok = true;
++			}
++		}
++		printf("SONGYUAN TOUCH: bit-bang %s (engine out of the loop)\n",
++		    ok ? "boot id matches" : "no boot id either");
 +	}
 +	/* Back to qup4_se0 function 1 for the serial engine. */
 +	sy_gpio(48, SY_FUNC_QUP4_SE0, 0, 6, -1, true);
@@ -2084,15 +2102,31 @@ index 0000000..872bc47
 +	return err;
 +}
 +
-+/* fts_system_reset (FUXI:542-545, MYRONC:241): reset low 10 ms, high, then let
-+ * the firmware boot - nothing answers before 200 ms (MYRONC:241). */
++/*
++ * fts_reset_proc(hdelay), as the shipping module has it (fts3685_real.ko,
++ * fts_reset_proc @0xa1c, disassembly lines 0xa54-0xa84):
++ *   gpiod_direction_output_raw(reset, 0)
++ *   msleep(1)
++ *   gpiod_direction_output_raw(reset, 1)
++ *   if (hdelay) msleep(hdelay)
++ * Note the low pulse is 1 ms, not the 10 ms an older reference used.
++ */
++static void
++sy_fts_reset_proc(unsigned hdelay)
++{
++	sy_gpio(SY_RESET, 0, 0, 4, 0, false);	/* reset low */
++	delay(1000);				/* msleep(1) */
++	sy_gpio(SY_RESET, 0, 0, 4, 1, false);	/* reset high */
++	if (hdelay) {
++		sy_sleep(hdelay);
++	}
++}
++
++/* fts_system_reset: reset_proc(200), then the firmware boots. */
 +static void
 +sy_fts_reset(void)
 +{
-+	sy_gpio(SY_RESET, 0, 0, 4, 0, false);
-+	sy_sleep(10);
-+	sy_gpio(SY_RESET, 0, 0, 4, 1, false);
-+	sy_sleep(200);
++	sy_fts_reset_proc(200);
 +}
 +
 +/*
@@ -2112,36 +2146,31 @@ index 0000000..872bc47
 +}
 +
 +/*
-+ * Power-on in the stock order (MYRONC:230-245): reset level low before its
-+ * output enable (no glitch high), 2 ms, avdd on (GPIO 117 high), 3 ms, the
-+ * iovdd vote through the apps RSC (L4I_E0 1.8 V, PAND:1430-1433 votes it before
-+ * the reset is released too), reset high, then 200 ms of firmware boot. reset
-+ * and avdd are outputs (MYRON:52). avdd is the pin (MYRON:45); iovdd is the rail
-+ * nothing else has voted, so without it the chip never answers.
++ * Power-on in the order the shipping module uses (fts3685_real.ko,
++ * fts_power_source_ctrl_simplify @0xa068, enable branch at 0xa09c-0xa104):
++ *   regulator_enable(avdd)  ->  gpiod_direction_output_raw(reset, 1)  ->
++ *   regulator_enable(iovdd)
++ * with no sleep between the three. avdd is the GPIO 117 fixed regulator and iovdd
++ * is the RPMh L4I_E0 rail (RPMh vote instead of regulator_enable), so:
++ * avdd high, reset high, iovdd vote, then one settle before the first read. The
++ * reset pulse itself is fts_reset_proc(0) inside the boot-ROM handshake.
 + */
 +static void
 +sy_power_on(bool vote)
 +{
 +	sy_pins_config();
-+	sy_gpio(SY_RESET, 0, 0, 4, 0, false);			/* level low first */
-+	printf("SONGYUAN TOUCH: power_on: reset 66 asked low -> cfg=%#x io=%u, avdd 117 cfg=%#x io=%u\n",
-+	    sy_rd(sy.tlmm, SY_GPIO(SY_RESET)), sy_rd(sy.tlmm, SY_GPIO(SY_RESET) + 4) & 3u,
-+	    sy_rd(sy.tlmm, SY_GPIO(SY_AVDD)), sy_rd(sy.tlmm, SY_GPIO(SY_AVDD) + 4) & 3u);
-+	sy_sleep(2);
 +	sy_gpio(SY_AVDD, 0, 0, 4, 1, false);			/* avdd on */
-+	printf("SONGYUAN TOUCH: power_on: avdd 117 asked high -> cfg=%#x io=%u, reset 66 cfg=%#x io=%u\n",
-+	    sy_rd(sy.tlmm, SY_GPIO(SY_AVDD)), sy_rd(sy.tlmm, SY_GPIO(SY_AVDD) + 4) & 3u,
-+	    sy_rd(sy.tlmm, SY_GPIO(SY_RESET)), sy_rd(sy.tlmm, SY_GPIO(SY_RESET) + 4) & 3u);
-+	sy_sleep(3);
-+	if (vote) {
-+		int err = sy_rpmh_vote();			/* iovdd (L4I_E0) on */
-+		printf("SONGYUAN TOUCH: RPMh: iovdd vote -> %d\n", err);
-+	}
++	printf("SONGYUAN TOUCH: power_on: avdd 117 asked high -> cfg=%#x io=%u\n",
++	    sy_rd(sy.tlmm, SY_GPIO(SY_AVDD)), sy_rd(sy.tlmm, SY_GPIO(SY_AVDD) + 4) & 3u);
 +	sy_gpio(SY_RESET, 0, 0, 4, 1, false);			/* reset high */
 +	printf("SONGYUAN TOUCH: power_on: reset 66 asked high -> cfg=%#x io=%u, avdd 117 cfg=%#x io=%u\n",
 +	    sy_rd(sy.tlmm, SY_GPIO(SY_RESET)), sy_rd(sy.tlmm, SY_GPIO(SY_RESET) + 4) & 3u,
 +	    sy_rd(sy.tlmm, SY_GPIO(SY_AVDD)), sy_rd(sy.tlmm, SY_GPIO(SY_AVDD) + 4) & 3u);
-+	sy_sleep(200);
++	if (vote) {
++		int err = sy_rpmh_vote();			/* iovdd (L4I_E0) on */
++		printf("SONGYUAN TOUCH: RPMh: iovdd vote -> %d\n", err);
++	}
++	sy_sleep(100);			/* settle before the first read (vendor has none) */
 +}
 +
 +/* Chip id (MYRONC:337-347): myron's FT3683 answered 0x36/0x83; songyuan's IC is
@@ -2381,39 +2410,65 @@ index 0000000..872bc47
 +}
 +
 +/*
-+ * FocalTech's boot-ROM handshake, exactly as the working redwood port has it
-+ * (E:\songyuan\ref\hkwork\xnu\files\bsd\dev\redwood_focaltech_private.h:117-160,
-+ * focaltech_enter_boot_rom/focaltech_read_boot_id):
-+ *   reset low 1 ms, reset high, 12 ms,
-+ *   write {0x55, 0xAA} (a framed write of the single data byte 0xAA to 0x55),
-+ *   12 ms (FTS_CMD_START_DELAY),
-+ *   read two bytes from command 0x90  -> the ROM boot id.
-+ * The FT3685G's boot id is 0x58 0x83 (Android dmesg "fts_check_bootid: read boot
-+ * id:0x58 0x83"); the redwood FT3680 reports 0x56 0x62. When the id is valid the
-+ * firmware is in flash but not started, and the host must write the bare 0x08
-+ * command (FTS_ROMBOOT_CMD_START_APP) to make the ROM jump to it.
-+ * Returns 0 when the two-byte read itself succeeded; *hi/*lo carry the id.
++ * fts_enter_into_boot, exactly as the shipping module has it (fts3685_real.ko,
++ * fts_enter_into_boot @0x13d9c, disassembly lines 0x13dfc-0x13ea0):
++ *
++ *   w23 = 0x55                                     ; one-byte write buffer
++ *   for (i = 0; i < 30; i++) {                     ; cmp w19,#0x1e
++ *       fts_reset_proc(0)                          ; low 1 ms -> high, no wait
++ *       msleep(12 + i * 2)                         ; x22 += 2 each round
++ *       for (k = 0; k < 3; k++) {                  ; three tries per round
++ *           fts_write(&0x55, 1)                    ; {55 00 00 00}: datalen 0
++ *           msleep(12)
++ *           if (fts_check_bootid() == 0) -> done   ; fts_check_bootid @0x139bc:
++ *                                                  ; read 0x90, 2 bytes, must be
++ *                                                  ; {0x58, 0x83}
++ *       }
++ *   }
++ *
++ * Note what this is NOT: the generic FocalTech sources send {0x55, 0xAA} as a
++ * write of data byte 0xAA to register 0x55; this Xiaomi module writes the bare
++ * one-byte command 0x55 (a 4-byte frame with no data byte and no CRC), and it
++ * never sends 0xAA.
++ * Returns true when fts_check_bootid's condition held.
 + */
-+static int
-+sy_fts_rom_id(uint8_t *hi, uint8_t *lo)
++static bool
++sy_fts_enter_boot(uint8_t *hi, uint8_t *lo)
 +{
-+	static const uint8_t start = 0xaa;
 +	uint8_t id[2] = {0, 0};
-+	int w, r;
++	bool ok = false;
 +
-+	sy_gpio(SY_RESET, 0, 0, 4, 0, false);	/* reset low 1 ms */
-+	delay(1000);
-+	sy_gpio(SY_RESET, 0, 0, 4, 1, false);	/* then high */
-+	delay(12000);				/* FTS_CMD_START_DELAY before the command */
-+	w = sy_fts_write(0x55, &start, 1);
-+	delay(12000);				/* and again before the read */
-+	r = sy_fts_read(0x90, id, 2);
++	*hi = 0;
++	*lo = 0;
++	for (unsigned i = 0; i < 30 && !ok; i++) {
++		sy_fts_reset_proc(0);
++		sy_sleep(12 + i * 2);
++		for (unsigned k = 0; k < 3; k++) {
++			int r = sy_fts_write(0x55, NULL, 0);	/* bare command 0x55 */
++			if (r) {
++				continue;
++			}
++			delay(12000);				/* msleep(12) */
++			r = sy_fts_read(0x90, id, 2);
++			if (!r && id[0] == SY_FTS_ID_A3 && id[1] == SY_FTS_ID_9F) {
++				ok = true;
++				break;
++			}
++		}
++		if (i == 0) {
++			printf("SONGYUAN TOUCH: boot-RAM round 0: id %02x %02x (want %02x %02x)\n",
++			    id[0], id[1], SY_FTS_ID_A3, SY_FTS_ID_9F);
++		}
++	}
 +	*hi = id[0];
 +	*lo = id[1];
-+	printf("SONGYUAN TOUCH: ROM boot-id: start command err %d, command 0x90 err %d, "
-+	    "id %02x %02x (FT3685G expects %02x %02x)\n", w, r, id[0], id[1],
-+	    SY_FTS_ID_A3, SY_FTS_ID_9F);
-+	return (w || r) ? EIO : 0;
++	if (ok) {
++		printf("SONGYUAN TOUCH: boot id %02x %02x (boot id check pass)\n", id[0], id[1]);
++	} else {
++		printf("SONGYUAN TOUCH: no valid boot id after 30 rounds, last %02x %02x "
++		    "(want %02x %02x)\n", id[0], id[1], SY_FTS_ID_A3, SY_FTS_ID_9F);
++	}
++	return ok;
 +}
 +
 +/*
@@ -2476,15 +2531,16 @@ index 0000000..872bc47
 +}
 +
 +/*
-+ * Identify and TIC after power-on. The FT3685G comes out of reset in its ROM
-+ * bootloader: the runtime id registers (0xA3/0x9F) read 0 there, and the only
-+ * thing that answers is the boot-ROM handshake (0x55/0xAA -> 0x90). Android's
-+ * own driver does the same ("fts_enter_into_boot: enter into boot environment",
-+ * "fts_check_bootid: read boot id:0x58 0x83", "boot id check pass"), and the
-+ * working redwood port confirms the sequence (redwood_focaltech_private.h:117-
-+ * 160, 178-201). When the id is valid the firmware is in flash but not started,
-+ * so the host writes the bare 0x08 command (FTS_ROMBOOT_CMD_START_APP); only then
-+ * is the chip a touch controller. If it does not come up the probe matrix runs.
++ * Identify and TIC after power-on, in the order the shipping module uses:
++ * fts_get_ic_information first reads the runtime id 0xA3/0x9F five times 200 ms
++ * apart; when that fails the chip is in its boot ROM, fts_enter_into_boot runs
++ * the 30-round handshake (below), and once the boot id checks out the host writes
++ * the bare 0x08 command (FTS_ROMBOOT_CMD_START_APP) so the boot ROM jumps to the
++ * application firmware; after that the runtime id must answer, otherwise the
++ * flash image is not usable and a PRAM download would be needed.
++ * Android's log on this phone shows exactly that path: "fts_enter_into_boot:
++ * enter into boot environment", "fts_check_bootid: read boot id:0x58 0x83",
++ * "boot id check pass".
 + */
 +static int
 +sy_fts_setup(void)
@@ -2495,15 +2551,11 @@ index 0000000..872bc47
 +	if (!(err = sy_fts_chip_id())) {
 +		return sy_fts_tic();	/* firmware already running (warm boot) */
 +	}
-+	/* Runtime id did not answer: the chip should be in its ROM bootloader. */
-+	if (!sy_fts_rom_id(&hi, &lo) && (hi != 0x00 || lo != 0x00)) {
++	if (sy_fts_enter_boot(&hi, &lo)) {
 +		static const uint8_t start_app = 0x08;	/* FTS_ROMBOOT_CMD_START_APP */
-+		printf("SONGYUAN TOUCH: chip is in its boot ROM, boot id %02x %02x%s\n", hi, lo,
-+		    (hi == SY_FTS_ID_A3 && lo == SY_FTS_ID_9F) ? ", the FT3685G boot id" : "");
 +		err = sy_fts_write(start_app, NULL, 0);
 +		if (!err) {
-+			/* The firmware needs time to bring its peripherals up. */
-+			sy_sleep(200);
++			sy_sleep(150);		/* firmware brings its peripherals up */
 +			for (unsigned t = 0; t < 3; t++) {
 +				if (!(err = sy_fts_chip_id())) {
 +					printf("SONGYUAN TOUCH: firmware started (attempt %u)\n",
@@ -2512,13 +2564,13 @@ index 0000000..872bc47
 +				}
 +				sy_sleep(100);
 +			}
-+			printf("SONGYUAN TOUCH: firmware start (0x08) sent but the chip "
-+			    "still does not answer\n");
++			printf("SONGYUAN TOUCH: runtime id still invalid after start; "
++			    "PRAM download needed\n");
 +		} else {
 +			printf("SONGYUAN TOUCH: firmware start (0x08) write failed %d\n", err);
 +		}
 +	} else {
-+		printf("SONGYUAN TOUCH: no valid ROM boot id; chip mute or still booting\n");
++		printf("SONGYUAN TOUCH: chip did not enter its boot ROM\n");
 +	}
 +	sy_probe_matrix();	/* one boot, every plausible SPI configuration */
 +	if ((err = sy_fts_chip_id())) {
@@ -2609,7 +2661,6 @@ index 0000000..872bc47
 +		goto out;
 +	}
 +	sy_pins_config();	/* pads on the serial engine before the loopback test */
-+	sy_self_test();		/* engine loopback, both modes, independent of the chip */
 +	sy_pins_dump("before");
 +	sy_power_on(rpmh != 0);
 +	printf("SONGYUAN TOUCH: after power_on (avdd 117 high, reset 66 high): reset cfg=%#x io=%u, "
@@ -2621,6 +2672,7 @@ index 0000000..872bc47
 +	sy_pad_probe();		/* are the pads driven, and by whom, with the chip powered */
 +	sy_irq_activity();	/* does the chip's firmware pull IRQ at all */
 +	sy_bitbang_probe();	/* the same frames by hand, engine unused */
++	sy_self_test();		/* engine loopback, after the chip-level probes */
 +	if ((err = sy_fts_setup())) {
 +		printf("SONGYUAN TOUCH: FTS start failed %d\n", err);
 +		sy_pins_dump("after failed start");
