@@ -12,10 +12,10 @@ index 98d9d17..7917dcc 100644
  bsd/dev/pandora_gpi.c			standard
 diff --git a/bsd/dev/songyuan_touch.c b/bsd/dev/songyuan_touch.c
 new file mode 100644
-index 0000000..554fa3b
+index 0000000..db62167
 --- /dev/null
 +++ b/bsd/dev/songyuan_touch.c
-@@ -0,0 +1,2000 @@
+@@ -0,0 +1,2261 @@
 +/*
 + * SONGYUAN (Redmi K90 Pro Max, SM8850) main screen touch: FocalTech FT3683 on
 + * QUPv3 wrapper 4 SE0 (0x01a80000), polled through the wrapper's GPI DMA.
@@ -60,6 +60,21 @@ index 0000000..554fa3b
 + *   songyuan_ftsdbg=1     dump the GENI and SE-DMA registers before and after
 + *                         every transfer; default 0 prints them after a failure
 + *                         and for the first two transfers only.
++ *   songyuan_ftsvariant=N one build sweeps the frame/mode doubts (default 0, the
++ *                         myron-compatible frame):
++ *                           bits 1:0 engine   0 SE DMA (default), 1 FIFO/PIO,
++ *                                             2 wrapper 4 GPI DMA
++ *                           bits 3:2 read opcode  0 = 0xA0, 1 = 0x80, 2 = 0xC0,
++ *                                             3 = 0x00
++ *                           bit 4     chip select driven by GPIO 51 by hand
++ *                                     around each frame, not by the engine
++ *                           bits 6:5  SPI mode 0..3 (CPHA/CPOL)
++ *                           bit 7     send the header, then read in a second
++ *                                     (fragmented) command instead of one
++ *                                     full-duplex command
++ *                           bit 8     LOOPBACK self-test: the engine echoes TX
++ *                                     back to RX, so a frame whose RX equals TX
++ *                                     proves the engine/packing/DMA path
 + *
 + * Power: avdd is a fixed regulator enabled by TLMM GPIO 117, active high
 + * (MYRON:45) - a pin. iovdd (L4I, 1.8 V) is an RPMh LDO: myron's driver leaves
@@ -322,6 +337,11 @@ index 0000000..554fa3b
 +	uint64_t dma_pa;
 +	bool started, dead;
 +	bool use_se_dma;		/* SE DMA master (GeniSpi.c:113); else GPI (PAND:493) */
++	unsigned variant;		/* songyuan_ftsvariant: one build sweeps the frame/mode doubts */
++	unsigned path;			/* 0 SE DMA, 1 FIFO/PIO, 2 GPI DMA */
++	uint32_t read_opcode;		/* 0xa0 (MYRONC), 0x80, 0xc0 or 0x00 from the variant */
++	bool manual_cs, tx_then_rx, loopback;
++	unsigned spi_mode;		/* variant bits 6:5: CPHA/CPOL */
 +	unsigned dbg;			/* songyuan_ftsdbg: dump GENI before/after every transfer */
 +	unsigned qup_major, qup_minor, fifo_depth, fifo_bits, oversample, se_clk_div;
 +	unsigned dma_errors, spi_count;
@@ -1114,11 +1134,10 @@ index 0000000..554fa3b
 +		printf("SONGYUAN TOUCH: SE0 busy (status %#x)\n", sy_rd(sy.se, SE_STATUS));
 +		return EBUSY;
 +	}
-+	if (sy.use_se_dma) {
-+		/* GeniSpi.c:74-121 verbatim, then the SPI half (:98-107, 68-72, 139-148)
-+		 * and :113-118: FIFO interrupt sources off, engine's DMA master on. The
-+		 * top-level SE_IRQ_EN is left enabled as myron's driver leaves it, so the
-+		 * status registers are visible to the poll. */
++	if (sy.path != 2) {
++		/* GeniSpi.c:74-121 verbatim, then the SPI half (:98-107, 68-72, 139-148).
++		 * The top-level SE_IRQ_EN is left enabled as myron's driver leaves it, so
++		 * the status registers are visible to the poll. */
 +		sy_wr(sy.se, SE_GSI_EVENT_EN, 0);
 +		sy_wr(sy.se, SE_M_IRQ_CLR, 0xffffffffu);
 +		sy_wr(sy.se, SE_S_IRQ_CLR, 0xffffffffu);
@@ -1147,10 +1166,10 @@ index 0000000..554fa3b
 +		    (SE_M_CMD_DONE | SE_M_TX_FIFO_WATERMARK | SE_M_RX_FIFO_WATERMARK |
 +		    SE_M_RX_FIFO_LAST));
 +		sy_wr(sy.se, SE_DMA_MODE, sy_rd(sy.se, SE_DMA_MODE) & ~1u);
-+		sy_wr(sy.se, SE_SPI_LOOPBACK, 0);
++		sy_wr(sy.se, SE_SPI_LOOPBACK, sy.loopback ? 1u : 0u);
 +		sy_wr(sy.se, SE_SPI_DEMUX_SEL, 0);	/* chip select 0, the DT's one */
-+		sy_wr(sy.se, SE_SPI_CPHA, 0);		/* focaltech_ts@0: no spi-cpha */
-+		sy_wr(sy.se, SE_SPI_CPOL, 0);		/* and no spi-cpol: mode 0 */
++		sy_wr(sy.se, SE_SPI_CPHA, (sy.spi_mode & 1u) ? SE_SPI_CPHA_BIT : 0u);
++		sy_wr(sy.se, SE_SPI_CPOL, (sy.spi_mode & 2u) ? SE_SPI_CPOL_BIT : 0u);
 +		sy_wr(sy.se, SE_SPI_DEMUX_INV, 0);
 +		sy_wr(sy.se, SE_SPI_TRANS_CFG, sy_rd(sy.se, SE_SPI_TRANS_CFG) &
 +		    ~SE_SPI_CS_TOGGLE);
@@ -1159,10 +1178,19 @@ index 0000000..554fa3b
 +		sy_wr(sy.se, SE_M_IRQ_CLR, 0xffffffffu);
 +		sy_wr(sy.se, SE_DMA_TX_CLR, 0xffffffffu);
 +		sy_wr(sy.se, SE_DMA_RX_CLR, 0xffffffffu);
-+		sy_wr(sy.se, SE_M_IRQ_EN, sy_rd(sy.se, SE_M_IRQ_EN) &
-+		    ~(SE_M_CMD_DONE | SE_M_TX_FIFO_WATERMARK | SE_M_RX_FIFO_WATERMARK |
-+		    SE_M_RX_FIFO_LAST));
-+		sy_wr(sy.se, SE_DMA_MODE, sy_rd(sy.se, SE_DMA_MODE) | 1u);
++		if (sy.path == 0) {
++			/* GeniSpi.c:113-118: FIFO interrupt sources off, engine's DMA master on. */
++			sy_wr(sy.se, SE_M_IRQ_EN, sy_rd(sy.se, SE_M_IRQ_EN) &
++			    ~(SE_M_CMD_DONE | SE_M_TX_FIFO_WATERMARK |
++			    SE_M_RX_FIFO_WATERMARK | SE_M_RX_FIFO_LAST));
++			sy_wr(sy.se, SE_DMA_MODE, sy_rd(sy.se, SE_DMA_MODE) | 1u);
++		} else {
++			/* GeniSpi.c:99-101: FIFO/PIO mode for the variant sweep. */
++			sy_wr(sy.se, SE_M_IRQ_EN, sy_rd(sy.se, SE_M_IRQ_EN) |
++			    (SE_M_CMD_DONE | SE_M_TX_FIFO_WATERMARK |
++			    SE_M_RX_FIFO_WATERMARK | SE_M_RX_FIFO_LAST));
++			sy_wr(sy.se, SE_DMA_MODE, sy_rd(sy.se, SE_DMA_MODE) & ~1u);
++		}
 +	} else {
 +		/* PAND:504-520 unchanged: geni_se_select_mode(GENI_GPI_DMA). */
 +		sy_wr(sy.se, SE_GSI_EVENT_EN, 0);
@@ -1187,7 +1215,7 @@ index 0000000..554fa3b
 +		printf("SONGYUAN TOUCH: no SMMU mapping\n");
 +		return ENOMEM;
 +	}
-+	if (!sy.use_se_dma) {
++	if (sy.path == 2) {
 +		sy.gpi = ml_io_map(SY_GPI_PA, SY_GPI_SIZE);
 +		if (!sy.gpi) {
 +			printf("SONGYUAN TOUCH: no GPI mapping\n");
@@ -1213,7 +1241,7 @@ index 0000000..554fa3b
 +		    sy.dma_pa);
 +		return ENOMEM;
 +	}
-+	if (!sy.use_se_dma) {
++	if (sy.path == 2) {
 +		printf("SONGYUAN TOUCH: GPII %u before: ch0 %#x ch1 %#x ev %#x\n", SY_GPII,
 +		    sy_rd(sy.gpi, GPI_CH(0)), sy_rd(sy.gpi, GPI_CH(1)), sy_rd(sy.gpi, GPI_EV));
 +		if ((err = sy_gpi_init())) {
@@ -1221,9 +1249,11 @@ index 0000000..554fa3b
 +		}
 +	}
 +	printf("SONGYUAN TOUCH: SE0 SPI over %s, DMA page %#llx, DFS level %u, "
-+	    "div %u = %u Hz (if_disable %#x)\n", sy.use_se_dma ? "SE DMA" : "GPII 1",
-+	    sy.dma_pa, sy.level, sy.use_se_dma ? sy.se_clk_div : sy.spi_div,
-+	    sy.use_se_dma ? 19200000u / (sy.se_clk_div ? sy.se_clk_div : 1) : sy.actual_hz,
++	    "div %u = %u Hz (if_disable %#x)\n",
++	    sy.path == 0 ? "SE DMA" : sy.path == 1 ? "FIFO/PIO" : "GPII 1", sy.dma_pa,
++	    sy.level, sy.path == 2 ? sy.spi_div : sy.se_clk_div,
++	    sy.path == 2 ? sy.actual_hz :
++	    19200000u / (sy.se_clk_div ? sy.se_clk_div : 1),
 +	    sy_rd(sy.se, SE_IF_DISABLE));
 +	sy_geni_dump("after SE set-up");
 +	return 0;
@@ -1289,53 +1319,76 @@ index 0000000..554fa3b
 +}
 +
 +/*
-+ * One full-duplex transfer through the serial engine's own DMA master
-+ * (GeniSpi.c:219-293). Both directions always carry n bytes, TX from SY_TXB_OFF
-+ * and RX into SY_RXB_OFF of the DMA page; the command is TX_RX (3) with both
-+ * lengths, then each direction's SE-DMA pointer/attribute/length registers. The
-+ * engine raises a done bit in the SE-DMA interrupt status of each direction and
-+ * also a command-done in the M interrupt status; all are cleared as they come.
-+ * The RX buffer starts as a 0x5a canary, so bytes the engine did not write show
-+ * up as 0x5a in the log instead of looking like data.
++ * Chip select, when songyuan_ftsvariant bit 4 asks for manual control: GPIO 51 as
++ * a TLMM output (qup4_se0_l3 driven by the pin mux, not the serial engine), low
++ * for the frame and released to the engine afterwards. This answers "is the chip
++ * selected at all" without a rebuild.
++ */
++static void
++sy_cs(bool assert)
++{
++	if (assert) {
++		sy_gpio(51, 0, 0, 6, 0, true);		/* function 0, output, level low */
++		delay(2);
++	} else {
++		delay(2);
++		sy_gpio(51, 0, 0, 6, 1, true);		/* level high first */
++		delay(2);
++		sy_gpio(51, SY_FUNC_QUP4_SE0, 3, 6, -1, true);	/* back to the SE */
++	}
++}
++
++/* Hex of a frame: what the engine was given and what it brought back. */
++static void
++sy_hex(const char *tag, const uint8_t *p, unsigned n)
++{
++	printf("%s", tag);
++	for (unsigned i = 0; i < n && i < 24; i++) {
++		printf(" %02x", p[i]);
++	}
++	if (n > 24) {
++		printf(" ..");
++	}
++}
++
++/*
++ * Program and poll one command of the SE's DMA master (GeniSpi.c:219-293).
++ * tx/rx select the directions; cmd_word is the fully shifted SE_GENI_M_CMD0
++ * value (permission: TX_RX for one full-duplex command, TX_ONLY|fragmentation
++ * then RX_ONLY for the TX-then-RX variant). 0 when every requested done bit
++ * arrived, EIO on an error bit, ETIMEDOUT at the poll limit.
 + */
 +static int
-+sy_spi_dma(const uint8_t *tx, uint8_t *rx, unsigned n)
++sy_dma_run(bool tx, bool rx, unsigned n, uint32_t cmd_word, bool *tdone, bool *rdone)
 +{
-+	uint8_t *txb = (uint8_t *)(sy.dma + SY_TXB_OFF), *rxb = (uint8_t *)(sy.dma + SY_RXB_OFF);
 +	uint32_t lo = (uint32_t)sy.dma_pa, hi = (uint32_t)(sy.dma_pa >> 32);
 +	int err = 0;
-+	bool tx_done = false, rx_done = false;
-+
-+	if (n > SY_XFER_MAX) {
-+		return EINVAL;
-+	}
-+	if (sy.dbg) {
-+		sy_geni_dump("before transfer");
-+	}
-+	if (tx) {
-+		memcpy(txb, tx, n);
-+	} else {
-+		memset(txb, 0, n);
-+	}
-+	memset(rxb, 0x5a, n);
-+	clean_dcache64((addr64_t)(sy.dma_pa + SY_TXB_OFF), n, 1);	/* the engine reads our bytes */
-+	flush_dcache64((addr64_t)(sy.dma_pa + SY_RXB_OFF), n, 1);	/* no stale line may win over its writes */
++	*tdone = !tx;
++	*rdone = !rx;
 +	sy_wr(sy.se, SE_M_IRQ_CLR, 0xffffffffu);
 +	sy_wr(sy.se, SE_DMA_TX_CLR, 0xffffffffu);
 +	sy_wr(sy.se, SE_DMA_RX_CLR, 0xffffffffu);
-+	sy_wr(sy.se, SE_SPI_TX_LEN, n);
-+	sy_wr(sy.se, SE_SPI_RX_LEN, n);
-+	sy_wr(sy.se, SE_M_CMD0, SE_M_CMD_TX_RX << SE_M_CMD0_OPCODE_SHIFT);
-+	sy_wr(sy.se, SE_DMA_RX_IRQ_EN_SET, SE_DMA_DONE | SE_DMA_EOT | SE_DMA_AHB_ERR);
-+	sy_wr(sy.se, SE_DMA_RX_PTR_L, lo + SY_RXB_OFF);
-+	sy_wr(sy.se, SE_DMA_RX_PTR_H, hi);
-+	sy_wr(sy.se, SE_DMA_RX_ATTR, 0);
-+	sy_wr(sy.se, SE_DMA_RX_LEN, n);
-+	sy_wr(sy.se, SE_DMA_TX_IRQ_EN_SET, SE_DMA_DONE | SE_DMA_EOT | SE_DMA_AHB_ERR);
-+	sy_wr(sy.se, SE_DMA_TX_PTR_L, lo + SY_TXB_OFF);
-+	sy_wr(sy.se, SE_DMA_TX_PTR_H, hi);
-+	sy_wr(sy.se, SE_DMA_TX_ATTR, SE_DMA_TX_ATTR_EOT_BUF);
-+	sy_wr(sy.se, SE_DMA_TX_LEN, n);
++	if (tx) {
++		sy_wr(sy.se, SE_SPI_TX_LEN, n);
++	}
++	if (rx) {
++		sy_wr(sy.se, SE_SPI_RX_LEN, n);
++	}
++	sy_wr(sy.se, SE_M_CMD0, cmd_word);
++	if (rx) {
++		sy_wr(sy.se, SE_DMA_RX_IRQ_EN_SET, SE_DMA_DONE | SE_DMA_EOT | SE_DMA_AHB_ERR);
++		sy_wr(sy.se, SE_DMA_RX_PTR_L, lo + SY_RXB_OFF);
++		sy_wr(sy.se, SE_DMA_RX_PTR_H, hi);
++		sy_wr(sy.se, SE_DMA_RX_ATTR, 0);
++		sy_wr(sy.se, SE_DMA_RX_LEN, n);
++	}
++	if (tx) {
++		sy_wr(sy.se, SE_DMA_TX_IRQ_EN_SET, SE_DMA_DONE | SE_DMA_EOT | SE_DMA_AHB_ERR);
++		sy_wr(sy.se, SE_DMA_TX_PTR_L, lo + SY_TXB_OFF);
++		sy_wr(sy.se, SE_DMA_TX_PTR_H, hi);
++		sy_wr(sy.se, SE_DMA_TX_ATTR, SE_DMA_TX_ATTR_EOT_BUF);
++		sy_wr(sy.se, SE_DMA_TX_LEN, n);
++	}
 +	for (unsigned i = 0; i < 200000; i++) {
 +		uint32_t ts = sy_rd(sy.se, SE_DMA_TX_IRQ_STAT);
 +		uint32_t rs = sy_rd(sy.se, SE_DMA_RX_IRQ_STAT);
@@ -1357,43 +1410,70 @@ index 0000000..554fa3b
 +			err = EIO;
 +			break;
 +		}
-+		if (ts & SE_DMA_DONE) {
-+			tx_done = true;
++		if (tx && (ts & SE_DMA_DONE)) {
++			*tdone = true;
 +		}
-+		if (rs & SE_DMA_DONE) {
-+			rx_done = true;
++		if (rx && (rs & SE_DMA_DONE)) {
++			*rdone = true;
 +		}
-+		if (tx_done && rx_done) {
++		if (*tdone && *rdone) {
 +			break;
 +		}
 +		delay(1);
 +	}
 +	sy.se_tx_in = sy_rd(sy.se, SE_DMA_TX_LEN_IN);
 +	sy.se_rx_in = sy_rd(sy.se, SE_DMA_RX_LEN_IN);
-+	if (!err && !(tx_done && rx_done)) {
++	if (!err && !(*tdone && *rdone)) {
 +		err = ETIMEDOUT;
 +	}
-+	sy.spi_count++;
++	return err;
++}
++
++/*
++ * One frame through the serial engine's own DMA master (GeniSpi.c:219-293). Both
++ * directions always carry n bytes, TX from SY_TXB_OFF and RX into SY_RXB_OFF of
++ * the DMA page. The RX buffer starts as a 0x5a canary, so bytes the engine did
++ * not write show up as 0x5a in the log instead of looking like data.
++ */
++static int
++sy_spi_dma(const uint8_t *tx, uint8_t *rx, unsigned n)
++{
++	uint8_t *txb = (uint8_t *)(sy.dma + SY_TXB_OFF), *rxb = (uint8_t *)(sy.dma + SY_RXB_OFF);
++	bool tdone = false, rdone = false;
++	int err;
++
++	if (tx) {
++		memcpy(txb, tx, n);
++	} else {
++		memset(txb, 0, n);
++	}
++	memset(rxb, 0x5a, n);
++	clean_dcache64((addr64_t)(sy.dma_pa + SY_TXB_OFF), n, 1);	/* the engine reads our bytes */
++	flush_dcache64((addr64_t)(sy.dma_pa + SY_RXB_OFF), n, 1);	/* no stale line may win */
++	if (sy.tx_then_rx) {
++		/* First the header out with the chip select held (fragmentation = bit 2),
++		 * then a read-only command that clocks the answer in. */
++		err = sy_dma_run(true, false, n,
++		    SE_M_CMD_TX_ONLY << SE_M_CMD0_OPCODE_SHIFT | (1u << 2), &tdone, &rdone);
++		if (!err) {
++			err = sy_dma_run(false, true, n,
++			    SE_M_CMD_RX_ONLY << SE_M_CMD0_OPCODE_SHIFT, &tdone, &rdone);
++		}
++	} else {
++		err = sy_dma_run(true, true, n, SE_M_CMD_TX_RX << SE_M_CMD0_OPCODE_SHIFT,
++		    &tdone, &rdone);
++	}
 +	if (!err) {
 +		flush_dcache64((addr64_t)(sy.dma_pa + SY_RXB_OFF), n, 1);
 +		if (rx) {
 +			memcpy(rx, rxb, n);
-+		}
-+		if (sy.dbg) {
-+			sy_geni_dump("after transfer");
-+		} else if (sy.spi_count <= 2) {
-+			printf("SONGYUAN TOUCH: SPI[%u] %u bytes ok: m_irq=%#x dma tx=%#x rx=%#x "
-+			    "len_in %u/%u rx %02x %02x %02x %02x %02x\n", sy.spi_count, n,
-+			    sy_rd(sy.se, SE_M_IRQ), sy_rd(sy.se, SE_DMA_TX_IRQ_STAT),
-+			    sy_rd(sy.se, SE_DMA_RX_IRQ_STAT), sy.se_tx_in, sy.se_rx_in,
-+			    rxb[0], rxb[1], rxb[2], rxb[3], rxb[4]);
 +		}
 +		return 0;
 +	}
 +	if (++sy.dma_errors <= 8 || sy.dbg) {
 +		printf("SONGYUAN TOUCH: SPI SE-DMA failed %d (n %u, done tx %d rx %d, len_in %u/%u): "
 +		    "m_cmd0=%#x m_irq=%#x m_irq_en=%#x status=%#x dma tx_irq=%#x rx_irq=%#x "
-+		    "rx_attr=%#x fifo tx=%#x rx=%#x\n", err, n, tx_done, rx_done, sy.se_tx_in,
++		    "rx_attr=%#x fifo tx=%#x rx=%#x\n", err, n, tdone, rdone, sy.se_tx_in,
 +		    sy.se_rx_in, sy_rd(sy.se, SE_M_CMD0), sy_rd(sy.se, SE_M_IRQ),
 +		    sy_rd(sy.se, SE_M_IRQ_EN), sy_rd(sy.se, SE_STATUS),
 +		    sy_rd(sy.se, SE_DMA_TX_IRQ_STAT), sy_rd(sy.se, SE_DMA_RX_IRQ_STAT),
@@ -1410,9 +1490,137 @@ index 0000000..554fa3b
 +	return err;
 +}
 +
++/* GeniSpi.c:156-174: fill the TX FIFO from what is left. True while more remains. */
++static bool
++sy_fifo_tx(const uint8_t *tx, unsigned len, unsigned *rem, unsigned bpw)
++{
++	unsigned words = sy.fifo_depth >= 2 ? sy.fifo_depth - 1u : 1u;
++	unsigned max = words * bpw, i = 0;
++	const uint8_t *p = tx + (len - *rem);
++
++	if (*rem < max) {
++		max = *rem;
++	}
++	while (i < max) {
++		uint32_t word = 0;
++		unsigned k = max - i < bpw ? max - i : bpw;
++		for (unsigned j = 0; j < k; j++) {
++			word |= (uint32_t)p[i++] << (8 * j);
++		}
++		sy_wr(sy.se, SE_TX_FIFO, word);
++	}
++	*rem -= max;
++	if (!*rem) {
++		sy_wr(sy.se, SE_TX_WM, 0);
++		return false;
++	}
++	return true;
++}
++
++/* GeniSpi.c:176-197: drain the RX FIFO into what is left of the frame. */
++static void
++sy_fifo_rx(uint8_t *rx, unsigned len, unsigned *rem, unsigned bpw)
++{
++	uint32_t st = sy_rd(sy.se, SE_RX_STATUS);
++	unsigned bytes = (st & 0x1ffffffu) * bpw, i = 0;
++	uint8_t *p = rx + (len - *rem);
++	if (st & (1u << 31)) {
++		unsigned valid = (st >> 28) & 7u;
++		if (valid && valid < 4) {
++			bytes -= bpw - valid;
++		}
++	}
++	if (*rem < bytes) {
++		bytes = *rem;
++	}
++	while (i < bytes) {
++		uint32_t word = sy_rd(sy.se, SE_RX_FIFO);
++		unsigned k = bytes - i < bpw ? bytes - i : bpw;
++		for (unsigned j = 0; j < k; j++) {
++			p[i++] = (uint8_t)(word >> (8 * j));
++		}
++	}
++	*rem -= bytes;
++}
++
++/*
++ * One frame in FIFO/PIO mode (GeniSpi.c:295-348, the non-DMA branch): variant
++ * bits 1:0 = 1. The engine's FIFO interface is disabled by TZ, so this is the
++ * hypothesis "the FIFO still works and DMA was the problem"; it shows the raw
++ * bytes the engine shifts in.
++ */
++static int
++sy_spi_fifo(const uint8_t *tx, uint8_t *rx, unsigned n)
++{
++	unsigned bpw = sy.fifo_bits >= 8 ? sy.fifo_bits / 8 : 4u;
++	unsigned tx_rem = tx ? n : 0, rx_rem = rx ? n : 0;
++	uint32_t cmd = 0;
++	int err = ETIMEDOUT;
++
++	if (bpw == 0) {
++		bpw = 4;
++	}
++	if (tx) {
++		cmd |= SE_M_CMD_TX_ONLY;
++	}
++	if (rx) {
++		cmd |= SE_M_CMD_RX_ONLY;
++	}
++	if (cmd == (SE_M_CMD_TX_ONLY | SE_M_CMD_RX_ONLY)) {
++		cmd = SE_M_CMD_TX_RX;
++	}
++	sy_wr(sy.se, SE_M_IRQ_CLR, 0xffffffffu);
++	if (tx) {
++		sy_wr(sy.se, SE_SPI_TX_LEN, n);
++	}
++	if (rx) {
++		sy_wr(sy.se, SE_SPI_RX_LEN, n);
++	}
++	sy_wr(sy.se, SE_M_CMD0, cmd << SE_M_CMD0_OPCODE_SHIFT);
++	if (tx && sy_fifo_tx(tx, n, &tx_rem, bpw)) {
++		sy_wr(sy.se, SE_TX_WM, 1);
++	}
++	for (unsigned i = 0; i < 200000; i++) {
++		uint32_t st = sy_rd(sy.se, SE_M_IRQ);
++		if (!st) {
++			delay(1);
++			continue;
++		}
++		sy_wr(sy.se, SE_M_IRQ_CLR, st);
++		if (st & SE_M_ERRORS) {
++			err = EIO;
++			break;
++		}
++		if (st & (SE_M_RX_FIFO_WATERMARK | SE_M_RX_FIFO_LAST)) {
++			sy_fifo_rx(rx, n, &rx_rem, bpw);
++		}
++		if ((st & SE_M_TX_FIFO_WATERMARK) && tx) {
++			(void)sy_fifo_tx(tx, n, &tx_rem, bpw);
++		}
++		if (st & SE_M_CMD_DONE) {
++			if (rx && rx_rem) {
++				sy_fifo_rx(rx, n, &rx_rem, bpw);
++			}
++			err = (tx_rem || rx_rem) ? EIO : 0;
++			if (tx_rem) {
++				sy_wr(sy.se, SE_TX_WM, 0);
++			}
++			break;
++		}
++		delay(1);
++	}
++	if (err) {
++		printf("SONGYUAN TOUCH: SPI FIFO failed %d (n %u, left tx %u rx %u): m_cmd0=%#x "
++		    "m_irq=%#x status=%#x fifo tx=%#x rx=%#x\n", err, n, tx_rem, rx_rem,
++		    sy_rd(sy.se, SE_M_CMD0), sy_rd(sy.se, SE_M_IRQ), sy_rd(sy.se, SE_STATUS),
++		    sy_rd(sy.se, SE_TX_STATUS), sy_rd(sy.se, SE_RX_STATUS));
++	}
++	return err;
++}
++
 +/*
 + * One full-duplex transfer through wrapper 4's GPI DMA (PAND:623-666), kept as
-+ * the A/B path (songyuan_ftsdma=0). Both directions always carry n bytes: the
++ * the A/B path (variant bits 1:0 = 2). Both directions always carry n bytes: the
 + * FocalTech frame is one transaction of n bytes out and n bytes in, so tx is
 + * never NULL here (PAND sends 0xff when it is). CONFIG0 sets 8-bit words (8 - 4),
 + * TX/RX packing, mode 0, the DFS level and the divider; GO is full duplex (3)
@@ -1457,25 +1665,51 @@ index 0000000..554fa3b
 +}
 +
 +/*
-+ * One SPI frame. The engine's own DMA master is myron's path (and the one that
-+ * works on this phone); wrapper 4's GPI DMA is pandora's, selected with
-+ * songyuan_ftsdma=0 for an A/B run. sy.dbg dumps the GENI registers around every
-+ * transfer.
++ * One SPI frame. songyuan_ftsvariant bits 1:0 choose the engine: 0 the SE's own
++ * DMA master (myron's path, the default), 1 FIFO/PIO, 2 wrapper 4's GPI DMA
++ * (pandora's). Bit 4 drives chip select by hand around the frame. Every frame's
++ * TX and RX bytes are logged for the first few transfers and for every failure,
++ * so one boot shows which variant the chip answers.
 + */
 +static int
 +sy_spi(const uint8_t *tx, uint8_t *rx, unsigned n)
 +{
++	int err;
++
 +	if (sy.dead || n == 0 || n > SY_XFER_MAX) {
 +		return EIO;
-+	}
-+	if (sy.use_se_dma) {
-+		return sy_spi_dma(tx, rx, n);
 +	}
 +	if (sy.dbg) {
 +		sy_geni_dump("before transfer");
 +	}
-+	return sy_spi_gpi(tx, rx, n);
++	if (sy.manual_cs) {
++		sy_cs(true);
++	}
++	if (sy.path == 1) {
++		err = sy_spi_fifo(tx, rx, n);
++	} else if (sy.path == 2) {
++		err = sy_spi_gpi(tx, rx, n);
++	} else {
++		err = sy_spi_dma(tx, rx, n);
++	}
++	if (sy.manual_cs) {
++		sy_cs(false);
++	}
++	sy.spi_count++;
++	if (sy.dbg) {
++		sy_geni_dump("after transfer");
++	}
++	if (sy.dbg || err || sy.spi_count <= 8) {
++		printf("SONGYUAN TOUCH: SPI[%u] n %u err %d:", sy.spi_count, n, err);
++		sy_hex(" tx", tx, tx ? n : 0);
++		sy_hex(" rx", rx, rx ? n : 0);
++		printf(" m_irq=%#x dma tx=%#x rx=%#x len_in %u/%u\n", sy_rd(sy.se, SE_M_IRQ),
++		    sy_rd(sy.se, SE_DMA_TX_IRQ_STAT), sy_rd(sy.se, SE_DMA_RX_IRQ_STAT),
++		    sy.se_tx_in, sy.se_rx_in);
++	}
++	return err;
 +}
++
 +
 +/* ---- FocalTech protocol ---------------------------------------------------------- */
 +
@@ -1507,9 +1741,11 @@ index 0000000..554fa3b
 +}
 +
 +/*
-+ * Register read (MYRONC:305-319): {addr, 0xa0, len hi, len lo, 0, 0, 0} then n
-+ * bytes of data from byte 7 and a CRC-16/MCRF4XX over them, little endian, at
-+ * bytes 7+n and 8+n. Status byte 3 must have 0xA0 clear. Three attempts.
++ * Register read (MYRONC:305-319): {addr, read opcode, len hi, len lo, 0, 0, 0}
++ * then n bytes of data from byte 7 and a CRC-16/MCRF4XX over them, little
++ * endian, at bytes 7+n and 8+n. Status byte 3 must have 0xA0 clear. Three
++ * attempts. The read opcode is 0xa0 in myron's FT3683 frame, but the FT3685G may
++ * want another one, so songyuan_ftsvariant selects 0xa0, 0x80, 0xc0 or 0x00.
 + */
 +static int
 +sy_fts_read(uint8_t addr, uint8_t *out, unsigned n)
@@ -1522,7 +1758,7 @@ index 0000000..554fa3b
 +	for (unsigned attempt = 0; attempt < SY_FTS_TRIES; attempt++) {
 +		memset(sy.tx, 0, len);
 +		sy.tx[0] = addr;
-+		sy.tx[1] = SY_FTS_READ;
++		sy.tx[1] = (uint8_t)sy.read_opcode;
 +		sy.tx[2] = (uint8_t)(n >> 8);
 +		sy.tx[3] = (uint8_t)n;
 +		if ((err = sy_fts_xfer(len))) {
@@ -1897,7 +2133,29 @@ index 0000000..554fa3b
 +	(void)PE_parse_boot_argn("songyuan_ftsrpmh", &rpmh, sizeof(rpmh));
 +	(void)PE_parse_boot_argn("songyuan_ftsdma", &dma, sizeof(dma));
 +	(void)PE_parse_boot_argn("songyuan_ftsdbg", &sy.dbg, sizeof(sy.dbg));
-+	sy.use_se_dma = dma != 0;
++	(void)PE_parse_boot_argn("songyuan_ftsvariant", &sy.variant, sizeof(sy.variant));
++	/*
++	 * One build, several hypotheses (see the header): the transfer engine, the
++	 * read opcode, the chip-select owner, CPHA/CPOL, "TX then RX" and a loopback
++	 * self-test. The FTS frame itself (7-byte header, data, CRC-16) does not
++	 * change; only sy_fts_read's opcode does.
++	 */
++	sy.path = sy.variant & 3u;
++	if (!dma && sy.path == 0) {
++		sy.path = 2;		/* legacy switch: songyuan_ftsdma=0 = GPI DMA */
++	}
++	sy.use_se_dma = sy.path == 0;
++	sy.read_opcode = (sy.variant >> 2) & 3u;
++	sy.read_opcode = sy.read_opcode == 0 ? 0xa0u : sy.read_opcode == 1 ? 0x80u :
++	    sy.read_opcode == 2 ? 0xc0u : 0x00u;
++	sy.manual_cs = (sy.variant & (1u << 4)) != 0;
++	sy.spi_mode = (sy.variant >> 5) & 3u;
++	sy.tx_then_rx = (sy.variant & (1u << 7)) != 0;
++	sy.loopback = (sy.variant & (1u << 8)) != 0;
++	if (sy.path == 2 && (sy.spi_mode || sy.loopback || sy.tx_then_rx)) {
++		printf("SONGYUAN TOUCH: mode/loopback/tx-then-rx are the myron paths' knobs; "
++		    "ignored on the GPI path\n");
++	}
 +	if (PE_parse_boot_argn("songyuan_ftshz", &hz, sizeof(hz)) &&
 +	    (hz < SY_SPI_HZ_MIN || hz > SY_SPI_HZ_MAX)) {
 +		printf("SONGYUAN TOUCH: songyuan_ftshz=%u outside %u..%u, keeping %u\n", hz,
@@ -1906,9 +2164,12 @@ index 0000000..554fa3b
 +	}
 +	sy_set_hz(hz);
 +	printf("SONGYUAN TOUCH: starting in %u s, SPI %u Hz (div %u, %u Hz), iovdd vote %s, "
-+	    "path %s, debug %u\n", delay_s, sy.hz, sy.spi_div, sy.actual_hz,
++	    "path %s, variant %#x (opcode %#x, manual CS %d, mode %u, tx-then-rx %d, loopback %d), "
++	    "debug %u\n", delay_s, sy.hz, sy.spi_div, sy.actual_hz,
 +	    rpmh ? "on" : "off (songyuan_ftsrpmh=0)",
-+	    sy.use_se_dma ? "SE DMA (myron)" : "GPI DMA (pandora)", sy.dbg);
++	    sy.path == 0 ? "SE DMA (myron)" : sy.path == 1 ? "FIFO/PIO" : "GPI DMA (pandora)",
++	    sy.variant, sy.read_opcode, sy.manual_cs, sy.spi_mode, sy.tx_then_rx, sy.loopback,
++	    sy.dbg);
 +	sy_sleep(delay_s * 1000u);
 +	sy.gcc = ml_io_map(SY_GCC_PA, 0x1f0000);
 +	sy.tlmm = ml_io_map(SY_TLMM_PA, 0xa0000);
