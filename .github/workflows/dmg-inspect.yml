@@ -10,7 +10,7 @@ jobs:
       - name: deps
         run: |
           sudo apt-get update
-          sudo apt-get install -y build-essential cmake libfuse3-dev fuse3 git unzip curl
+          sudo apt-get install -y build-essential cmake libfuse3-dev fuse3 git unzip curl zlib1g-dev libbz2-dev libattr1-dev
       - name: apfs-fuse
         run: |
           git clone --depth 1 --recursive https://github.com/sgan81/apfs-fuse.git apfs-fuse
