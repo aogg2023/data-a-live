@@ -12,10 +12,10 @@ index 98d9d17..7917dcc 100644
  bsd/dev/pandora_gpi.c			standard
 diff --git a/bsd/dev/songyuan_touch.c b/bsd/dev/songyuan_touch.c
 new file mode 100644
-index 0000000..f50f886
+index 0000000..a671a14
 --- /dev/null
 +++ b/bsd/dev/songyuan_touch.c
-@@ -0,0 +1,2743 @@
+@@ -0,0 +1,2745 @@
 +/*
 + * SONGYUAN (Redmi K90 Pro Max, SM8850) main screen touch: FocalTech FT3683 on
 + * QUPv3 wrapper 4 SE0 (0x01a80000), polled through the wrapper's GPI DMA.
@@ -418,10 +418,11 @@ index 0000000..f50f886
 +/*
 + * TLMM CTL: pull [1:0] (1 down, 3 up), func [5:2], drive [8:6] = mA/2-1, OE [9],
 + * EGPIO_PRESENT [11], EGPIO_ENABLE [12]. As PAND:218-234, plus mt_pin_cfg
-+ * (MYRON:63-66): the low bits are replaced, the bits above kept, and the pin is
-+ * claimed (EGPIO_ENABLE) when it is egpio capable; egpio forces PRESENT for the
-+ * SPI pins, whose stock state is 0x801 (present, not enabled, MYRON:55-59).
-+ * The level is written before the output enable, so the pin never glitches.
++ * (MYRON:63-66): the low bits are replaced, the bits above kept, and ENABLE is
++ * only mirrored from whatever PRESENT the boot chain left (pandora_touch.c:209-
++ * 223, its working driver on the same pins). The touch pins pass egpio = false:
++ * the kernel does not force PRESENT/ENABLE into the SPI pad registers. The level
++ * is written before the output enable, so the pin never glitches.
 + */
 +static void
 +sy_gpio(unsigned n, unsigned func, unsigned pull, unsigned ma, int out, bool egpio)
@@ -1347,13 +1348,13 @@ index 0000000..f50f886
 +sy_cs(bool assert)
 +{
 +	if (assert) {
-+		sy_gpio(51, 0, 0, 6, 0, true);		/* function 0, output, level low */
++		sy_gpio(51, 0, 0, 6, 0, false);		/* function 0, output, level low */
 +		delay(2);
 +	} else {
 +		delay(2);
-+		sy_gpio(51, 0, 0, 6, 1, true);		/* level high first */
++		sy_gpio(51, 0, 0, 6, 1, false);		/* level high first */
 +		delay(2);
-+		sy_gpio(51, SY_FUNC_QUP4_SE0, 3, 6, -1, true);	/* back to the SE */
++		sy_gpio(51, SY_FUNC_QUP4_SE0, 3, 6, -1, false);	/* back to the SE */
 +	}
 +}
 +
@@ -1856,19 +1857,19 @@ index 0000000..f50f886
 +	printf("SONGYUAN TOUCH: pads (up/down):");
 +	for (unsigned i = 0; i < 4; i++) {
 +		uint32_t up, down;
-+		sy_gpio(pins[i], 0, 3, 6, -1, true);	/* input, pull-up */
++		sy_gpio(pins[i], 0, 3, 6, -1, false);	/* input, pull-up */
 +		delay(50);
 +		up = sy_rd(sy.tlmm, SY_GPIO(pins[i]) + 4) & 1u;
-+		sy_gpio(pins[i], 0, 1, 6, -1, true);	/* input, pull-down */
++		sy_gpio(pins[i], 0, 1, 6, -1, false);	/* input, pull-down */
 +		delay(50);
 +		down = sy_rd(sy.tlmm, SY_GPIO(pins[i]) + 4) & 1u;
 +		printf(" %u=%u/%u", pins[i], up, down);
 +	}
 +	printf("\n");
-+	sy_gpio(48, SY_FUNC_QUP4_SE0, 0, 6, -1, true);
-+	sy_gpio(49, SY_FUNC_QUP4_SE0, 0, 6, -1, true);
-+	sy_gpio(50, SY_FUNC_QUP4_SE0, 0, 4, -1, true);
-+	sy_gpio(51, SY_FUNC_QUP4_SE0, 3, 6, -1, true);
++	sy_gpio(48, SY_FUNC_QUP4_SE0, 0, 6, -1, false);
++	sy_gpio(49, SY_FUNC_QUP4_SE0, 0, 6, -1, false);
++	sy_gpio(50, SY_FUNC_QUP4_SE0, 0, 4, -1, false);
++	sy_gpio(51, SY_FUNC_QUP4_SE0, 3, 6, -1, false);
 +}
 +
 +
@@ -1921,10 +1922,10 @@ index 0000000..f50f886
 +	bool ok = false;
 +
 +	printf("SONGYUAN TOUCH: bit-bang SPI probe on GPIO 48-51 (~200 kHz, engine unused)\n");
-+	sy_gpio(48, 0, 3, 4, -1, true);		/* MISO: input, pull-up */
-+	sy_gpio(49, 0, 0, 4, 0, true);		/* MOSI: output low */
-+	sy_gpio(50, 0, 0, 4, 0, true);		/* CLK: output low */
-+	sy_gpio(51, 0, 3, 4, 1, true);		/* CS: output high */
++	sy_gpio(48, 0, 3, 4, -1, false);	/* MISO: input, pull-up */
++	sy_gpio(49, 0, 0, 4, 0, false);		/* MOSI: output low */
++	sy_gpio(50, 0, 0, 4, 0, false);		/* CLK: output low */
++	sy_gpio(51, 0, 3, 4, 1, false);		/* CS: output high */
 +	delay(100);
 +	memset(rx, 0, sizeof(rx));
 +	sy_bb_frame(rd_a3, sizeof(rd_a3), rx);
@@ -1955,10 +1956,10 @@ index 0000000..f50f886
 +		    ok ? "boot id matches" : "no boot id either");
 +	}
 +	/* Back to qup4_se0 function 1 for the serial engine. */
-+	sy_gpio(48, SY_FUNC_QUP4_SE0, 0, 6, -1, true);
-+	sy_gpio(49, SY_FUNC_QUP4_SE0, 0, 6, -1, true);
-+	sy_gpio(50, SY_FUNC_QUP4_SE0, 0, 4, -1, true);
-+	sy_gpio(51, SY_FUNC_QUP4_SE0, 3, 6, -1, true);
++	sy_gpio(48, SY_FUNC_QUP4_SE0, 0, 6, -1, false);
++	sy_gpio(49, SY_FUNC_QUP4_SE0, 0, 6, -1, false);
++	sy_gpio(50, SY_FUNC_QUP4_SE0, 0, 4, -1, false);
++	sy_gpio(51, SY_FUNC_QUP4_SE0, 3, 6, -1, false);
 +}
 +
 +/*
@@ -2138,10 +2139,10 @@ index 0000000..f50f886
 +static void
 +sy_pins_config(void)
 +{
-+	sy_gpio(48, SY_FUNC_QUP4_SE0, 0, 6, -1, true);		/* MISO, 6 mA, no pull */
-+	sy_gpio(49, SY_FUNC_QUP4_SE0, 0, 6, -1, true);		/* MOSI */
-+	sy_gpio(50, SY_FUNC_QUP4_SE0, 0, 4, -1, true);		/* CLK, 4 mA */
-+	sy_gpio(51, SY_FUNC_QUP4_SE0, 3, 6, -1, true);		/* CS, 6 mA, pull-up */
++	sy_gpio(48, SY_FUNC_QUP4_SE0, 0, 6, -1, false);		/* MISO, 6 mA, no pull */
++	sy_gpio(49, SY_FUNC_QUP4_SE0, 0, 6, -1, false);		/* MOSI */
++	sy_gpio(50, SY_FUNC_QUP4_SE0, 0, 4, -1, false);		/* CLK, 4 mA */
++	sy_gpio(51, SY_FUNC_QUP4_SE0, 3, 6, -1, false);		/* CS, 6 mA, pull-up */
 +	sy_gpio(SY_IRQ, 0, 3, 2, -1, false);			/* input, pull-up */
 +}
 +
@@ -2660,6 +2661,7 @@ index 0000000..f50f886
 +		printf("SONGYUAN TOUCH: engine set-up failed %d\n", err);
 +		goto out;
 +	}
++	sy_pins_dump("stock (boot chain, before any write)");	/* shows the EGPIO bits */
 +	sy_pins_config();	/* pads on the serial engine before the loopback test */
 +	sy_pins_dump("before");
 +	sy_power_on(rpmh != 0);
