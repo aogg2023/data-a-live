@@ -9610,10 +9610,10 @@ index 0000000..b6ce5c4
 +};
 diff --git a/bsd/dev/songyuan_touch.c b/bsd/dev/songyuan_touch.c
 new file mode 100644
-index 0000000..3d78570
+index 0000000..56cf5bc
 --- /dev/null
 +++ b/bsd/dev/songyuan_touch.c
-@@ -0,0 +1,3002 @@
+@@ -0,0 +1,3041 @@
 +/*
 + * SONGYUAN (Redmi K90 Pro Max, SM8850) main screen touch: FocalTech FT3683 on
 + * QUPv3 wrapper 4 SE0 (0x01a80000), polled through the wrapper's GPI DMA.
@@ -9659,6 +9659,10 @@ index 0000000..3d78570
 + *                         after the boot id answers and start it with 0x08;
 + *                         default 1. 0 skips the download (only the start
 + *                         command is sent), for an A/B run.
++ *   songyuan_ftscsdelay=N SE_SPI_DELAY_COUNTERS (0x278) clock-to-CS delay, bits
++ *                         19:10; default 50, range 0..1023, for a scan.
++ *   songyuan_ftsiwdelay=N the same register's inter-words delay, bits 9:0;
++ *                         default 0, range 0..1023.
 + *   songyuan_ftsdbg=1     dump the GENI and SE-DMA registers before and after
 + *                         every transfer; default 0 prints them after a failure
 + *                         and for the first two transfers only.
@@ -9781,6 +9785,13 @@ index 0000000..3d78570
 +#define SE_SPI_WORD_LEN  0x268u
 +#define SE_SPI_TX_LEN    0x26cu
 +#define SE_SPI_RX_LEN    0x270u
++/* SPI delay counters: bits 9:0 inter-words delay, bits 19:10 clock-to-CS delay. The
++ * stock Android driver programs 50/0 (0xC800); without it the RX side comes back all zero
++ * on the OnePlus 13T (SM8750) bring-up as well (same symptom, verified fix there). */
++#define SE_SPI_DELAY_COUNTERS	0x278u
++#define SE_SPI_DLY_WORDS_MASK	0x3ffu
++#define SE_SPI_DLY_CS_MASK	0x3ffu
++#define SE_SPI_DLY_CS_SHIFT	10
 +#define SE_RX_PACK0      0x284u
 +#define SE_RX_PACK1      0x288u
 +#define SE_M_CMD0        0x600u
@@ -9955,6 +9966,8 @@ index 0000000..3d78570
 +	uint32_t read_opcode;		/* 0xa0 (MYRONC), 0x80, 0xc0 or 0x00 from the variant */
 +	bool manual_cs, tx_then_rx, loopback, cs_cmds;
 +	unsigned spi_mode;		/* variant bits 6:5: CPHA/CPOL */
++	unsigned delay_cs;		/* songyuan_ftscsdelay: SE_SPI_DELAY_COUNTERS 19:10 */
++	unsigned delay_words;		/* songyuan_ftsiwdelay: SE_SPI_DELAY_COUNTERS 9:0 */
 +	unsigned dbg;			/* songyuan_ftsdbg: dump GENI before/after every transfer */
 +	unsigned qup_major, qup_minor, fifo_depth, fifo_bits, oversample, se_clk_div;
 +	unsigned dma_errors, spi_count, fifo_logs;
@@ -10559,7 +10572,8 @@ index 0000000..3d78570
 +	printf("SONGYUAN TOUCH: geni %s: m_cmd0=%#x m_cmd_ctrl=%#x m_irq=%#x m_irq_en=%#x "
 +	    "s_irq_en=%#x irq_en=%#x status=%#x gsi_ev=%#x dma_mode=%#x "
 +	    "trans_cfg=%#x demux=%#x/%#x cpha=%#x cpol=%#x loop=%#x word=%#x "
-+	    "pack=%#x/%#x rxpack=%#x/%#x byte_gran=%#x clk_sel=%#x m_clk=%#x\n", when,
++	    "pack=%#x/%#x rxpack=%#x/%#x byte_gran=%#x clk_sel=%#x m_clk=%#x delay=%#x\n",
++	    when,
 +	    sy_rd(sy.se, SE_M_CMD0), sy_rd(sy.se, SE_M_CMD_CTRL), sy_rd(sy.se, SE_M_IRQ),
 +	    sy_rd(sy.se, SE_M_IRQ_EN), sy_rd(sy.se, SE_S_IRQ_EN),
 +	    sy_rd(sy.se, SE_IRQ_EN), sy_rd(sy.se, SE_STATUS), sy_rd(sy.se, SE_GSI_EVENT_EN),
@@ -10568,7 +10582,8 @@ index 0000000..3d78570
 +	    sy_rd(sy.se, SE_SPI_CPHA), sy_rd(sy.se, SE_SPI_CPOL), sy_rd(sy.se, SE_SPI_LOOPBACK),
 +	    sy_rd(sy.se, SE_SPI_WORD_LEN), sy_rd(sy.se, SE_TX_PACK0), sy_rd(sy.se, SE_TX_PACK1),
 +	    sy_rd(sy.se, SE_RX_PACK0), sy_rd(sy.se, SE_RX_PACK1), sy_rd(sy.se, SE_BYTE_GRAN),
-+	    sy_rd(sy.se, SE_CLK_SEL), sy_rd(sy.se, SE_M_CLK_CFG));
++	    sy_rd(sy.se, SE_CLK_SEL), sy_rd(sy.se, SE_M_CLK_CFG),
++	    sy_rd(sy.se, SE_SPI_DELAY_COUNTERS));
 +	printf("SONGYUAN TOUCH: geni %s dma: tx_irq=%#x tx_irq_en=%#x tx_ptr=%#x tx_len=%#x "
 +	    "tx_len_in=%#x rx_irq=%#x rx_irq_en=%#x rx_ptr=%#x rx_len=%#x rx_len_in=%#x "
 +	    "rx_attr=%#x fifo tx=%#x rx=%#x\n", when,
@@ -10815,6 +10830,22 @@ index 0000000..3d78570
 +		    ~SE_SPI_CS_TOGGLE);
 +		sy_geni_word_len();
 +		sy_geni_clock();
++		/*
++		 * SE_SPI_DELAY_COUNTERS (0x278): clock-to-CS delay in bits 19:10 and
++		 * inter-words delay in bits 9:0. The stock Android driver programs 50/0
++		 * (0xC800) on this non-GPI path; the OnePlus 13T (SM8750) bring-up had
++		 * exactly this symptom ("SPI dma=1 ti=4 ri=4 st=0" with all-zero RX) and
++		 * touching this register fixed it (their 0x278 = 0xC800 then read 0xC800
++		 * and RX carried a valid header). Programmed before the first transfer.
++		 */
++		{
++			uint32_t dly = ((sy.delay_cs & SE_SPI_DLY_CS_MASK) << SE_SPI_DLY_CS_SHIFT) |
++			    (sy.delay_words & SE_SPI_DLY_WORDS_MASK);
++			sy_wr(sy.se, SE_SPI_DELAY_COUNTERS, dly);
++			printf("SONGYUAN TOUCH: SPI delays cs=%u words=%u -> 0x278=%#x (read %#x)\n",
++			    sy.delay_cs, sy.delay_words, dly,
++			    sy_rd(sy.se, SE_SPI_DELAY_COUNTERS));
++		}
 +		sy_engine_select(sy.path);
 +	} else {
 +		/* PAND:504-520 unchanged: geni_se_select_mode(GENI_GPI_DMA). */
@@ -12455,6 +12486,14 @@ index 0000000..3d78570
 +	(void)PE_parse_boot_argn("songyuan_ftsdma", &dma, sizeof(dma));
 +	(void)PE_parse_boot_argn("songyuan_ftsdbg", &sy.dbg, sizeof(sy.dbg));
 +	(void)PE_parse_boot_argn("songyuan_ftsvariant", &sy.variant, sizeof(sy.variant));
++	{
++		/* SE_SPI_DELAY_COUNTERS: stock 50/0; both fields are 10 bits wide. */
++		unsigned cs = 50, iw = 0;
++		(void)PE_parse_boot_argn("songyuan_ftscsdelay", &cs, sizeof(cs));
++		(void)PE_parse_boot_argn("songyuan_ftsiwdelay", &iw, sizeof(iw));
++		sy.delay_cs = cs & SE_SPI_DLY_CS_MASK;
++		sy.delay_words = iw & SE_SPI_DLY_WORDS_MASK;
++	}
 +	{
 +		unsigned fw = 1;
 +		(void)PE_parse_boot_argn("songyuan_ftsfw", &fw, sizeof(fw));
