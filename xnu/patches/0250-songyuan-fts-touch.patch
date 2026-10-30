@@ -9610,10 +9610,10 @@ index 0000000..b6ce5c4
 +};
 diff --git a/bsd/dev/songyuan_touch.c b/bsd/dev/songyuan_touch.c
 new file mode 100644
-index 0000000..fe638e2
+index 0000000..3d78570
 --- /dev/null
 +++ b/bsd/dev/songyuan_touch.c
-@@ -0,0 +1,2930 @@
+@@ -0,0 +1,3002 @@
 +/*
 + * SONGYUAN (Redmi K90 Pro Max, SM8850) main screen touch: FocalTech FT3683 on
 + * QUPv3 wrapper 4 SE0 (0x01a80000), polled through the wrapper's GPI DMA.
@@ -12058,63 +12058,61 @@ index 0000000..fe638e2
 +}
 +
 +/*
-+ * fts_enter_into_boot, exactly as the shipping module has it (fts3685_real.ko,
-+ * fts_enter_into_boot @0x13d9c, disassembly lines 0x13dfc-0x13ea0):
++ * Enter the chip's boot ROM with the exact timing and order of the working
++ * community FTS-over-GENI driver (E:\songyuan\work\unixnu_fts_Fts8203.c,
++ * enter_rom, lines 90-113; that port is known to deliver working touch on XNU):
 + *
-+ *   w23 = 0x55                                     ; one-byte write buffer
-+ *   for (i = 0; i < 30; i++) {                     ; cmp w19,#0x1e
-+ *       fts_reset_proc(0)                          ; low 1 ms -> high, no wait
-+ *       msleep(12 + i * 2)                         ; x22 += 2 each round
-+ *       for (k = 0; k < 3; k++) {                  ; three tries per round
-+ *           fts_write(&0x55, 1)                    ; {55 00 00 00}: datalen 0
-+ *           msleep(12)
-+ *           if (fts_check_bootid() == 0) -> done   ; fts_check_bootid @0x139bc:
-+ *                                                  ; read 0x90, 2 bytes, must be
-+ *                                                  ; {0x58, 0x83}
++ *   for (attempt = 0; attempt < 3; attempt++) {
++ *       reset low; delay 1000 us; reset high; delay 8000 us
++ *       for (query = 0; query < 3; query++) {
++ *           write_command(0x55, NULL, 0)      ; 4-byte frame {55 00 00 00}
++ *           delay 8000 us
++ *           read(0x90, 2)                     ; the ROM boot id
++ *           if id == {0x58, 0x83} -> success  ; our chip's id (theirs is 82 01)
 + *       }
 + *   }
 + *
-+ * Note what this is NOT: the generic FocalTech sources send {0x55, 0xAA} as a
-+ * write of data byte 0xAA to register 0x55; this Xiaomi module writes the bare
-+ * one-byte command 0x55 (a 4-byte frame with no data byte and no CRC), and it
-+ * never sends 0xAA.
-+ * Returns true when fts_check_bootid's condition held.
++ * That is 3 x 3 = 9 queries with 8 ms delays, instead of the 30 rounds x 3 with
++ * 12 ms the shipping Android module uses. The frame is the same bare command
++ * 0x55 (no data byte, no CRC).
 + */
 +static bool
 +sy_fts_enter_boot(uint8_t *hi, uint8_t *lo)
 +{
 +	uint8_t id[2] = {0, 0};
 +	bool ok = false;
-+	int w = 0, r = 0;
 +
 +	*hi = 0;
 +	*lo = 0;
-+	for (unsigned i = 0; i < 30 && !ok; i++) {
-+		sy_fts_reset_proc(0);
-+		sy_sleep(12 + i * 2);
-+		for (unsigned k = 0; k < 3; k++) {
-+			w = sy_fts_write(0x55, NULL, 0);	/* bare command 0x55 */
++	for (unsigned attempt = 0; attempt < 3 && !ok; attempt++) {
++		sy_gpio(SY_RESET, 0, 0, 4, 0, false);	/* reset low */
++		delay(1000);
++		sy_gpio(SY_RESET, 0, 0, 4, 1, false);	/* reset high */
++		delay(8000);
++		for (unsigned query = 0; query < 3 && !ok; query++) {
++			int w = sy_fts_write(0x55, NULL, 0);	/* bare command 0x55 */
++			int r;
 +			if (w) {
++				printf("SONGYUAN TOUCH: enter-rom a%u q%u: write 0x55 -> %d\n",
++				    attempt, query, w);
 +				continue;
 +			}
-+			delay(12000);				/* msleep(12) */
++			delay(8000);
 +			r = sy_fts_read(0x90, id, 2);
++			printf("SONGYUAN TOUCH: enter-rom a%u q%u: id %02x %02x (want %02x "
++			    "%02x, read %d)\n", attempt, query, id[0], id[1],
++			    SY_FTS_ID_A3, SY_FTS_ID_9F, r);
 +			if (!r && id[0] == SY_FTS_ID_A3 && id[1] == SY_FTS_ID_9F) {
 +				ok = true;
-+				break;
 +			}
 +		}
-+		/* Every round is logged, and a failed transfer never ends the loop: the
-+		 * vendor code runs all 30 rounds x 3 tries. */
-+		printf("SONGYUAN TOUCH: boot-RAM round %u: id %02x %02x (want %02x %02x, "
-+		    "write %d read %d)\n", i, id[0], id[1], SY_FTS_ID_A3, SY_FTS_ID_9F, w, r);
 +	}
 +	*hi = id[0];
 +	*lo = id[1];
 +	if (ok) {
 +		printf("SONGYUAN TOUCH: boot id %02x %02x (boot id check pass)\n", id[0], id[1]);
 +	} else {
-+		printf("SONGYUAN TOUCH: no valid boot id after 30 rounds, last %02x %02x "
++		printf("SONGYUAN TOUCH: no valid boot id after 3x3 queries, last %02x %02x "
 +		    "(want %02x %02x)\n", id[0], id[1], SY_FTS_ID_A3, SY_FTS_ID_9F);
 +	}
 +	return ok;
@@ -12204,33 +12202,113 @@ index 0000000..fe638e2
 +	return 0;
 +}
 +
-+/* CRC + the 0xCC/0xCD/0xCE exchange of fts_ecc_check. Diagnostic, not fatal. */
-+static void
-+sy_fts_ecc_check(void)
++/*
++ * The ECC word the community driver computes and compares with the chip
++ * (E:\songyuan\work\unixnu_fts_Fts8203.c, firmware_ecc, lines 115-124): XOR each
++ * big-endian 16-bit word into the register and step the 0x8408 polynomial 16
++ * times per word. That is not the same formula as sy_fts_crc()' byte-wise walk,
++ * so it is computed separately here.
++ */
++static uint16_t
++sy_fts_ecc_word(const uint8_t *data, unsigned length)
 +{
-+	unsigned total = sizeof(sy_fts_fw);
-+	uint8_t cmd[6], crc_in[2] = {0, 0}, st[2] = {0, 0};
-+	uint16_t crc = sy_fts_crc(sy_fts_fw, total);
-+	unsigned chip_crc;
-+	int w, r1, r2;
++	uint16_t ecc = 0;
 +
-+	/* off24 = 0, len24 = total (single ECC block: total < 0x40000). */
-+	cmd[0] = (uint8_t)(0 >> 16);
-+	cmd[1] = (uint8_t)(0 >> 8);
-+	cmd[2] = 0;
-+	cmd[3] = (uint8_t)(total >> 16);
-+	cmd[4] = (uint8_t)(total >> 8);
-+	cmd[5] = (uint8_t)total;
-+	w = sy_fts_bulk_write(0xcc, cmd, sizeof(cmd));
-+	delay(2000);			/* fts_msleep(2) in fts_ecc_check */
-+	r1 = sy_fts_read(0xcd, crc_in, 2);
-+	chip_crc = (unsigned)((crc_in[0] << 8) | crc_in[1]);
-+	r2 = sy_fts_read(0xce, st, 2);
-+	printf("SONGYUAN TOUCH: ECC check: write %d, CRC ours %#x chip %#x (read %d), "
-+	    "status %02x %02x (read %d)\n", w, crc, chip_crc, r1, st[0], st[1], r2);
++	for (unsigned i = 0; i + 1 < length; i += 2) {
++		ecc ^= (uint16_t)(((uint16_t)data[i] << 8) | data[i + 1]);
++		for (unsigned bit = 0; bit < 16; bit++) {
++			ecc = (uint16_t)((ecc >> 1) ^ ((ecc & 1) ? 0x8408 : 0));
++		}
++	}
++	return ecc;
 +}
 +
-+/* Boot-ROM handshake, PRAM download, ECC and the 0x08 start. */
++/*
++ * After the download: the ECC/start sequence of E:\songyuan\work\unixnu_fts_Fts8203.c
++ * (fts8203_start, lines 191-262), with our image length and our ROM id:
++ *   write_command(0xCC, {0,0,0, len>>16, len>>8, len}, 6)   ; 13-byte frame
++ *   delay 2 ms
++ *   poll read(0xCE, 1) until 0xA5, at most 100 x 1 ms (timeout is reported)
++ *   read(0xCD, 2) -> big-endian value, compared with firmware_ecc()
++ *   0x08 bare command -> delay 210 ms
++ *   read(0xA6, 1) (firmware version) -> delay 50 ms
++ *   read(0xA3, 1) and read(0x9F, 1) (runtime id)
++ * A CRC mismatch is reported but does not stop the start command: getting the
++ * application running is worth more than matching the reference's abort here.
++ */
++static int
++sy_fts_ecc_start(void)
++{
++	unsigned total = sizeof(sy_fts_fw);
++	uint8_t request[6] = {0, 0, 0, (uint8_t)(total >> 16), (uint8_t)(total >> 8),
++	    (uint8_t)total};
++	uint8_t status = 0, crc_in[2] = {0, 0}, ver = 0, id3 = 0, id9f = 0;
++	uint16_t expected = sy_fts_ecc_word(sy_fts_fw, total);
++	unsigned device;
++	unsigned polls = 100;
++	int w, r, r1 = EIO, r2 = EIO, r3 = EIO, r4 = EIO;
++
++	w = sy_fts_bulk_write(0xcc, request, sizeof(request));
++	delay(2000);
++	while (polls--) {
++		if (!sy_fts_read(0xce, &status, 1) && status == 0xa5) {
++			break;
++		}
++		delay(1000);
++	}
++	printf("SONGYUAN TOUCH: ECC request write %d, 0xCE status %02x after %u ms "
++	    "(want a5)\n", w, status, (100u - (polls + 1u)));
++	if (status != 0xa5) {
++		printf("SONGYUAN TOUCH: ECC status did not become a5 (timeout)\n");
++	}
++	r1 = sy_fts_read(0xcd, crc_in, 2);
++	device = (unsigned)((crc_in[0] << 8) | crc_in[1]);
++	printf("SONGYUAN TOUCH: ECC: expected %#x device %#x (read %d)%s\n", expected,
++	    device, r1, (r1 == 0 && device == expected) ? "" : " MISMATCH");
++	r2 = sy_fts_write(0x08, NULL, 0);	/* FTS_ROMBOOT_CMD_START_APP */
++	printf("SONGYUAN TOUCH: start app (0x08) -> %d\n", r2);
++	sy_sleep(210);
++	r3 = sy_fts_read(0xa6, &ver, 1);
++	printf("SONGYUAN TOUCH: firmware version 0xA6 %02x (read %d)\n", ver, r3);
++	sy_sleep(50);
++	r4 = sy_fts_read(0xa3, &id3, 1);
++	r = sy_fts_read(0x9f, &id9f, 1);
++	printf("SONGYUAN TOUCH: runtime id 0xA3 %02x (read %d), 0x9F %02x (read %d)\n",
++	    id3, r4, id9f, r);
++	return r2;
++}
++
++/*
++ * State registers, as the community driver's fts8203_state() reads them
++ * (unixnu_fts_Fts8203.c lines 139-171): mode 0x00, power 0xA5, gesture 0xD0,
++ * interrupt 0x8F, flow 0x91, plus the 0x90 ROM id. Every value is printed even
++ * when its read fails.
++ */
++static void
++sy_fts_state(void)
++{
++	static const struct {
++		uint8_t reg;
++		const char *name;
++	} regs[] = {
++		{0x00, "mode"}, {0xa5, "power"}, {0xd0, "gesture"}, {0x8f, "interrupt"},
++		{0x91, "flow"},
++	};
++
++	printf("SONGYUAN TOUCH: state:");
++	for (unsigned i = 0; i < sizeof(regs) / sizeof(regs[0]); i++) {
++		uint8_t v = 0;
++		int r = sy_fts_read(regs[i].reg, &v, 1);
++		printf(" %s(%02x)=%02x/r%d", regs[i].name, regs[i].reg, v, r);
++	}
++	{
++		uint8_t rom[2] = {0, 0};
++		int r = sy_fts_read(0x90, rom, 2);
++		printf(" rom(90)=%02x%02x/r%d\n", rom[0], rom[1], r);
++	}
++}
++
++/* Boot-ROM handshake, PRAM download, ECC/start and the state dump. */
 +static int
 +sy_fts_fw_load(bool download)
 +{
@@ -12240,16 +12318,7 @@ index 0000000..fe638e2
 +		printf("SONGYUAN TOUCH: firmware download failed %d\n", err);
 +		return err;
 +	}
-+	if (download) {
-+		sy_fts_ecc_check();
-+	}
-+	err = sy_fts_write(0x08, NULL, 0);	/* FTS_ROMBOOT_CMD_START_APP */
-+	printf("SONGYUAN TOUCH: start app (0x08) -> %d\n", err);
-+	if (err) {
-+		return err;
-+	}
-+	sy_sleep(200);				/* the application firmware boots */
-+	return 0;
++	return sy_fts_ecc_start();
 +}
 +
 +/*
@@ -12334,19 +12403,22 @@ index 0000000..fe638e2
 +	}
 +	if (sy_fts_enter_boot(&hi, &lo)) {
 +		/* The boot ROM is listening; download the application firmware into
-+		 * PRAM (unless songyuan_ftsfw=0), verify its CRC, then start it. */
++		 * PRAM (unless songyuan_ftsfw=0), run the ECC/start sequence, then look
++		 * at the runtime id and the state registers. */
 +		err = sy_fts_fw_load(sy.fw_load);
 +		if (!err) {
 +			for (unsigned t = 0; t < 3; t++) {
 +				if (!(err = sy_fts_chip_id())) {
 +					printf("SONGYUAN TOUCH: firmware started (attempt %u)\n",
 +					    t + 1);
++					sy_fts_state();
 +					return sy_fts_tic();
 +				}
 +				sy_sleep(100);
 +			}
 +			printf("SONGYUAN TOUCH: runtime id still invalid after the download; "
 +			    "check the ECC/start log above\n");
++			sy_fts_state();
 +		}
 +	} else {
 +		printf("SONGYUAN TOUCH: chip did not enter its boot ROM\n");
