@@ -9610,10 +9610,10 @@ index 0000000..b6ce5c4
 +};
 diff --git a/bsd/dev/songyuan_touch.c b/bsd/dev/songyuan_touch.c
 new file mode 100644
-index 0000000..56cf5bc
+index 0000000..fd38cea
 --- /dev/null
 +++ b/bsd/dev/songyuan_touch.c
-@@ -0,0 +1,3041 @@
+@@ -0,0 +1,3057 @@
 +/*
 + * SONGYUAN (Redmi K90 Pro Max, SM8850) main screen touch: FocalTech FT3683 on
 + * QUPv3 wrapper 4 SE0 (0x01a80000), polled through the wrapper's GPI DMA.
@@ -12123,17 +12123,21 @@ index 0000000..56cf5bc
 +		for (unsigned query = 0; query < 3 && !ok; query++) {
 +			int w = sy_fts_write(0x55, NULL, 0);	/* bare command 0x55 */
 +			int r;
-+			if (w) {
-+				printf("SONGYUAN TOUCH: enter-rom a%u q%u: write 0x55 -> %d\n",
-+				    attempt, query, w);
-+				continue;
-+			}
++			/*
++			 * Always read 0x90 after the 0x55: in the boot ROM a write does
++			 * not drive MISO, so the echo/status byte reads as 0xA0-set and
++			 * sy_fts_write() reports EIO even though the command went out.
++			 * Android's fts_enter_into_boot() writes and then reads the boot
++			 * id regardless; do the same (the write result is only logged).
++			 */
 +			delay(8000);
++			id[0] = 0;
++			id[1] = 0;
 +			r = sy_fts_read(0x90, id, 2);
-+			printf("SONGYUAN TOUCH: enter-rom a%u q%u: id %02x %02x (want %02x "
-+			    "%02x, read %d)\n", attempt, query, id[0], id[1],
-+			    SY_FTS_ID_A3, SY_FTS_ID_9F, r);
-+			if (!r && id[0] == SY_FTS_ID_A3 && id[1] == SY_FTS_ID_9F) {
++			printf("SONGYUAN TOUCH: enter-rom a%u q%u: write %d read %d id %02x %02x "
++			    "(want %02x %02x)\n", attempt, query, w, r, id[0], id[1],
++			    SY_FTS_ID_A3, SY_FTS_ID_9F);
++			if (id[0] == SY_FTS_ID_A3 && id[1] == SY_FTS_ID_9F) {
 +				ok = true;
 +			}
 +		}
@@ -12429,9 +12433,15 @@ index 0000000..56cf5bc
 +	uint8_t hi = 0, lo = 0;
 +	int err;
 +
-+	if (!(err = sy_fts_chip_id())) {
-+		return sy_fts_tic();	/* firmware already running (warm boot) */
-+	}
++	/*
++	 * Android's probe order (fts_ts_probe_work -> fts_enter_into_boot ->
++	 * fw upgrade -> 0x08 -> read A3/9F): enter the boot ROM first. The FT3685G
++	 * comes up in its ROM bootloader, where a bare 0xA3 read is answered by
++	 * nothing at all, so reading the runtime id first can never succeed on a
++	 * cold boot. A chip already running firmware is unaffected: the reset in
++	 * sy_fts_enter_boot() puts it back into the boot ROM and the handshake then
++	 * succeeds, exactly like the vendor's own probe.
++	 */
 +	if (sy_fts_enter_boot(&hi, &lo)) {
 +		/* The boot ROM is listening; download the application firmware into
 +		 * PRAM (unless songyuan_ftsfw=0), run the ECC/start sequence, then look
@@ -12451,8 +12461,14 @@ index 0000000..56cf5bc
 +			    "check the ECC/start log above\n");
 +			sy_fts_state();
 +		}
++		if (!(err = sy_fts_chip_id())) {
++			return sy_fts_tic();
++		}
 +	} else {
 +		printf("SONGYUAN TOUCH: chip did not enter its boot ROM\n");
++	}
++	if (!(err = sy_fts_chip_id())) {
++		return sy_fts_tic();	/* firmware already running (warm boot) */
 +	}
 +	sy_probe_matrix();	/* one boot, every plausible SPI configuration */
 +	if ((err = sy_fts_chip_id())) {
@@ -12663,7 +12679,7 @@ index 716d6c2..7aea6f8 100644
  extern void sweet_touch_init(void);
  extern void fuxi_touch_init(void);
  extern void fuxi_keys_init(void);
-+#if defined(SONGYUAN) || defined(PANDORA)
++#if defined(SONGYUAN)
 +extern void songyuan_touch_init(void);
 +#endif
  #if defined(PANDORA)
@@ -12685,7 +12701,7 @@ index 716d6c2..7aea6f8 100644
  #endif
  	/* Power / volume keys (bsd/dev/fuxi_keys.c, SPMI arbiter v7). */
  	fuxi_keys_init();
-+#if defined(SONGYUAN) || defined(PANDORA)
++#if defined(SONGYUAN)
 +	/* Main screen touch, FocalTech FT3683 on QUP4 SE0 (bsd/dev/songyuan_touch.c). */
 +	songyuan_touch_init();
 +#endif
