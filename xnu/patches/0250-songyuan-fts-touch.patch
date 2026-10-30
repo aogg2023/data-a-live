@@ -12679,7 +12679,7 @@ index 716d6c2..7aea6f8 100644
  extern void sweet_touch_init(void);
  extern void fuxi_touch_init(void);
  extern void fuxi_keys_init(void);
-+#if defined(SONGYUAN)
++#if defined(SONGYUAN) || defined(PANDORA)
 +extern void songyuan_touch_init(void);
 +#endif
  #if defined(PANDORA)
@@ -12701,7 +12701,7 @@ index 716d6c2..7aea6f8 100644
  #endif
  	/* Power / volume keys (bsd/dev/fuxi_keys.c, SPMI arbiter v7). */
  	fuxi_keys_init();
-+#if defined(SONGYUAN)
++#if defined(SONGYUAN) || defined(PANDORA)
 +	/* Main screen touch, FocalTech FT3683 on QUP4 SE0 (bsd/dev/songyuan_touch.c). */
 +	songyuan_touch_init();
 +#endif
