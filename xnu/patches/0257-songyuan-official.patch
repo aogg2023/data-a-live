@@ -1,0 +1,278 @@
+--- a/bsd/dev/songyuan_touch.c
++++ b/bsd/dev/songyuan_touch.c
+@@ -347,6 +347,8 @@
+ 	bool use_se_dma;		/* SE DMA master (GeniSpi.c:113); else GPI (PAND:493) */
+ 	bool fw_load;			/* songyuan_ftsfw: download the firmware into PRAM */
+ 	bool egpio_clear;		/* songyuan_ftsegpio: clear EGPIO PRESENT/ENABLE on the touch pads */
++	bool vote_l5b;			/* songyuan_ftsl5b: also vote L5B 3.1 V (not in the official touch DT) */
++	bool gpi_loop;			/* songyuan_ftsloop: GPI loopback self-test */
+ 	unsigned variant;		/* songyuan_ftsvariant: one build sweeps the frame/mode doubts */
+ 	unsigned path;			/* 0 SE DMA, 1 FIFO/PIO, 2 GPI DMA */
+ 	uint32_t read_opcode;		/* 0xa0 (MYRONC), 0x80, 0xc0 or 0x00 from the variant */
+@@ -1943,7 +1945,24 @@
+ 	unsigned saved;
+ 
+ 	if (sy.path == 2) {
+-		printf("SONGYUAN TOUCH: engine self-test skipped on the GPI path\n");
++		/* The GPI path is what every boot uses, so verify it too: with the SE's
++		 * loopback on, the engine returns its own MOSI on MISO. Only on request,
++		 * because it programs the SE while the chip is already powered. */
++		if (!sy.gpi_loop) {
++			printf("SONGYUAN TOUCH: GPI self-test off (songyuan_ftsloop=1 runs it)\n");
++			return;
++		}
++		{
++			uint8_t grx[6] = {0, 0, 0, 0, 0, 0};
++			int gerr;
++			sy_wr(sy.se, SE_SPI_LOOPBACK, 1);
++			gerr = sy_spi_gpi(tx, grx, sizeof(tx));
++			sy_wr(sy.se, SE_SPI_LOOPBACK, 0);
++			printf("SONGYUAN TOUCH: GPI loopback err %d RX%sTX:", gerr,
++			    gerr ? "!=" : "==");
++			sy_hex(" rx", grx, sizeof(grx));
++			printf("\n");
++		}
+ 		return;
+ 	}
+ 	/* Same frame through both engine modes, each with the SE's loopback on, so the
+@@ -2048,9 +2067,9 @@
+ 		printf(" %u=%u/%u", pins[i], up, down);
+ 	}
+ 	printf("\n");
+-	sy_gpio(48, SY_FUNC_QUP4_SE0, 1, 6, -1, false);
+-	sy_gpio(49, SY_FUNC_QUP4_SE0, 1, 6, -1, false);
+-	sy_gpio(50, SY_FUNC_QUP4_SE0, 1, 4, -1, false);
++	sy_gpio(48, SY_FUNC_QUP4_SE0, 0, 6, -1, false);
++	sy_gpio(49, SY_FUNC_QUP4_SE0, 0, 6, -1, false);
++	sy_gpio(50, SY_FUNC_QUP4_SE0, 0, 4, -1, false);
+ 	sy_gpio(51, SY_FUNC_QUP4_SE0, 3, 6, -1, false);
+ }
+ 
+@@ -2180,9 +2199,9 @@
+ 	(void)sy_bb_group("original,rising", 48, 49, 0);
+ 	(void)sy_bb_group("original,falling", 48, 49, 1);
+ 	/* Back to qup4_se0 function 1 for the serial engine. */
+-	sy_gpio(48, SY_FUNC_QUP4_SE0, 1, 6, -1, false);
+-	sy_gpio(49, SY_FUNC_QUP4_SE0, 1, 6, -1, false);
+-	sy_gpio(50, SY_FUNC_QUP4_SE0, 1, 4, -1, false);
++	sy_gpio(48, SY_FUNC_QUP4_SE0, 0, 6, -1, false);
++	sy_gpio(49, SY_FUNC_QUP4_SE0, 0, 6, -1, false);
++	sy_gpio(50, SY_FUNC_QUP4_SE0, 0, 4, -1, false);
+ 	sy_gpio(51, SY_FUNC_QUP4_SE0, 3, 6, -1, false);
+ }
+ 
+@@ -2268,7 +2287,8 @@
+ 		if (sy.rx[3] & SY_FTS_STATUS) {
+ 			err = EIO;
+ 			if (sy.logs++ < 8) {
+-				printf("SONGYUAN TOUCH: read %#x: status %#x\n", addr, sy.rx[3]);
++				printf("SONGYUAN TOUCH: read %#x: status %#x raw %02x %02x %02x %02x\n",
++				    addr, sy.rx[3], sy.rx[7], sy.rx[8], sy.rx[9], sy.rx[10]);
+ 			}
+ 			continue;
+ 		}
+@@ -2278,7 +2298,8 @@
+ 		if (want != got) {
+ 			err = EIO;
+ 			if (sy.logs++ < 8) {
+-				printf("SONGYUAN TOUCH: read %#x: CRC %#x want %#x\n", addr, got, want);
++				printf("SONGYUAN TOUCH: read %#x: CRC %#x want %#x raw %02x %02x\n",
++				    addr, got, want, sy.rx[7], sy.rx[8]);
+ 			}
+ 			continue;
+ 		}
+@@ -2365,11 +2386,11 @@
+ static void
+ sy_pins_config(void)
+ {
+-	sy_gpio(48, SY_FUNC_QUP4_SE0, 1, 6, -1, false);		/* MISO, 6 mA, no pull */
+-	sy_gpio(49, SY_FUNC_QUP4_SE0, 1, 6, -1, false);		/* MOSI */
+-	sy_gpio(50, SY_FUNC_QUP4_SE0, 1, 4, -1, false);		/* CLK, 4 mA */
++	sy_gpio(48, SY_FUNC_QUP4_SE0, 0, 6, -1, false);		/* MISO, 6 mA, no pull */
++	sy_gpio(49, SY_FUNC_QUP4_SE0, 0, 6, -1, false);		/* MOSI */
++	sy_gpio(50, SY_FUNC_QUP4_SE0, 0, 4, -1, false);		/* CLK, 4 mA */
+ 	sy_gpio(51, SY_FUNC_QUP4_SE0, 3, 6, -1, false);		/* CS, 6 mA, pull-up */
+-	sy_gpio(SY_IRQ, 0, 3, 2, -1, false);			/* input, pull-up */
++	sy_gpio(SY_IRQ, 0, 3, 8, -1, false);			/* input, pull-up */
+ }
+ 
+ /*
+@@ -2385,21 +2406,27 @@
+ static void
+ sy_power_on(bool vote)
+ {
+-	/* data-a-live order: iovdd/AVDD-input votes first, then avdd, then reset. */
++	/* Official focaltech_core.c, fts_power_source_ctrl(ENABLE) at 1954-1988:
++	 *   gpio_direction_output(reset, 0); msleep(1); regulator_enable(avdd);
++	 *   regulator_enable(iovdd);   -- and probe: msleep(1); reset high; msleep(100)
++	 * There is no second reset pulse and no 200 ms wait in the official driver. */
+ 	sy_pins_config();
+-	sy_gpio(SY_RESET, 0, 0, 4, 0, false);
++	sy_gpio(SY_RESET, 0, 0, 4, 0, false);		/* reset held low while powering */
++	sy_sleep(1);
++	sy_gpio(SY_AVDD, 0, 0, 4, 1, false);		/* avdd (GPIO 117 fixed regulator) */
+ 	if (vote) {
+-		int vi = sy_rpmh_vote();
+-		int va = sy_rpmh_vote_avdd();
+-		printf("SONGYUAN TOUCH: votes: L4I_E0 %d, L5B_E0 %d\n", vi, va);
+-	}
+-	sy_gpio(SY_AVDD, 0, 0, 4, 1, false);
+-	printf("SONGYUAN TOUCH: power_on: reset low, avdd high\n");
+-	sy_sleep(50);
+-	sy_gpio(SY_RESET, 0, 0, 4, 0, false);
+-	sy_sleep(10);
+-	sy_gpio(SY_RESET, 0, 0, 4, 1, false);
+-	sy_sleep(200);
++		int verr = sy_rpmh_vote();		/* iovdd = L4I_E0 1.8 V */
++		printf("SONGYUAN TOUCH: power_on: iovdd vote L4I_E0 -> %d", verr);
++		if (sy.vote_l5b) {
++			int aerr = sy_rpmh_vote_avdd();
++			printf(", L5B_E0 -> %d", aerr);
++		}
++		printf("\n");
++	}
++	sy_sleep(1);
++	sy_gpio(SY_RESET, 0, 0, 4, 1, false);		/* release */
++	sy_sleep(100);					/* official: 100 ms before the first read */
++	printf("SONGYUAN TOUCH: power_on: reset low 1 ms, avdd high, iovdd, reset high, 100 ms\n");
+ }
+ 
+ /* Chip id (MYRONC:337-347): myron's FT3683 answered 0x36/0x83; songyuan's IC is
+@@ -2661,23 +2688,43 @@
+ sy_fts_enter_boot(uint8_t *hi, uint8_t *lo)
+ {
+ 	uint8_t id[2] = {0, 0};
+-	uint8_t aa = 0xaa;
++	uint8_t start_cmd[2] = {0x55, 0xaa};	/* FTS_CMD_START1, FTS_CMD_START2 */
++	unsigned base = 12;			/* FTS_CMD_START_DELAY */
+ 	bool ok = false;
+-	*hi = 0; *lo = 0;
+-	for (unsigned attempt = 0; attempt < 3 && !ok; attempt++) {
+-		sy_gpio(SY_RESET, 0, 0, 4, 0, false);
+-		delay(1000);
+-		sy_gpio(SY_RESET, 0, 0, 4, 1, false);
+-		delay(12000 + attempt * 8000);
+-		int w = sy_fts_write(0x55, &aa, 1);
+-		delay(12000);
+-		id[0] = 0; id[1] = 0;
+-		int r = sy_fts_read(0x90, id, 2);
+-		printf("SONGYUAN TOUCH: bootid a%u write %d read %d id %02x %02x (want %02x %02x)\n",
+-		    attempt, w, r, id[0], id[1], SY_FTS_ID_A3, SY_FTS_ID_9F);
+-		if (id[0] == SY_FTS_ID_A3 && id[1] == SY_FTS_ID_9F) ok = true;
+-	}
+-	*hi = id[0]; *lo = id[1];
++
++	*hi = 0;
++	*lo = 0;
++	(void)PE_parse_boot_argn("songyuan_ftsromdelay", &base, sizeof(base));
++	if (base == 0 || base > 500) {
++		base = 12;
++	}
++	/* Official fts_read_bootid() (vendor_focaltech_core.c:536): write the two
++	 * start bytes, msleep(FTS_CMD_START_DELAY = 12), read 2 bytes from 0x90.
++	 * The shipped module retries it in fts_fwupg_reset_in_boot(): 30 rounds,
++	 * a reset each round, delay = base + 2 * round, three write/read tries. */
++	for (unsigned round = 0; round < 30 && !ok; round++) {
++		unsigned dly = base + 2u * round;
++		sy_fts_reset_proc(0);		/* gpio 0, 1 ms, gpio 1 */
++		sy_sleep(dly);
++		for (unsigned query = 0; query < 3 && !ok; query++) {
++			int w = sy_fts_write(0x55, start_cmd + 1, 1);	/* {55,00,00,01,..,AA} */
++			int r;
++			sy_sleep(base);
++			id[0] = 0; id[1] = 0;
++			r = sy_fts_read(0x90, id, 2);
++			printf("SONGYUAN TOUCH: bootid r%u q%u dly %u: write %d read %d id %02x %02x "
++			    "(want %02x %02x)\n", round, query, dly, w, r, id[0], id[1],
++			    SY_FTS_ID_A3, SY_FTS_ID_9F);
++			if (id[0] == SY_FTS_ID_A3 && id[1] == SY_FTS_ID_9F) {
++				ok = true;
++			}
++		}
++	}
++	*hi = id[0];
++	*lo = id[1];
++	if (ok) {
++		printf("SONGYUAN TOUCH: boot id %02x %02x (pass)\n", id[0], id[1]);
++	}
+ 	return ok;
+ }
+ 
+@@ -2961,21 +3008,17 @@
+ 	uint8_t hi = 0, lo = 0;
+ 	int err;
+ 
+-	/*
+-	 * Android's probe order (fts_ts_probe_work -> fts_enter_into_boot ->
+-	 * fw upgrade -> 0x08 -> read A3/9F): enter the boot ROM first. The FT3685G
+-	 * comes up in its ROM bootloader, where a bare 0xA3 read is answered by
+-	 * nothing at all, so reading the runtime id first can never succeed on a
+-	 * cold boot. A chip already running firmware is unaffected: the reset in
+-	 * sy_fts_enter_boot() puts it back into the boot ROM and the handshake then
+-	 * succeeds, exactly like the vendor's own probe.
+-	 */
++	/* Official probe order (fts_get_ic_information, vendor_focaltech_core.c:579):
++	 * first the runtime chip id, retried until TIMEOUT_READ_REG; only when that
++	 * never becomes valid may the driver read the boot id and enter the ROM. */
++	if (!(err = sy_fts_chip_id())) {
++		return sy_fts_tic();
++	}
++	printf("SONGYUAN TOUCH: runtime id invalid (%d); reading boot id\n", err);
+ 	if (sy_fts_enter_boot(&hi, &lo)) {
+-		/* The boot ROM is listening; download the application firmware into
+-		 * PRAM (unless songyuan_ftsfw=0), run the ECC/start sequence, then look
+-		 * at the runtime id and the state registers. */
+-		err = sy_fts_fw_load(sy.fw_load);
+-		if (!err) {
++		/* In the boot ROM: download the application firmware into PRAM, start it,
++		 * then look at the runtime id again. */
++		if (!(err = sy_fts_fw_load(sy.fw_load))) {
+ 			for (unsigned t = 0; t < 3; t++) {
+ 				if (!(err = sy_fts_chip_id())) {
+ 					printf("SONGYUAN TOUCH: firmware started (attempt %u)\n",
+@@ -2985,20 +3028,17 @@
+ 				}
+ 				sy_sleep(100);
+ 			}
+-			printf("SONGYUAN TOUCH: runtime id still invalid after the download; "
+-			    "check the ECC/start log above\n");
+-			sy_fts_state();
+-		}
+-		if (!(err = sy_fts_chip_id())) {
+-			return sy_fts_tic();
+-		}
+-	} else {
+-		printf("SONGYUAN TOUCH: chip did not enter its boot ROM\n");
+-	}
++		}
++		printf("SONGYUAN TOUCH: runtime id still invalid after the download; "
++		    "check the ECC/start log above\n");
++		sy_fts_state();
++		return err;
++	}
++	printf("SONGYUAN TOUCH: chip did not enter its boot ROM\n");
+ 	if (!(err = sy_fts_chip_id())) {
+-		return sy_fts_tic();	/* firmware already running (warm boot) */
+-	}
+-	sy_probe_matrix();	/* one boot, every plausible SPI configuration */
++		return sy_fts_tic();
++	}
++	sy_probe_matrix();
+ 	if ((err = sy_fts_chip_id())) {
+ 		return err;
+ 	}
+@@ -3028,9 +3068,13 @@
+ 	(void)PE_parse_boot_argn("songyuan_ftsdelay", &delay_s, sizeof(delay_s));
+ 	(void)PE_parse_boot_argn("songyuan_ftsrpmh", &rpmh, sizeof(rpmh));
+ 	(void)PE_parse_boot_argn("songyuan_ftsdma", &dma, sizeof(dma));
+-	unsigned eg = 0;
++	unsigned eg = 0, l5b = 0, gloop = 0;
+ 	(void)PE_parse_boot_argn("songyuan_ftsegpio", &eg, sizeof(eg));
++	(void)PE_parse_boot_argn("songyuan_ftsl5b", &l5b, sizeof(l5b));
++	(void)PE_parse_boot_argn("songyuan_ftsloop", &gloop, sizeof(gloop));
+ 	sy.egpio_clear = eg != 0;
++	sy.vote_l5b = l5b != 0;
++	sy.gpi_loop = gloop != 0;
+ 	(void)PE_parse_boot_argn("songyuan_ftsdbg", &sy.dbg, sizeof(sy.dbg));
+ 	(void)PE_parse_boot_argn("songyuan_ftsvariant", &sy.variant, sizeof(sy.variant));
+ 	{
