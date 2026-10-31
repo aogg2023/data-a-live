@@ -29,8 +29,10 @@ jobs:
         run: |
           set -euo pipefail
           cd art
-          unzip -o -q *.zip
-          IMG=$(ls -S *.img | head -1)
+          ls -l
+          if ls *.zip >/dev/null 2>&1; then unzip -o -q *.zip; fi
+          IMG=$(ls -S *.img 2>/dev/null | head -1 || true)
+          if [ -z "$IMG" ]; then echo "no .img in artifact"; exit 1; fi
           echo "image: $IMG"; ls -l "$IMG"
           hdiutil resize -size "${{ inputs.new_size }}" "$IMG"
           echo "== fsck (repair) =="
@@ -43,7 +45,8 @@ jobs:
         run: |
           set -euo pipefail
           cd art
-          IMG=$(ls -S *.img | head -1)
+          IMG=$(ls -S *.img 2>/dev/null | head -1 || true)
+          [ -n "$IMG" ] || { echo "no .img"; exit 1; }
           zip -q -1 root20g.zip "$IMG"
           ls -l root20g.zip
           rm -f "$IMG"
