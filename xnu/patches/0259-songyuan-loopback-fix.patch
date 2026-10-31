@@ -1,0 +1,59 @@
+--- a/bsd/dev/songyuan_touch.c
++++ b/bsd/dev/songyuan_touch.c
+@@ -1947,24 +1947,25 @@
+ 	unsigned saved;
+ 
+ 	if (sy.path == 2) {
+-		/* The GPI path is what every boot uses, so verify it too: with the SE's
+-		 * loopback on, the engine returns its own MOSI on MISO. Only on request,
+-		 * because it programs the SE while the chip is already powered. */
++		/* The GPI path is what every boot uses, so verify it: with the SE's SPI
++		 * loopback on, the engine must return its own MOSI on MISO. The verdict is
++		 * the byte comparison -- a transfer that "completes" proves nothing. */
++		uint8_t grx[6] = {0, 0, 0, 0, 0, 0};
++		bool gsame;
++		int gerr;
+ 		if (!sy.gpi_loop) {
+-			printf("SONGYUAN TOUCH: GPI self-test off (songyuan_ftsloop=1 runs it)\n");
++			printf("SONGYUAN TOUCH: GPI loopback off (songyuan_ftsloop=1 runs it)\n");
+ 			return;
+ 		}
+-		{
+-			uint8_t grx[6] = {0, 0, 0, 0, 0, 0};
+-			int gerr;
+-			sy_wr(sy.se, SE_SPI_LOOPBACK, 1);
+-			gerr = sy_spi_gpi(tx, grx, sizeof(tx));
+-			sy_wr(sy.se, SE_SPI_LOOPBACK, 0);
+-			printf("SONGYUAN TOUCH: GPI loopback err %d RX%sTX:", gerr,
+-			    gerr ? "!=" : "==");
+-			sy_hex(" rx", grx, sizeof(grx));
+-			printf("\n");
+-		}
++		sy_wr(sy.se, SE_SPI_LOOPBACK, 1);
++		gerr = sy_spi_gpi(tx, grx, sizeof(tx));
++		sy_wr(sy.se, SE_SPI_LOOPBACK, 0);
++		gsame = (gerr == 0) && bcmp(grx, tx, sizeof(tx)) == 0;
++		printf("SONGYUAN TOUCH: GPI loopback err %d %s:", gerr,
++		    gsame ? "RX==TX PASS" : "RX!=TX FAIL");
++		sy_hex(" tx", tx, sizeof(tx));
++		sy_hex(" rx", grx, sizeof(grx));
++		printf("\n");
+ 		return;
+ 	}
+ 	/* Same frame through both engine modes, each with the SE's loopback on, so the
+@@ -3167,6 +3168,7 @@
+ 	sy_pins_dump("stock (boot chain, before any write)");	/* shows the EGPIO bits */
+ 	sy_pins_config();	/* pads on the serial engine before the loopback test */
+ 	sy_pins_dump("before");
++	sy_self_test();		/* transport check with the chip still unpowered */
+ 	sy_power_on(rpmh != 0);
+ 	printf("SONGYUAN TOUCH: after power_on (avdd 117 high, reset 66 high): reset cfg=%#x io=%u, "
+ 	    "avdd cfg=%#x io=%u, irq 158 cfg=%#x io=%u\n",
+@@ -3179,7 +3181,6 @@
+ 		sy_irq_activity();	/* does the chip's firmware pull IRQ at all */
+ 		sy_bitbang_probe();	/* the same frames by hand, engine unused */
+ 	}
+-	sy_self_test();		/* engine loopback, after the chip-level probes */
+ 	if ((err = sy_fts_setup())) {
+ 		printf("SONGYUAN TOUCH: FTS start failed %d\n", err);
+ 		sy_pins_dump("after failed start");
