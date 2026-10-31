@@ -1,0 +1,133 @@
+--- a/bsd/dev/songyuan_touch.c
++++ b/bsd/dev/songyuan_touch.c
+@@ -301,7 +301,8 @@
+ /* FocalTech FT3683 (MYRON:104-119,155-156; MYRONC:22-24,305-359). */
+ #define SY_FTS_FRAME	84u		/* MYRON:117: the 0x01 frame */
+ #define SY_FTS_MAX	128u		/* driver buffer: 84 + 7 + 2 fits with room */
+-#define SY_FTS_HDR	7u		/* MYRONC:22-23: addr, opcode, len hi/lo, 3 dummy */
++#define SY_FTS_HDR	7u
++#define SY_V2_HDR	10u	/* SPI V2: 4-byte header + 6 pad, data at byte 10 */		/* MYRONC:22-23: addr, opcode, len hi/lo, 3 dummy */
+ #define SY_FTS_READ	0xa0u		/* MYRONC:310: read opcode */
+ #define SY_FTS_WRITE	0x00u		/* MYRONC:327 */
+ #define SY_FTS_STATUS	0xa0u		/* MYRONC:313: status byte 3 must have 0xA0 clear */
+@@ -2368,41 +2369,41 @@
+ static int
+ sy_fts_read(uint8_t addr, uint8_t *out, unsigned n)
+ {
+-	delay(150);		/* vendor minimum CS-high time */
+-	if (n == 0 || n + SY_FTS_HDR + 2 > sizeof(sy.tx) || n + SY_FTS_HDR + 2 > sizeof(sy.rx)) {
++	unsigned total = SY_V2_HDR + n + 2;
++	if (n == 0 || total > sizeof(sy.tx) || total > sizeof(sy.rx)) {
+ 		return EINVAL;
+ 	}
+-	unsigned len = n + SY_FTS_HDR + 2;
+ 	int err = EIO;
+ 	for (unsigned attempt = 0; attempt < SY_FTS_TRIES; attempt++) {
+-		memset(sy.tx, 0, len);
+-		sy.tx[0] = addr;
+-		sy.tx[1] = (uint8_t)sy.read_opcode;
++		memset(sy.tx, 0, total);
++		sy.tx[0] = (uint8_t)sy.read_opcode;	/* SPI V2: opcode first */
++		sy.tx[1] = addr;			/* then the register */
+ 		sy.tx[2] = (uint8_t)(n >> 8);
+ 		sy.tx[3] = (uint8_t)n;
+-		if ((err = sy_fts_xfer(len))) {
++		if ((err = sy_fts_xfer(total))) {
+ 			continue;
+ 		}
+ 		if (sy.rx[3] & SY_FTS_STATUS) {
+ 			err = EIO;
+ 			if (sy.logs++ < 8) {
+ 				printf("SONGYUAN TOUCH: read %#x: status %#x raw %02x %02x %02x %02x\n",
+-				    addr, sy.rx[3], sy.rx[7], sy.rx[8], sy.rx[9], sy.rx[10]);
++				    addr, sy.rx[3], sy.rx[SY_V2_HDR], sy.rx[SY_V2_HDR + 1],
++				    sy.rx[SY_V2_HDR + 2], sy.rx[SY_V2_HDR + 3]);
+ 			}
+ 			continue;
+ 		}
+-		uint16_t want = sy_fts_crc(sy.rx + SY_FTS_HDR, n);
+-		uint16_t got = (uint16_t)(sy.rx[SY_FTS_HDR + n] |
+-		    (sy.rx[SY_FTS_HDR + n + 1] << 8));
++		uint16_t want = sy_fts_crc(sy.rx + SY_V2_HDR, n);
++		uint16_t got = (uint16_t)(sy.rx[SY_V2_HDR + n] |
++		    (sy.rx[SY_V2_HDR + n + 1] << 8));
+ 		if (want != got) {
+ 			err = EIO;
+ 			if (sy.logs++ < 8) {
+ 				printf("SONGYUAN TOUCH: read %#x: CRC %#x want %#x raw %02x %02x\n",
+-				    addr, got, want, sy.rx[7], sy.rx[8]);
++				    addr, got, want, sy.rx[SY_V2_HDR], sy.rx[SY_V2_HDR + 1]);
+ 			}
+ 			continue;
+ 		}
+-		memcpy(out, sy.rx + SY_FTS_HDR, n);
++		memcpy(out, sy.rx + SY_V2_HDR, n);
+ 		return 0;
+ 	}
+ 	return err;
+@@ -2419,22 +2420,21 @@
+ static int
+ sy_fts_write(uint8_t addr, const uint8_t *data, unsigned n)
+ {
+-	delay(150);		/* vendor minimum CS-high time */
+-	unsigned len = n ? SY_FTS_HDR + n : 4;
+-	if (n > sizeof(sy.tx) || len > sizeof(sy.tx) || len > sizeof(sy.rx)) {
++	unsigned total = n ? SY_V2_HDR + n : 4;
++	if (n > sizeof(sy.tx) || total > sizeof(sy.tx) || total > sizeof(sy.rx)) {
+ 		return EINVAL;
+ 	}
+ 	int err = EIO;
+ 	for (unsigned attempt = 0; attempt < SY_FTS_TRIES; attempt++) {
+-		memset(sy.tx, 0, len);
+-		sy.tx[0] = addr;
+-		sy.tx[1] = SY_FTS_WRITE;
++		memset(sy.tx, 0, total);
++		sy.tx[0] = SY_FTS_WRITE;		/* SPI V2: 0x00 first */
++		sy.tx[1] = addr;
+ 		sy.tx[2] = (uint8_t)(n >> 8);
+ 		sy.tx[3] = (uint8_t)n;
+ 		if (n) {
+-			memcpy(sy.tx + SY_FTS_HDR, data, n);
+-		}
+-		if ((err = sy_fts_xfer(len))) {
++			memcpy(sy.tx + SY_V2_HDR, data, n);
++		}
++		if ((err = sy_fts_xfer(total))) {
+ 			continue;
+ 		}
+ 		if (sy.rx[3] & SY_FTS_STATUS) {
+@@ -2863,26 +2863,25 @@
+  * address: the same set-address/write-data interface, just more frames.
+  */
+ #define SY_FW_CHUNK	4000u
+-static uint8_t sy_fw_tx[SY_FW_CHUNK + 8], sy_fw_rx[SY_FW_CHUNK + 8];
++static uint8_t sy_fw_tx[SY_FW_CHUNK + 16], sy_fw_rx[SY_FW_CHUNK + 16];
+ 
+ /* One long data frame: {addr, 0x00, len hi, len lo, 0,0,0, data...}. */
+ static int
+ sy_fts_bulk_write(uint8_t addr, const uint8_t *data, unsigned n)
+ {
+-	unsigned len = 7 + n;
++	unsigned total = SY_V2_HDR + n;
+ 	int err = EIO;
+-
+-	if (n == 0 || len > sizeof(sy_fw_tx) || len > SY_XFER_MAX) {
++	if (n == 0 || total > sizeof(sy_fw_tx) || total > SY_XFER_MAX) {
+ 		return EINVAL;
+ 	}
+ 	for (unsigned attempt = 0; attempt < SY_FTS_TRIES; attempt++) {
+-		memset(sy_fw_tx, 0, len);
+-		sy_fw_tx[0] = addr;
+-		sy_fw_tx[1] = SY_FTS_WRITE;
++		memset(sy_fw_tx, 0, total);
++		sy_fw_tx[0] = SY_FTS_WRITE;
++		sy_fw_tx[1] = addr;
+ 		sy_fw_tx[2] = (uint8_t)(n >> 8);
+ 		sy_fw_tx[3] = (uint8_t)n;
+-		memcpy(sy_fw_tx + 7, data, n);
+-		if ((err = sy_spi(sy_fw_tx, sy_fw_rx, len))) {
++		memcpy(sy_fw_tx + SY_V2_HDR, data, n);
++		if ((err = sy_spi(sy_fw_tx, sy_fw_rx, total))) {
+ 			continue;
+ 		}
+ 		if (sy_fw_rx[3] & SY_FTS_STATUS) {
