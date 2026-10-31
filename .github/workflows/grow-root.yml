@@ -25,33 +25,43 @@ jobs:
         run: |
           gh run download "${{ inputs.run_id }}" -n songyuan-root-image -D art -R "$GITHUB_REPOSITORY"
           ls -l art
-      - name: unzip, grow with hdiutil, verify with fsck_hfs
+      - name: install zstd
+        run: brew install zstd || brew upgrade zstd
+      - name: join + decompress the zstd parts
         run: |
           set -euo pipefail
           cd art
           ls -l
-          if ls *.zip >/dev/null 2>&1; then unzip -o -q *.zip; fi
-          IMG=$(ls -S *.img 2>/dev/null | head -1 || true)
-          if [ -z "$IMG" ]; then echo "no .img in artifact"; exit 1; fi
-          echo "image: $IMG"; ls -l "$IMG"
+          if ls *.img >/dev/null 2>&1; then
+            echo "artifact already carries .img"
+          else
+            cat root.img.zst.part.* > root.img.zst
+            zstd -d -T0 root.img.zst -o root.img
+            rm -f root.img.zst
+          fi
+          ls -l root.img
+      - name: grow with hdiutil and verify with fsck_hfs
+        run: |
+          set -euo pipefail
+          cd art
+          IMG=root.img
+          ls -l "$IMG"
           hdiutil resize -size "${{ inputs.new_size }}" "$IMG"
           echo "== fsck (repair) =="
           sudo /sbin/fsck_hfs -f -y "$IMG" | tail -20 || true
           echo "== fsck (check) =="
           sudo /sbin/fsck_hfs -f -n "$IMG" | tail -20
           echo "== volume info =="
-          hdiutil imageinfo "$IMG" | head -40
-      - name: zip and split
+          hdiutil imageinfo "$IMG" | head -30
+      - name: compress and split
         run: |
           set -euo pipefail
           cd art
-          IMG=$(ls -S *.img 2>/dev/null | head -1 || true)
-          [ -n "$IMG" ] || { echo "no .img"; exit 1; }
-          zip -q -1 root20g.zip "$IMG"
-          ls -l root20g.zip
-          rm -f "$IMG"
+          zstd -T0 -3 -f root.img -o root20g.img.zst
+          ls -l root20g.img.zst
+          rm -f root.img
           rm -rf parts && mkdir parts
-          split -b 1800m root20g.zip parts/root20g-part-
+          split -b 1800m root20g.img.zst parts/root20g.img.zst.part.
           (cd parts && shasum -a 256 * > SHA256SUMS && ls -l)
       - name: publish release assets
         env:
@@ -62,6 +72,6 @@ jobs:
           gh release delete "$TAG" -R "$GITHUB_REPOSITORY" --yes --cleanup-tag || true
           gh release create "$TAG" -R "$GITHUB_REPOSITORY" \
             --title "songyuan iOS root $TAG" \
-            --notes "Grown with hdiutil resize to ${{ inputs.new_size }}; join parts, sha256sum -c, unzip."
+            --notes "Grown with hdiutil resize to ${{ inputs.new_size }}; join .part files, sha256sum -c, zstd -d."
           gh release upload "$TAG" art/parts/* -R "$GITHUB_REPOSITORY"
           gh release view "$TAG" -R "$GITHUB_REPOSITORY" --json assets -q '.assets[] | "\(.name) \(.size)"'
