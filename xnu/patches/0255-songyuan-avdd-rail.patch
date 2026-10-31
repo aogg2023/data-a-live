@@ -1,0 +1,93 @@
+--- a/bsd/dev/songyuan_touch.c
++++ b/bsd/dev/songyuan_touch.c
+@@ -582,21 +582,18 @@
+  * call cannot arm a second request for the same rail.
+  */
+ static int
+-sy_rpmh_vote(void)
++sy_rpmh_vote_res(const char *res, uint32_t mv, uint32_t mode)
+ {
+ 	const struct sy_rpmh_layout *L = NULL;
+ 	uint32_t id = 0, config = 0, magic = 0, address = 0;
+ 	uint32_t major, minor, ntcs, ncpt, b = 0, bit = 0, irq_en = 0;
+ 	uint32_t word[3] = {0, 0, 0}, cs[3] = {0, 0, 0};
+-	uint32_t vals[3] = {SY_VRM_MV, SY_VRM_MODE, SY_VRM_ENABLE};
++	uint32_t vals[3] = {mv, mode, SY_VRM_ENABLE};
+ 	static const uint32_t offs[3] = {0, 8, 4};	/* voltage, mode, enable */
+ 	unsigned t = 0;
+ 	int chosen = -1, rc = 0;
+ 	bool done = false;
+ 
+-	if (sy_rpmh_tried) {
+-		return sy_rpmh_result;
+-	}
+ 	sy_rsc = ml_io_map(SY_RSC_PA, SY_RSC_SIZE);
+ 	sy_cmddb = ml_io_map(SY_CMDDB_PA, SY_CMDDB_SIZE);
+ 	if (!sy_rsc || !sy_cmddb) {
+@@ -629,7 +626,7 @@
+ 		rc = ENODEV;
+ 		goto out;
+ 	}
+-	if ((rc = sy_rpmh_lookup("L4I_E0", &address))) {
++	if ((rc = sy_rpmh_lookup(res, &address))) {
+ 		goto out;
+ 	}
+ 	for (t = 0; t < SY_TCS_ACTIVE; t++) {
+@@ -698,14 +695,14 @@
+ 			delay(1);
+ 		}
+ 	}
+-	printf("SONGYUAN TOUCH: RPMh: L4I_E0 %u mV/mode %u/enable on TCS%u done=%d irq=%#x "
+-	    "status=%#x cmd-status=%#x/%#x/%#x\n", SY_VRM_MV, SY_VRM_MODE, t, done,
++	printf("SONGYUAN TOUCH: RPMh: %s %u mV/mode %u/enable on TCS%u done=%d irq=%#x "
++	    "status=%#x cmd-status=%#x/%#x/%#x\n", res, mv, mode, t, done,
+ 	    sy_rd(sy_rsc, SY_TCS_OFF + 4), sy_rd(sy_rsc, b + L->status),
+ 	    cs[0], cs[1], cs[2]);
+ 	if (!done) {
+-		printf("SONGYUAN TOUCH: RPMh: L4I_E0 vote timed out: rsc id=%#x (v%u.%u), "
+-		    "commands %#x/%#x/%#x = %u/%u/%u, control=%#x status=%#x\n", id, major, minor,
+-		    word[0], word[1], word[2], vals[0], vals[1], vals[2],
++		printf("SONGYUAN TOUCH: RPMh: %s vote timed out: rsc id=%#x (v%u.%u), "
++		    "commands %#x/%#x/%#x = %u/%u/%u, control=%#x status=%#x\n", res, id,
++		    major, minor, word[0], word[1], word[2], vals[0], vals[1], vals[2],
+ 		    sy_rd(sy_rsc, b + L->control), sy_rd(sy_rsc, b + L->status));
+ 		rc = ETIMEDOUT;
+ 	}
+@@ -718,9 +715,18 @@
+ 	sy_wr(sy_rsc, SY_TCS_OFF + 8, bit);	/* W1C: only our TCS's bit */
+ 	(void)sy_rpmh_sync(SY_TCS_OFF, irq_en);
+ out:
+-	sy_rpmh_tried = true;
+-	sy_rpmh_result = rc;
+-	return rc;
++}
++
++static int
++sy_rpmh_vote(void)
++{
++	return sy_rpmh_vote_res("L4I_E0", SY_VRM_MV, SY_VRM_MODE);
++}
++
++static int
++sy_rpmh_vote_avdd(void)
++{
++	return sy_rpmh_vote_res("L5B_E0", 3100, SY_VRM_MODE);
+ }
+ 
+ /* ---- clocks and serial engine --------------------------------------------------- */
+@@ -2367,9 +2373,13 @@
+ sy_power_on(bool vote)
+ {
+ 	sy_pins_config();
+-	sy_gpio(SY_RESET, 0, 0, 4, 0, false);
++	sy_gpio(SY_RESET, 0, 0, 4, 0, false);		/* reset asserted through power-up */
++	if (vote) {
++		int vi = sy_rpmh_vote();
++		int va = sy_rpmh_vote_avdd();
++		printf("SONGYUAN TOUCH: votes: L4I_E0 %d, L5B_E0 %d\n", vi, va);
++	}
+ 	sy_gpio(SY_AVDD, 0, 0, 4, 1, false);
+-	if (vote) (void)sy_rpmh_vote();
+ 	sy_sleep(50);
+ 	sy_gpio(SY_RESET, 0, 0, 4, 0, false);
+ 	sy_sleep(10);
