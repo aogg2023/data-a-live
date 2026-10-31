@@ -1,9 +1,6 @@
 --- a/bsd/dev/songyuan_touch.c
-
 +++ b/bsd/dev/songyuan_touch.c
-
-@@ -2024,9 +2024,9 @@
-
+@@ -2036,9 +2036,9 @@
  		printf(" %u=%u/%u", pins[i], up, down);
  	}
  	printf("\n");
@@ -16,8 +13,7 @@
  	sy_gpio(51, SY_FUNC_QUP4_SE0, 3, 6, -1, false);
  }
  
-@@ -2156,9 +2156,9 @@
-
+@@ -2168,9 +2168,9 @@
  	(void)sy_bb_group("original,rising", 48, 49, 0);
  	(void)sy_bb_group("original,falling", 48, 49, 1);
  	/* Back to qup4_se0 function 1 for the serial engine. */
@@ -30,8 +26,7 @@
  	sy_gpio(51, SY_FUNC_QUP4_SE0, 3, 6, -1, false);
  }
  
-@@ -2339,9 +2339,9 @@
-
+@@ -2351,9 +2351,9 @@
  static void
  sy_pins_config(void)
  {
@@ -44,8 +39,7 @@
  	sy_gpio(51, SY_FUNC_QUP4_SE0, 3, 6, -1, false);		/* CS, 6 mA, pull-up */
  	sy_gpio(SY_IRQ, 0, 3, 2, -1, false);			/* input, pull-up */
  }
-@@ -2359,19 +2359,24 @@
-
+@@ -2371,19 +2371,24 @@
  static void
  sy_power_on(bool vote)
  {
