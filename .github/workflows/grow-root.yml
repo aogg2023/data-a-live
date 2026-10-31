@@ -1,0 +1,64 @@
+name: grow-root
+on:
+  workflow_dispatch:
+    inputs:
+      run_id:
+        description: run holding the songyuan-root-image artifact
+        default: "40657960768"
+      new_size:
+        description: new HFS+ image size
+        default: 20g
+      tag:
+        description: release tag for the grown image parts
+        default: iosroot-20g-20261101
+permissions:
+  contents: write
+  actions: read
+jobs:
+  grow:
+    runs-on: macos-15
+    timeout-minutes: 150
+    steps:
+      - name: download the 12 GiB root artifact
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh run download "${{ inputs.run_id }}" -n songyuan-root-image -D art -R "$GITHUB_REPOSITORY"
+          ls -l art
+      - name: unzip, grow with hdiutil, verify with fsck_hfs
+        run: |
+          set -euo pipefail
+          cd art
+          unzip -o -q *.zip
+          IMG=$(ls -S *.img | head -1)
+          echo "image: $IMG"; ls -l "$IMG"
+          hdiutil resize -size "${{ inputs.new_size }}" "$IMG"
+          echo "== fsck (repair) =="
+          sudo /sbin/fsck_hfs -f -y "$IMG" | tail -20 || true
+          echo "== fsck (check) =="
+          sudo /sbin/fsck_hfs -f -n "$IMG" | tail -20
+          echo "== volume info =="
+          hdiutil imageinfo "$IMG" | head -40
+      - name: zip and split
+        run: |
+          set -euo pipefail
+          cd art
+          IMG=$(ls -S *.img | head -1)
+          zip -q -1 root20g.zip "$IMG"
+          ls -l root20g.zip
+          rm -f "$IMG"
+          rm -rf parts && mkdir parts
+          split -b 1800m root20g.zip parts/root20g-part-
+          (cd parts && shasum -a 256 * > SHA256SUMS && ls -l)
+      - name: publish release assets
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          TAG="${{ inputs.tag }}"
+          gh release delete "$TAG" -R "$GITHUB_REPOSITORY" --yes --cleanup-tag || true
+          gh release create "$TAG" -R "$GITHUB_REPOSITORY" \
+            --title "songyuan iOS root $TAG" \
+            --notes "Grown with hdiutil resize to ${{ inputs.new_size }}; join parts, sha256sum -c, unzip."
+          gh release upload "$TAG" art/parts/* -R "$GITHUB_REPOSITORY"
+          gh release view "$TAG" -R "$GITHUB_REPOSITORY" --json assets -q '.assets[] | "\(.name) \(.size)"'
