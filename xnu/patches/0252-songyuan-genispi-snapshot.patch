@@ -1,0 +1,24 @@
+--- a/bsd/dev/songyuan_touch.c
+
++++ b/bsd/dev/songyuan_touch.c
+
+@@ -1990,6 +1990,18 @@
+
+ 		printf("SONGYUAN TOUCH: loopback GeniSpi err %d %s:", err, same ? "RX==TX" : "RX!=TX");
+ 		sy_hex(" tx", tx, sizeof(tx));
+ 		sy_hex(" rx", rx3, sizeof(rx3));
++
++		if (err || !same) {
++			printf("SONGYUAN TOUCH: GeniSpi snapshot: tx_irq %#x rx_irq %#x txin %u rxin %u "
++			    "irq %#x status %#x txfs %#x rxfs %#x dma tx %#llx rx %#llx\n",
++			    sy_geni.snap_dma_tx, sy_geni.snap_dma_rx, sy_geni.snap_dma_txin,
++			    sy_geni.snap_dma_rxin, sy_geni.snap_irq, sy_geni.snap_status,
++			    sy_geni.snap_txfs, sy_geni.snap_rxfs,
++			    (unsigned long long)sy_geni.dma.tx_phys, (unsigned long long)sy_geni.dma.rx_phys);
++			printf("SONGYUAN TOUCH: GeniSpi ctl: speed %u bpw %u mode %#x cs %d poll_only %u\n",
++			    sy_geni.cur_speed_hz, sy_geni.cur_bpw, sy_geni.last_mode, sy_geni.last_cs,
++			    sy_geni.poll_only);
++		}
+ 		printf("\n");
+ 	}
+ 	sy.path = saved;
