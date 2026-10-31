@@ -19,6 +19,8 @@ jobs:
     runs-on: macos-15
     timeout-minutes: 150
     steps:
+      - name: disk before
+        run: df -h /
       - name: download the 12 GiB root artifact
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -27,32 +29,35 @@ jobs:
           ls -l art
       - name: install zstd
         run: brew install zstd || brew upgrade zstd
-      - name: join + decompress the zstd parts
+      - name: join + decompress the zstd parts, free the parts
         run: |
           set -euo pipefail
           cd art
-          ls -l
-          if ls *.img >/dev/null 2>&1; then
-            echo "artifact already carries .img"
-          else
+          if ls *.img >/dev/null 2>&1; then echo "artifact carries .img"; else
             cat root.img.zst.part.* > root.img.zst
             zstd -d -T0 root.img.zst -o root.img
-            rm -f root.img.zst
+            rm -f root.img.zst root.img.zst.part.*
           fi
           ls -l root.img
-      - name: grow with hdiutil and verify with fsck_hfs
+          df -h .
+      - name: grow with hdiutil, verify through the device node
         run: |
           set -euo pipefail
           cd art
           IMG=root.img
-          ls -l "$IMG"
           hdiutil resize -size "${{ inputs.new_size }}" "$IMG"
-          echo "== fsck (repair) =="
-          sudo /sbin/fsck_hfs -f -y "$IMG" | tail -20 || true
-          echo "== fsck (check) =="
-          sudo /sbin/fsck_hfs -f -n "$IMG" | tail -20
-          echo "== volume info =="
-          hdiutil imageinfo "$IMG" | head -30
+          ls -l "$IMG"
+          DEV=$(hdiutil attach -nomount -noverify "$IMG" | awk '{print $1}' | head -1)
+          echo "device: $DEV"
+          sudo /sbin/fsck_hfs -f -y "$DEV" || true
+          sudo /sbin/fsck_hfs -f -n "$DEV" || true
+          sudo hdiutil detach "$DEV" || true
+          MP=$(hdiutil attach -noverify "$IMG" | tail -1 | sed 's/.*\/Volumes/\/Volumes/')
+          echo "mount: $MP"
+          df -h "$MP" || true
+          sudo hdiutil detach "$MP" || true
+          hdiutil imageinfo "$IMG" | head -20
+          df -h .
       - name: compress and split
         run: |
           set -euo pipefail
@@ -72,6 +77,6 @@ jobs:
           gh release delete "$TAG" -R "$GITHUB_REPOSITORY" --yes --cleanup-tag || true
           gh release create "$TAG" -R "$GITHUB_REPOSITORY" \
             --title "songyuan iOS root $TAG" \
-            --notes "Grown with hdiutil resize to ${{ inputs.new_size }}; join .part files, sha256sum -c, zstd -d."
+            --notes "Grown with hdiutil resize to ${{ inputs.new_size }}; join .part files, shasum -c SHA256SUMS, zstd -d."
           gh release upload "$TAG" art/parts/* -R "$GITHUB_REPOSITORY"
           gh release view "$TAG" -R "$GITHUB_REPOSITORY" --json assets -q '.assets[] | "\(.name) \(.size)"'
