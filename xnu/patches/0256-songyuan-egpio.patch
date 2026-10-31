@@ -1,0 +1,47 @@
+--- a/bsd/dev/songyuan_touch.c
++++ b/bsd/dev/songyuan_touch.c
+@@ -346,6 +346,7 @@
+ 	bool started, dead;
+ 	bool use_se_dma;		/* SE DMA master (GeniSpi.c:113); else GPI (PAND:493) */
+ 	bool fw_load;			/* songyuan_ftsfw: download the firmware into PRAM */
++	bool egpio_clear;		/* songyuan_ftsegpio: clear EGPIO PRESENT/ENABLE on the touch pads */
+ 	unsigned variant;		/* songyuan_ftsvariant: one build sweeps the frame/mode doubts */
+ 	unsigned path;			/* 0 SE DMA, 1 FIFO/PIO, 2 GPI DMA */
+ 	uint32_t read_opcode;		/* 0xa0 (MYRONC), 0x80, 0xc0 or 0x00 from the variant */
+@@ -440,7 +441,11 @@
+ 	uint32_t ctl = (old & ~(SY_CFG_LOW_MASK | SY_CFG_EGPIO_ENABLE)) |
+ 	    (pull | (func << 2) | ((ma / 2 - 1) << 6) | (out >= 0 ? 0x200u : 0u));
+ 	if (old & SY_CFG_EGPIO_PRESENT) {
+-		ctl |= SY_CFG_EGPIO_ENABLE;
++		if (sy.egpio_clear) {
++			ctl &= ~(SY_CFG_EGPIO_PRESENT | SY_CFG_EGPIO_ENABLE);
++		} else {
++			ctl |= SY_CFG_EGPIO_ENABLE;
++		}
+ 	}
+ 	sy_wr(sy.tlmm, SY_GPIO(n), ctl);
+ }
+@@ -3023,6 +3028,9 @@
+ 	(void)PE_parse_boot_argn("songyuan_ftsdelay", &delay_s, sizeof(delay_s));
+ 	(void)PE_parse_boot_argn("songyuan_ftsrpmh", &rpmh, sizeof(rpmh));
+ 	(void)PE_parse_boot_argn("songyuan_ftsdma", &dma, sizeof(dma));
++	unsigned eg = 0;
++	(void)PE_parse_boot_argn("songyuan_ftsegpio", &eg, sizeof(eg));
++	sy.egpio_clear = eg != 0;
+ 	(void)PE_parse_boot_argn("songyuan_ftsdbg", &sy.dbg, sizeof(sy.dbg));
+ 	(void)PE_parse_boot_argn("songyuan_ftsvariant", &sy.variant, sizeof(sy.variant));
+ 	{
+@@ -3070,11 +3078,11 @@
+ 	sy_set_hz(hz);
+ 	printf("SONGYUAN TOUCH: starting in %u s, SPI %u Hz (div %u, %u Hz), iovdd vote %s, "
+ 	    "path %s, variant %#x (opcode %#x, manual CS %d, mode %u, tx-then-rx %d, loopback %d), "
+-	    "debug %u\n", delay_s, sy.hz, sy.spi_div, sy.actual_hz,
++	    "debug %u egpio %s\n", delay_s, sy.hz, sy.spi_div, sy.actual_hz,
+ 	    rpmh ? "on" : "off (songyuan_ftsrpmh=0)",
+ 	    sy.path == 0 ? "SE DMA (myron)" : sy.path == 1 ? "FIFO/PIO" : "GPI DMA (pandora)",
+ 	    sy.variant, sy.read_opcode, sy.manual_cs, sy.spi_mode, sy.tx_then_rx, sy.loopback,
+-	    sy.dbg);
++	    sy.dbg, sy.egpio_clear ? "clear" : "keep");
+ 	sy_sleep(delay_s * 1000u);
+ 	sy.gcc = ml_io_map(SY_GCC_PA, 0x1f0000);
+ 	sy.tlmm = ml_io_map(SY_TLMM_PA, 0xa0000);
