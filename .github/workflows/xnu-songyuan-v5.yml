@@ -18,8 +18,8 @@ on:
   # no push trigger: every run is started by hand (private-repo macOS minutes are limited)
 
 concurrency:
-  group: xnu-${{ github.ref }}
-  cancel-in-progress: true
+  group: xsyn-${{ github.run_id }}
+  cancel-in-progress: false
 
 env:
   DXB_REPO: https://github.com/blacktop/darwin-xnu-build
