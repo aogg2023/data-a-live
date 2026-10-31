@@ -1,0 +1,15 @@
+--- a/bsd/dev/songyuan_touch.c
++++ b/bsd/dev/songyuan_touch.c
+@@ -2564,9 +2564,9 @@
+ 		return ENODEV;
+ 	}
+ 	if (a3 != SY_FTS_ID_A3 || id9f != SY_FTS_ID_9F) {
+-		printf("SONGYUAN TOUCH: chip ids %02x/%02x differ from the FT3685G boot id "
+-		    "%02x/%02x (myron's FT3683 was 36/83); continuing\n", a3, id9f,
+-		    SY_FTS_ID_A3, SY_FTS_ID_9F);
++		printf("SONGYUAN TOUCH: chip ids %02x/%02x are not the FT3685G id %02x/%02x; "
++		    "the chip is in its ROM\n", a3, id9f, SY_FTS_ID_A3, SY_FTS_ID_9F);
++		return ENODEV;
+ 	}
+ 	return 0;
+ }
