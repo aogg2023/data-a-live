@@ -1,9 +1,6 @@
 --- a/bsd/dev/songyuan_touch.c
-
 +++ b/bsd/dev/songyuan_touch.c
-
 @@ -1990,6 +1990,18 @@
-
  		printf("SONGYUAN TOUCH: loopback GeniSpi err %d %s:", err, same ? "RX==TX" : "RX!=TX");
  		sy_hex(" tx", tx, sizeof(tx));
  		sy_hex(" rx", rx3, sizeof(rx3));
