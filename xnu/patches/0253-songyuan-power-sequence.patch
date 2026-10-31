@@ -1,0 +1,82 @@
+--- a/bsd/dev/songyuan_touch.c
+
++++ b/bsd/dev/songyuan_touch.c
+
+@@ -2024,9 +2024,9 @@
+
+ 		printf(" %u=%u/%u", pins[i], up, down);
+ 	}
+ 	printf("\n");
+-	sy_gpio(48, SY_FUNC_QUP4_SE0, 0, 6, -1, false);
+-	sy_gpio(49, SY_FUNC_QUP4_SE0, 0, 6, -1, false);
+-	sy_gpio(50, SY_FUNC_QUP4_SE0, 0, 4, -1, false);
++	sy_gpio(48, SY_FUNC_QUP4_SE0, 1, 6, -1, false);
++	sy_gpio(49, SY_FUNC_QUP4_SE0, 1, 6, -1, false);
++	sy_gpio(50, SY_FUNC_QUP4_SE0, 1, 4, -1, false);
+ 	sy_gpio(51, SY_FUNC_QUP4_SE0, 3, 6, -1, false);
+ }
+ 
+@@ -2156,9 +2156,9 @@
+
+ 	(void)sy_bb_group("original,rising", 48, 49, 0);
+ 	(void)sy_bb_group("original,falling", 48, 49, 1);
+ 	/* Back to qup4_se0 function 1 for the serial engine. */
+-	sy_gpio(48, SY_FUNC_QUP4_SE0, 0, 6, -1, false);
+-	sy_gpio(49, SY_FUNC_QUP4_SE0, 0, 6, -1, false);
+-	sy_gpio(50, SY_FUNC_QUP4_SE0, 0, 4, -1, false);
++	sy_gpio(48, SY_FUNC_QUP4_SE0, 1, 6, -1, false);
++	sy_gpio(49, SY_FUNC_QUP4_SE0, 1, 6, -1, false);
++	sy_gpio(50, SY_FUNC_QUP4_SE0, 1, 4, -1, false);
+ 	sy_gpio(51, SY_FUNC_QUP4_SE0, 3, 6, -1, false);
+ }
+ 
+@@ -2339,9 +2339,9 @@
+
+ static void
+ sy_pins_config(void)
+ {
+-	sy_gpio(48, SY_FUNC_QUP4_SE0, 0, 6, -1, false);		/* MISO, 6 mA, no pull */
+-	sy_gpio(49, SY_FUNC_QUP4_SE0, 0, 6, -1, false);		/* MOSI */
+-	sy_gpio(50, SY_FUNC_QUP4_SE0, 0, 4, -1, false);		/* CLK, 4 mA */
++	sy_gpio(48, SY_FUNC_QUP4_SE0, 1, 6, -1, false);		/* MISO, 6 mA, no pull */
++	sy_gpio(49, SY_FUNC_QUP4_SE0, 1, 6, -1, false);		/* MOSI */
++	sy_gpio(50, SY_FUNC_QUP4_SE0, 1, 4, -1, false);		/* CLK, 4 mA */
+ 	sy_gpio(51, SY_FUNC_QUP4_SE0, 3, 6, -1, false);		/* CS, 6 mA, pull-up */
+ 	sy_gpio(SY_IRQ, 0, 3, 2, -1, false);			/* input, pull-up */
+ }
+@@ -2359,19 +2359,24 @@
+
+ static void
+ sy_power_on(bool vote)
+ {
++	/* data-a-live pandora_touch.c pt_ic_start/pt_thread: reset asserted through
++	 * power-up, 50 ms after avdd, then reset low 10 ms, release, 200 ms before the
++	 * first read. syna_spi_power_on / hw_reset of the working bare driver. */
+ 	sy_pins_config();
++	sy_gpio(SY_RESET, 0, 0, 4, 0, false);			/* reset asserted: low */
++	printf("SONGYUAN TOUCH: power_on: reset 66 low");
+ 	sy_gpio(SY_AVDD, 0, 0, 4, 1, false);			/* avdd on */
+-	printf("SONGYUAN TOUCH: power_on: avdd 117 asked high -> cfg=%#x io=%u\n",
+-	    sy_rd(sy.tlmm, SY_GPIO(SY_AVDD)), sy_rd(sy.tlmm, SY_GPIO(SY_AVDD) + 4) & 3u);
+-	sy_gpio(SY_RESET, 0, 0, 4, 1, false);			/* reset high */
+-	printf("SONGYUAN TOUCH: power_on: reset 66 asked high -> cfg=%#x io=%u, avdd 117 cfg=%#x io=%u\n",
+-	    sy_rd(sy.tlmm, SY_GPIO(SY_RESET)), sy_rd(sy.tlmm, SY_GPIO(SY_RESET) + 4) & 3u,
+-	    sy_rd(sy.tlmm, SY_GPIO(SY_AVDD)), sy_rd(sy.tlmm, SY_GPIO(SY_AVDD) + 4) & 3u);
++	printf(", avdd 117 high");
+ 	if (vote) {
+-		int err = sy_rpmh_vote();			/* iovdd (L4I_E0) on */
+-		printf("SONGYUAN TOUCH: RPMh: iovdd vote -> %d\n", err);
+-	}
+-	sy_sleep(100);			/* settle before the first read (vendor has none) */
++		int verr = sy_rpmh_vote();			/* iovdd (L4I_E0) on */
++		printf(", iovdd vote -> %d", verr);
++	}
++	printf("\n");
++	sy_sleep(50);						/* 50 ms power delay */
++	sy_gpio(SY_RESET, 0, 0, 4, 0, false);			/* reset low 10 ms */
++	sy_sleep(10);
++	sy_gpio(SY_RESET, 0, 0, 4, 1, false);			/* release */
++	sy_sleep(200);					/* 200 ms before the first read */
+ }
+ 
+ /* Chip id (MYRONC:337-347): myron's FT3683 answered 0x36/0x83; songyuan's IC is
