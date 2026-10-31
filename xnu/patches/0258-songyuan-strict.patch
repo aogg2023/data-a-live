@@ -1,0 +1,117 @@
+--- a/bsd/dev/songyuan_touch.c
++++ b/bsd/dev/songyuan_touch.c
+@@ -349,6 +349,8 @@
+ 	bool egpio_clear;		/* songyuan_ftsegpio: clear EGPIO PRESENT/ENABLE on the touch pads */
+ 	bool vote_l5b;			/* songyuan_ftsl5b: also vote L5B 3.1 V (not in the official touch DT) */
+ 	bool gpi_loop;			/* songyuan_ftsloop: GPI loopback self-test */
++	bool fts_start2;		/* songyuan_ftsstart2: send {55,AA} instead of the bare 55 */
++	bool probe;			/* songyuan_ftsprobe: run the pad/irq/bit-bang diagnostics */
+ 	unsigned variant;		/* songyuan_ftsvariant: one build sweeps the frame/mode doubts */
+ 	unsigned path;			/* 0 SE DMA, 1 FIFO/PIO, 2 GPI DMA */
+ 	uint32_t read_opcode;		/* 0xa0 (MYRONC), 0x80, 0xc0 or 0x00 from the variant */
+@@ -2165,9 +2167,9 @@
+ 	printf(" (status %02x, id at byte 7: %02x)\n", rx[3], rx[7]);
+ 	/* Unconditional: the boot-ROM answer does not depend on the runtime read. */
+ 	for (unsigned i = 0; i < 3 && !ok; i++) {
+-		sy_gpio(SY_RESET, 0, 0, 4, 0, false);	/* reset low 1 ms */
++		sy_gpio(SY_RESET, 0, 3, 8, 0, false);	/* reset low 1 ms */
+ 		delay(1000);
+-		sy_gpio(SY_RESET, 0, 0, 4, 1, false);	/* reset high */
++		sy_gpio(SY_RESET, 0, 3, 8, 1, false);	/* reset high */
+ 		sy_sleep(12 + i * 2);
+ 		memset(rx, 0, sizeof(rx));
+ 		sy_bb_frame(miso, mosi, cpha, cmd55, sizeof(cmd55), rx);
+@@ -2362,9 +2364,18 @@
+ static void
+ sy_fts_reset_proc(unsigned hdelay)
+ {
+-	sy_gpio(SY_RESET, 0, 0, 4, 0, false);	/* reset low */
++	static const uint8_t rst_flag = 0x01;
++	/* Official fts_reset_proc (vendor_focaltech_core.c:319-330):
++	 *   fts_write_reg(SET_ID_G_HOST_RST_FLAG = 0xB6, 0x01); msleep(20);
++	 *   gpio_direction_output(reset, 0); msleep(1); gpio_direction_output(reset, 1);
++	 *   if (hdelayms) msleep(hdelayms);
++	 * The register write cannot answer in the ROM, but the official driver sends
++	 * it anyway, so this does too and ignores the error. */
++	(void)sy_fts_write(0xb6, &rst_flag, 1);
++	sy_sleep(20);
++	sy_gpio(SY_RESET, 0, 3, 8, 0, false);	/* reset low */
+ 	delay(1000);				/* msleep(1) */
+-	sy_gpio(SY_RESET, 0, 0, 4, 1, false);	/* reset high */
++	sy_gpio(SY_RESET, 0, 3, 8, 1, false);	/* reset high */
+ 	if (hdelay) {
+ 		sy_sleep(hdelay);
+ 	}
+@@ -2411,7 +2422,7 @@
+ 	 *   regulator_enable(iovdd);   -- and probe: msleep(1); reset high; msleep(100)
+ 	 * There is no second reset pulse and no 200 ms wait in the official driver. */
+ 	sy_pins_config();
+-	sy_gpio(SY_RESET, 0, 0, 4, 0, false);		/* reset held low while powering */
++	sy_gpio(SY_RESET, 0, 3, 8, 0, false);		/* reset held low while powering */
+ 	sy_sleep(1);
+ 	sy_gpio(SY_AVDD, 0, 0, 4, 1, false);		/* avdd (GPIO 117 fixed regulator) */
+ 	if (vote) {
+@@ -2424,7 +2435,7 @@
+ 		printf("\n");
+ 	}
+ 	sy_sleep(1);
+-	sy_gpio(SY_RESET, 0, 0, 4, 1, false);		/* release */
++	sy_gpio(SY_RESET, 0, 3, 8, 1, false);		/* release */
+ 	sy_sleep(100);					/* official: 100 ms before the first read */
+ 	printf("SONGYUAN TOUCH: power_on: reset low 1 ms, avdd high, iovdd, reset high, 100 ms\n");
+ }
+@@ -2707,7 +2718,8 @@
+ 		sy_fts_reset_proc(0);		/* gpio 0, 1 ms, gpio 1 */
+ 		sy_sleep(dly);
+ 		for (unsigned query = 0; query < 3 && !ok; query++) {
+-			int w = sy_fts_write(0x55, start_cmd + 1, 1);	/* {55,00,00,01,..,AA} */
++			int w = sy.fts_start2 ? sy_fts_write(0x55, start_cmd + 1, 1) :
++			    sy_fts_write(0x55, NULL, 0);	/* official spec V1.0: bare 0x55 */
+ 			int r;
+ 			sy_sleep(base);
+ 			id[0] = 0; id[1] = 0;
+@@ -3038,7 +3050,9 @@
+ 	if (!(err = sy_fts_chip_id())) {
+ 		return sy_fts_tic();
+ 	}
+-	sy_probe_matrix();
++	if (sy.probe) {
++		sy_probe_matrix();
++	}
+ 	if ((err = sy_fts_chip_id())) {
+ 		return err;
+ 	}
+@@ -3068,13 +3082,17 @@
+ 	(void)PE_parse_boot_argn("songyuan_ftsdelay", &delay_s, sizeof(delay_s));
+ 	(void)PE_parse_boot_argn("songyuan_ftsrpmh", &rpmh, sizeof(rpmh));
+ 	(void)PE_parse_boot_argn("songyuan_ftsdma", &dma, sizeof(dma));
+-	unsigned eg = 0, l5b = 0, gloop = 0;
++	unsigned eg = 0, l5b = 0, gloop = 0, st2 = 0, diag = 0;
+ 	(void)PE_parse_boot_argn("songyuan_ftsegpio", &eg, sizeof(eg));
+ 	(void)PE_parse_boot_argn("songyuan_ftsl5b", &l5b, sizeof(l5b));
+ 	(void)PE_parse_boot_argn("songyuan_ftsloop", &gloop, sizeof(gloop));
++	(void)PE_parse_boot_argn("songyuan_ftsstart2", &st2, sizeof(st2));
++	(void)PE_parse_boot_argn("songyuan_ftsprobe", &diag, sizeof(diag));
+ 	sy.egpio_clear = eg != 0;
+ 	sy.vote_l5b = l5b != 0;
+ 	sy.gpi_loop = gloop != 0;
++	sy.fts_start2 = st2 != 0;
++	sy.probe = diag != 0;
+ 	(void)PE_parse_boot_argn("songyuan_ftsdbg", &sy.dbg, sizeof(sy.dbg));
+ 	(void)PE_parse_boot_argn("songyuan_ftsvariant", &sy.variant, sizeof(sy.variant));
+ 	{
+@@ -3156,9 +3174,11 @@
+ 	    sy_rd(sy.tlmm, SY_GPIO(SY_AVDD)), sy_rd(sy.tlmm, SY_GPIO(SY_AVDD) + 4) & 3u,
+ 	    sy_rd(sy.tlmm, SY_GPIO(SY_IRQ)), sy_rd(sy.tlmm, SY_GPIO(SY_IRQ) + 4) & 3u);
+ 	sy_pins_dump("after power_on");
+-	sy_pad_probe();		/* are the pads driven, and by whom, with the chip powered */
+-	sy_irq_activity();	/* does the chip's firmware pull IRQ at all */
+-	sy_bitbang_probe();	/* the same frames by hand, engine unused */
++	if (sy.probe) {
++		sy_pad_probe();		/* are the pads driven, and by whom, with the chip powered */
++		sy_irq_activity();	/* does the chip's firmware pull IRQ at all */
++		sy_bitbang_probe();	/* the same frames by hand, engine unused */
++	}
+ 	sy_self_test();		/* engine loopback, after the chip-level probes */
+ 	if ((err = sy_fts_setup())) {
+ 		printf("SONGYUAN TOUCH: FTS start failed %d\n", err);
