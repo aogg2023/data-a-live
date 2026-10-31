@@ -1,0 +1,78 @@
+--- a/bsd/dev/songyuan_touch.c
++++ b/bsd/dev/songyuan_touch.c
+@@ -2231,6 +2231,7 @@
+ static int
+ sy_fts_read(uint8_t addr, uint8_t *out, unsigned n)
+ {
++	delay(150);		/* vendor minimum CS-high time */
+ 	if (n == 0 || n + SY_FTS_HDR + 2 > sizeof(sy.tx) || n + SY_FTS_HDR + 2 > sizeof(sy.rx)) {
+ 		return EINVAL;
+ 	}
+@@ -2279,6 +2280,7 @@
+ static int
+ sy_fts_write(uint8_t addr, const uint8_t *data, unsigned n)
+ {
++	delay(150);		/* vendor minimum CS-high time */
+ 	unsigned len = n ? SY_FTS_HDR + n : 4;
+ 	if (n > sizeof(sy.tx) || len > sizeof(sy.tx) || len > sizeof(sy.rx)) {
+ 		return EINVAL;
+@@ -2634,45 +2636,23 @@
+ sy_fts_enter_boot(uint8_t *hi, uint8_t *lo)
+ {
+ 	uint8_t id[2] = {0, 0};
++	uint8_t aa = 0xaa;
+ 	bool ok = false;
+-
+-	*hi = 0;
+-	*lo = 0;
++	*hi = 0; *lo = 0;
+ 	for (unsigned attempt = 0; attempt < 3 && !ok; attempt++) {
+-		sy_gpio(SY_RESET, 0, 0, 4, 0, false);	/* reset low */
++		sy_gpio(SY_RESET, 0, 0, 4, 0, false);
+ 		delay(1000);
+-		sy_gpio(SY_RESET, 0, 0, 4, 1, false);	/* reset high */
+-		delay(8000);
+-		for (unsigned query = 0; query < 3 && !ok; query++) {
+-			int w = sy_fts_write(0x55, NULL, 0);	/* bare command 0x55 */
+-			int r;
+-			/*
+-			 * Always read 0x90 after the 0x55: in the boot ROM a write does
+-			 * not drive MISO, so the echo/status byte reads as 0xA0-set and
+-			 * sy_fts_write() reports EIO even though the command went out.
+-			 * Android's fts_enter_into_boot() writes and then reads the boot
+-			 * id regardless; do the same (the write result is only logged).
+-			 */
+-			delay(8000);
+-			id[0] = 0;
+-			id[1] = 0;
+-			r = sy_fts_read(0x90, id, 2);
+-			printf("SONGYUAN TOUCH: enter-rom a%u q%u: write %d read %d id %02x %02x "
+-			    "(want %02x %02x)\n", attempt, query, w, r, id[0], id[1],
+-			    SY_FTS_ID_A3, SY_FTS_ID_9F);
+-			if (id[0] == SY_FTS_ID_A3 && id[1] == SY_FTS_ID_9F) {
+-				ok = true;
+-			}
+-		}
+-	}
+-	*hi = id[0];
+-	*lo = id[1];
+-	if (ok) {
+-		printf("SONGYUAN TOUCH: boot id %02x %02x (boot id check pass)\n", id[0], id[1]);
+-	} else {
+-		printf("SONGYUAN TOUCH: no valid boot id after 3x3 queries, last %02x %02x "
+-		    "(want %02x %02x)\n", id[0], id[1], SY_FTS_ID_A3, SY_FTS_ID_9F);
+-	}
++		sy_gpio(SY_RESET, 0, 0, 4, 1, false);
++		delay(12000 + attempt * 8000);
++		int w = sy_fts_write(0x55, &aa, 1);
++		delay(12000);
++		id[0] = 0; id[1] = 0;
++		int r = sy_fts_read(0x90, id, 2);
++		printf("SONGYUAN TOUCH: bootid a%u write %d read %d id %02x %02x (want %02x %02x)\n",
++		    attempt, w, r, id[0], id[1], SY_FTS_ID_A3, SY_FTS_ID_9F);
++		if (id[0] == SY_FTS_ID_A3 && id[1] == SY_FTS_ID_9F) ok = true;
++	}
++	*hi = id[0]; *lo = id[1];
+ 	return ok;
+ }
+ 
