@@ -8,7 +8,7 @@
  #include <machine/atomic.h>
  
  extern ppnum_t pmap_find_phys(pmap_t pmap, addr64_t va);
-@@ -952,6 +953,215 @@
+@@ -952,6 +953,224 @@
  	.d_type       = D_DISK,
  };
  
@@ -23,6 +23,9 @@
 +/* The cache volume always uses 512-byte logical sectors, independent of the root device's
 + * current sector size (su.secsize can be changed by the root volume's own ioctls). */
 +#define CX_SECSIZE 512u
++/* Logical sector size of the cache device; the root device's ioctls can change su.secsize,
++ * so this device keeps its own (spec_open requires DKIOCSETBLOCKSIZE to succeed). */
++static uint32_t cx_secsize = CX_SECSIZE;
 +
 +static int
 +cx_load_extents(void)
@@ -93,7 +96,7 @@
 +{
 +	int error = 0;
 +	caddr_t vaddr = NULL;
-+	uint64_t off = (uint64_t)buf_blkno(bp) * CX_SECSIZE;
++	uint64_t off = (uint64_t)buf_blkno(bp) * cx_secsize;
 +	uint32_t count = buf_count(bp);
 +	uint64_t part_bytes = cx_blocks * UFS_BLOCK;
 +	bool rd = buf_flags(bp) & B_READ;
@@ -168,13 +171,19 @@
 +	uint64_t *o = (uint64_t *)data;
 +	switch (cmd) {
 +	case DKIOCGETBLOCKSIZE:
-+		*f = (uint32_t)CX_SECSIZE;
++		*f = cx_secsize;
++		return 0;
++	case DKIOCSETBLOCKSIZE:
++		if (*f < DEV_BSIZE || *f > UFS_BLOCK || (*f & (*f - 1))) {
++			return EINVAL;
++		}
++		cx_secsize = *f;
 +		return 0;
 +	case DKIOCGETPHYSICALBLOCKSIZE:
 +		*f = UFS_BLOCK;
 +		return 0;
 +	case DKIOCGETBLOCKCOUNT:
-+		*o = cx_blocks * UFS_BLOCK / CX_SECSIZE;
++		*o = cx_blocks * UFS_BLOCK / cx_secsize;
 +		return 0;
 +	case DKIOCISWRITABLE:
 +		*f = su.writable ? 1 : 0;
@@ -193,7 +202,7 @@
 +static int
 +sweet_cache_psize(__unused dev_t dev)
 +{
-+	return cx_blocks ? (int)MIN(cx_blocks * UFS_BLOCK / CX_SECSIZE, INT_MAX) : -1;
++	return cx_blocks ? (int)MIN(cx_blocks * UFS_BLOCK / cx_secsize, INT_MAX) : -1;
 +}
 +
 +static const struct bdevsw sweet_cache_bdevsw = {
@@ -224,7 +233,7 @@
  #if defined(PANDORA)
  /*
   * pandora_ufs_probe=1: read-only look at what the 17 Pro (SM8850) bootloader leaves
-@@ -1551,6 +1761,13 @@
+@@ -1551,6 +1770,13 @@
  	/* Only now, with the partition bounds known, can writes be allowed. */
  	su.writable = (rw != 0);
  	su.ready = true;
