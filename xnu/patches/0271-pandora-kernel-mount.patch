@@ -13,21 +13,25 @@
  #include <sys/proc_internal.h>
  #include <sys/kauth.h>
  #include <sys/uio_internal.h>
-@@ -375,6 +381,24 @@
+@@ -375,6 +381,28 @@
  	return error;
  }
  
 +/*
 + * 0271: mount a file system from a kernel thread on a block device we created (the GPU cache
-+ * volume). The device path is resolved in kernel space; the HFS mount uses the device vnode.
++ * volume). The device path is resolved in kernel space, and the file system gets a zeroed mount
++ * arguments block (hfs_mount rejects a NULL block as "this is the root mount").
 + */
 +int
 +pandora_mount_hfs(const char *dev, const char *mnt)
 +{
++	static char hfs_args[1024];   /* zeroed: defaults for uid/gid/mask/journal */
 +	int error;
-+	char *devname = __DECONST(char *, dev);
++	char *pair[2];
 +
-+	error = kernel_mount("hfs", NULLVP, NULLVP, mnt, (void *)&devname, 0,
++	pair[0] = __DECONST(char *, dev);
++	pair[1] = hfs_args;
++	error = kernel_mount("hfs", NULLVP, NULLVP, mnt, (void *)pair, 0,
 +	    MNT_DONTBROWSE, KERNEL_MOUNT_PANDORADEV, vfs_context_kernel());
 +	if (error) {
 +		printf("PANDORA CACHE: kernel_mount(hfs) %s on %s failed %d\n", dev, mnt, error);
@@ -38,20 +42,22 @@
  int
  vfs_mount_override_type_name(mount_t mp, const char *name)
  {
-@@ -1307,6 +1331,12 @@
+@@ -1307,6 +1335,14 @@
  	if (vfsp->vfc_vfsflags & VFC_VFSLOCALARGS &&
  	    !(internal_flags & (KERNEL_MOUNT_SNAPSHOT | KERNEL_MOUNT_VOLBYROLE_MASK))) {
  		boolean_t do_copyin_devpath = true;
 +		if (internal_flags & KERNEL_MOUNT_PANDORADEV) {
-+			char **devnamepp = (char **)fsmountargs;
-+			devpath = CAST_USER_ADDR_T(*devnamepp);
++			/* pair[0] = device path (kernel string), pair[1] = file-system mount arguments
++			 * (kernel buffer, may be NULL). */
++			char **pair = (char **)fsmountargs;
++			devpath = CAST_USER_ADDR_T(pair[0]);
++			fsmountargs = CAST_USER_ADDR_T(pair[1]);
 +			do_copyin_devpath = false;
-+			fsmountargs = USER_ADDR_NULL;
 +		}
  #if CONFIG_BASESYSTEMROOT
  		if (internal_flags & KERNEL_MOUNT_BASESYSTEMROOT) {
  			// KERNEL_MOUNT_BASESYSTEMROOT implies subtle behavior worh nothing:
-@@ -1351,6 +1381,9 @@
+@@ -1351,6 +1387,9 @@
  			struct nameidata nd;
  
  			enum uio_seg seg = UIO_USERSPACE;
