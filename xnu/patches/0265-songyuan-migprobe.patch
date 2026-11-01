@@ -1,0 +1,59 @@
+--- a/bsd/dev/pandora_files.c
++++ b/bsd/dev/pandora_files.c
+@@ -157,6 +157,48 @@
+ 	}
+ }
+ 
++
++/* 0265: where is the data migration job? Probe the paths launchd could take it from and log the
++ * errors, so the next patch can replace or disable the right file. Boot-arg pandora_nomigrate=1. */
++static int
++pf_try_open(const char *path, vfs_context_t ctx, off_t *size)
++{
++	vnode_t vp = NULLVP;
++	int error = vnode_open(path, FREAD, 0, 0, &vp, ctx);
++	if (error) {
++		return error;
++	}
++	struct vnode_attr va;
++	VATTR_INIT(&va);
++	VATTR_WANTED(&va, va_data_size);
++	if (!vnode_getattr(vp, &va, ctx) && size) {
++		*size = va.va_data_size;
++	}
++	vnode_close(vp, FREAD, ctx);
++	return 0;
++}
++
++static void
++pf_probe_migration(vfs_context_t ctx)
++{
++	static const char *const paths[] = {
++		"/System/Library/LaunchDaemons/com.apple.datamigrator.plist",
++		"/private/preboot/Cryptexes/OS/System/Library/LaunchDaemons/com.apple.datamigrator.plist",
++		"/System/Library/LaunchDaemons/com.apple.migrationpluginwrapper.plist",
++		"/usr/libexec/datamigrator",
++		"/usr/libexec/migrationpluginwrapper",
++		"/private/var/db/com.apple.xpc.launchd/overrides.plist",
++		"/private/var/db/com.apple.xpc.launchd/disabled.plist",
++		"/System/Library/xpc/launchd.plist",
++		"/sbin/launchd",
++	};
++	for (unsigned i = 0; i < sizeof(paths) / sizeof(paths[0]); i++) {
++		off_t sz = -1;
++		int error = pf_try_open(paths[i], ctx, &sz);
++		printf("PANDORA FILES: probe %s: %d size %lld\n", paths[i], error, (long long)sz);
++	}
++}
++
+ static void
+ pf_thread(void *arg, wait_result_t result)
+ {
+@@ -192,6 +234,7 @@
+ 	}
+ 	text[list->size] = 0;
+ 	vfs_context_t ctx = vfs_context_kernel();
++	pf_probe_migration(ctx);
+ 	pf_disable_migration(ctx);
+ 	unsigned written = 0, same = 0, failed = 0;
+ 	a = kalloc_data(PF_CHUNK, Z_WAITOK);
