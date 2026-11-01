@@ -8,16 +8,30 @@
  #include <machine/atomic.h>
  
  extern ppnum_t pmap_find_phys(pmap_t pmap, addr64_t va);
-@@ -585,6 +586,8 @@
- 	return 0;
- }
- 
+@@ -435,6 +436,8 @@
+  * One SCSI command in slot 0, data (if any) to/from the bounce buffer
+  * (to the device when write is set). Returns 0 or an errno.
+  */
 +static bool cx_write_allowed(uint64_t lba, uint64_t count);   /* 0272 cache volume */
 +
- /* READ(10) of count device blocks at lba into the bounce buffer. */
  static int
- ufs_read_blocks(uint64_t lba, uint32_t count)
-@@ -608,7 +611,8 @@
+ ufs_scsi(const uint8_t *cdb, unsigned cdb_len, uint32_t len, bool write)
+ {
+@@ -445,9 +448,12 @@
+     bool root_write=write && su.writable && su.lun==0 && cdb_len==10 && cdb[0]==0x2a &&
+         fx_write_allowed((uint64_t)cdb[2]<<24|cdb[3]<<16|cdb[4]<<8|cdb[5],
+             (uint64_t)cdb[7]<<8|cdb[8]) && len==((uint32_t)cdb[7]<<8|cdb[8])*UFS_BLOCK;
++    bool cache_write=write && su.writable && su.lun==0 && cdb_len==10 && cdb[0]==0x2a &&
++        cx_write_allowed((uint64_t)cdb[2]<<24|cdb[3]<<16|cdb[4]<<8|cdb[5],
++            (uint64_t)cdb[7]<<8|cdb[8]) && len==((uint32_t)cdb[7]<<8|cdb[8])*UFS_BLOCK;
+     bool root_sync=!write && len==0 && su.writable && fx_root && su.lun==0 &&
+         cdb_len==10 && cdb[0]==0x35;
+-    if (!root_write && !root_sync &&
++    if (!root_write && !cache_write && !root_sync &&
+         (write || !cdb_len || (cdb[0]!=0x00 && cdb[0]!=0x28 && !active_power))) return EROFS;
+ #endif
+ 
+@@ -608,7 +614,8 @@
  ufs_write_blocks(uint64_t lba, uint32_t count)
  {
  #if defined(FUXI)
@@ -27,7 +41,7 @@
  	    lba + count - 1 > UINT32_MAX) {
  #else
  	if (!su.writable || !su.nblocks || count == 0 || count > BOUNCE_SIZE / UFS_BLOCK ||
-@@ -952,6 +956,273 @@
+@@ -952,6 +959,273 @@
  	.d_type       = D_DISK,
  };
  
@@ -301,7 +315,7 @@
  #if defined(PANDORA)
  /*
   * pandora_ufs_probe=1: read-only look at what the 17 Pro (SM8850) bootloader leaves
-@@ -1551,6 +1822,13 @@
+@@ -1551,6 +1825,13 @@
  	/* Only now, with the partition bounds known, can writes be allowed. */
  	su.writable = (rw != 0);
  	su.ready = true;
