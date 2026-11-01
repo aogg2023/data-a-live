@@ -1,0 +1,54 @@
+--- a/bsd/vfs/vfs_syscalls.c
++++ b/bsd/vfs/vfs_syscalls.c
+@@ -80,6 +80,12 @@
+ #include <sys/stat.h>
+ #include <sys/vnode_internal.h>
+ #include <sys/mount_internal.h>
++
++/* 0271: mount() of a kernel-resolved block device (pandora GPU cache volume). mount_common()
++ * otherwise expects a user-space device path; this flag says the data argument is a kernel
++ * "char **" pointing at a kernel string, and that the file system gets no mount arguments
++ * (hfs_mount accepts NULL data and uses the device vnode mount_common opened). */
++#define KERNEL_MOUNT_PANDORADEV 0x800
+ #include <sys/proc_internal.h>
+ #include <sys/kauth.h>
+ #include <sys/uio_internal.h>
+@@ -375,6 +381,25 @@
+ 	return error;
+ }
+ 
++/*
++ * 0271: mount a file system from a kernel thread on a block device we created (the GPU cache
++ * volume). The device path is resolved in kernel space; the HFS mount uses the device vnode.
++ */
++int
++pandora_mount_hfs(const char *dev, const char *mnt)
++{
++	int error;
++	char *devname = __DECONST(char *, dev);
++
++	error = kernel_mount("hfs", NULLVP, NULLVP, mnt, (void *)&devname, 0,
++	    MNT_DONTBROWSE, KERNEL_MOUNT_PANDORADEV, vfs_context_kernel());
++	if (error) {
++		printf("PANDORA CACHE: kernel_mount(hfs) %s on %s failed %d
++", dev, mnt, error);
++	}
++	return error;
++}
++
+ int
+ vfs_mount_override_type_name(mount_t mp, const char *name)
+ {
+@@ -1307,6 +1332,12 @@
+ 	if (vfsp->vfc_vfsflags & VFC_VFSLOCALARGS &&
+ 	    !(internal_flags & (KERNEL_MOUNT_SNAPSHOT | KERNEL_MOUNT_VOLBYROLE_MASK))) {
+ 		boolean_t do_copyin_devpath = true;
++		if (internal_flags & KERNEL_MOUNT_PANDORADEV) {
++			char **devnamepp = (char **)fsmountargs;
++			devpath = CAST_USER_ADDR_T(*devnamepp);
++			do_copyin_devpath = false;
++			fsmountargs = USER_ADDR_NULL;
++		}
+ #if CONFIG_BASESYSTEMROOT
+ 		if (internal_flags & KERNEL_MOUNT_BASESYSTEMROOT) {
+ 			// KERNEL_MOUNT_BASESYSTEMROOT implies subtle behavior worh nothing:
