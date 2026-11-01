@@ -52,3 +52,13 @@
  #if CONFIG_BASESYSTEMROOT
  		if (internal_flags & KERNEL_MOUNT_BASESYSTEMROOT) {
  			// KERNEL_MOUNT_BASESYSTEMROOT implies subtle behavior worh nothing:
+@@ -1351,6 +1382,9 @@
+ 			struct nameidata nd;
+ 
+ 			enum uio_seg seg = UIO_USERSPACE;
++			if (internal_flags & KERNEL_MOUNT_PANDORADEV) {
++				seg = UIO_SYSSPACE;   /* the device path came from the kernel, not from user space */
++			}
+ #if CONFIG_BASESYSTEMROOT
+ 			if (internal_flags & KERNEL_MOUNT_BASESYSTEMROOT) {
+ 				seg = UIO_SYSSPACE;
