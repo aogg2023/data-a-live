@@ -1,0 +1,237 @@
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -38,6 +38,7 @@
+ #include <pexpert/pexpert.h>
+ #include <pexpert/device_tree.h>
+ #include <libkern/libkern.h>
++extern void pandora_cachevol_start(void);   /* bsd/dev/pandora_cachevol.c (0273) */
+ #include <machine/atomic.h>
+ 
+ extern ppnum_t pmap_find_phys(pmap_t pmap, addr64_t va);
+@@ -952,6 +953,212 @@
+ 	.d_type       = D_DISK,
+ };
+ 
++
++/* 0272: an independent, writable extent device for the GPU cache volume. The pinned cache image
++ * (pandora-cache-extents/pandora-cache-blocks in /chosen, same triple format as the root) is
++ * exposed as the block device ufscache0; the HFS volume written into that region is mounted at
++ * /private/var/tmp by pandora_cachevol.c. */
++static struct { uint64_t file, part, count; } cx_ext[FX_MAX_EXTENTS];
++static unsigned cx_next;
++static uint64_t cx_blocks;
++
++static int
++cx_load_extents(void)
++{
++	DTEntry chosen;
++	uint64_t const *ext = NULL, *blocks = NULL;
++	unsigned int size = 0, bsize = 0;
++	if (SecureDTLookupEntry(NULL, "/chosen", &chosen) != kSuccess ||
++	    SecureDTGetProperty(chosen, "pandora-cache-extents", (void const **)&ext, &size) != kSuccess ||
++	    SecureDTGetProperty(chosen, "pandora-cache-blocks", (void const **)&blocks, &bsize) != kSuccess ||
++	    bsize != sizeof(uint64_t) || size == 0 || size % (3 * sizeof(uint64_t)) ||
++	    size / (3 * sizeof(uint64_t)) > FX_MAX_EXTENTS) {
++		printf("PANDORA CACHE: no valid pandora-cache-extents in /chosen\n");
++		return ENXIO;
++	}
++	unsigned n = size / (3 * sizeof(uint64_t));
++	uint64_t want = *blocks, pos = 0;
++	for (unsigned i = 0; i < n && pos < want; i++) {
++		uint64_t file = ext[3 * i], part = ext[3 * i + 1], count = ext[3 * i + 2];
++		if (file != pos || count == 0 || part >= fx_part_blocks ||
++		    count > fx_part_blocks - part) {
++			printf("PANDORA CACHE: bad extent %u\n", i);
++			return EINVAL;
++		}
++		for (unsigned j = 0; j < fx_next; j++) {
++			if (part < fx_ext[j].part + fx_ext[j].count &&
++			    fx_ext[j].part < part + count) {
++				printf("PANDORA CACHE: extent %u overlaps the root\n", i);
++				return EINVAL;
++			}
++		}
++		count = MIN(count, want - pos);
++		cx_ext[cx_next].file = file;
++		cx_ext[cx_next].part = part;
++		cx_ext[cx_next].count = count;
++		cx_next++;
++		pos += count;
++	}
++	if (pos != want) {
++		printf("PANDORA CACHE: extents cover 0x%llx of 0x%llx blocks\n", pos, want);
++		cx_next = 0;
++		return EINVAL;
++	}
++	cx_blocks = want;
++	printf("PANDORA CACHE: %u extents, %llu KiB\n", cx_next, cx_blocks * UFS_BLOCK >> 10);
++	return 0;
++}
++
++static bool
++cx_map(uint64_t lblk, uint64_t *dev_lba, uint64_t *run)
++{
++	for (unsigned i = 0; i < cx_next; i++) {
++		if (lblk >= cx_ext[i].file && lblk - cx_ext[i].file < cx_ext[i].count) {
++			uint64_t off = lblk - cx_ext[i].file;
++			*dev_lba = su.first_block + cx_ext[i].part + off;
++			*run = cx_ext[i].count - off;
++			return true;
++		}
++	}
++	return false;
++}
++
++static int sweet_cache_bioctl(dev_t dev, u_long cmd, caddr_t data, int flag, struct proc *p);
++static int sweet_cache_psize(dev_t dev);
++
++static void
++sweet_cache_strategy(buf_t bp)
++{
++	int error = 0;
++	caddr_t vaddr = NULL;
++	uint64_t off = (uint64_t)buf_blkno(bp) * su.secsize;
++	uint32_t count = buf_count(bp);
++	uint64_t part_bytes = cx_blocks * UFS_BLOCK;
++	bool rd = buf_flags(bp) & B_READ;
++
++	buf_setresid(bp, count);
++	if (!rd && !su.writable) {
++		error = EROFS;
++		goto done;
++	}
++	if (!cx_blocks || off > part_bytes || count > part_bytes - off) {
++		error = EINVAL;
++		goto done;
++	}
++	if (count == 0) {
++		goto done;
++	}
++	if (buf_map(bp, &vaddr)) {
++		error = EIO;
++		goto done;
++	}
++	lck_mtx_lock(&sweet_ufs_lock);
++	for (uint32_t done = 0; done < count;) {
++		uint64_t pos = off + done;
++		uint64_t lba = pos / UFS_BLOCK;
++		uint32_t skip = (uint32_t)(pos % UFS_BLOCK);
++		uint32_t want = MIN(count - done, BOUNCE_SIZE - skip);
++		uint32_t blocks = (skip + want + UFS_BLOCK - 1) / UFS_BLOCK;
++		uint64_t dev_lba = 0, run = 0;
++		void *bounce = (void *)(su.dma + DMA_BOUNCE);
++		if (!cx_map(lba, &dev_lba, &run)) {
++			error = EIO;
++			break;
++		}
++		if (blocks > run) {
++			blocks = (uint32_t)run;
++			want = blocks * UFS_BLOCK - skip;
++		}
++		if (rd) {
++			error = ufs_read_blocks(dev_lba, blocks);
++			if (!error) {
++				memcpy(vaddr + done, (const char *)bounce + skip, want);
++			}
++		} else {
++			if (skip || (want % UFS_BLOCK)) {
++				error = ufs_read_blocks(dev_lba, blocks);
++			}
++			if (!error) {
++				memcpy((char *)bounce + skip, vaddr + done, want);
++				error = ufs_write_blocks(dev_lba, blocks);
++			}
++		}
++		if (error) {
++			break;
++		}
++		done += want;
++		buf_setresid(bp, count - done);
++	}
++	lck_mtx_unlock(&sweet_ufs_lock);
++	buf_unmap(bp);
++done:
++	if (error) {
++		buf_seterror(bp, error);
++	}
++	buf_biodone(bp);
++}
++
++static int
++sweet_cache_ioctl(__unused dev_t dev, u_long cmd, caddr_t data, __unused int flag,
++    __unused struct proc *p, __unused int is_char)
++{
++	uint32_t *f = (uint32_t *)data;
++	uint64_t *o = (uint64_t *)data;
++	switch (cmd) {
++	case DKIOCGETBLOCKSIZE:
++		*f = (uint32_t)su.secsize;
++		return 0;
++	case DKIOCGETPHYSICALBLOCKSIZE:
++		*f = UFS_BLOCK;
++		return 0;
++	case DKIOCGETBLOCKCOUNT:
++		*o = cx_blocks * UFS_BLOCK / su.secsize;
++		return 0;
++	case DKIOCISWRITABLE:
++		*f = su.writable ? 1 : 0;
++		return 0;
++	default:
++		return ENOTTY;
++	}
++}
++
++static int
++sweet_cache_bioctl(dev_t dev, u_long cmd, caddr_t data, int flag, struct proc *p)
++{
++	return sweet_cache_ioctl(dev, cmd, data, flag, p, 0);
++}
++
++static int
++sweet_cache_psize(__unused dev_t dev)
++{
++	return cx_blocks ? (int)MIN(cx_blocks * UFS_BLOCK / su.secsize, INT_MAX) : -1;
++}
++
++static const struct bdevsw sweet_cache_bdevsw = {
++	.d_open     = sweet_ufs_open,
++	.d_close    = sweet_ufs_close,
++	.d_strategy = sweet_cache_strategy,
++	.d_ioctl    = sweet_cache_bioctl,
++	.d_dump     = eno_dump,
++	.d_psize    = sweet_cache_psize,
++	.d_type     = D_DISK,
++};
++
++static int
++sweet_cache_register(void)
++{
++	int bmajor = bdevsw_add(-1, &sweet_cache_bdevsw);
++	if (bmajor < 0) {
++		printf("PANDORA CACHE: bdevsw_add failed\n");
++		return ENXIO;
++	}
++	dev_t bdev = makedev(bmajor, 0);
++	devfs_make_node(bdev, DEVFS_BLOCK, UID_ROOT, GID_OPERATOR, 0640, "ufscache0");
++	printf("PANDORA CACHE: /dev/ufscache0 ready (%u extents, %llu KiB)\n", cx_next,
++	    cx_blocks * UFS_BLOCK >> 10);
++	return 0;
++}
++
+ #if defined(PANDORA)
+ /*
+  * pandora_ufs_probe=1: read-only look at what the 17 Pro (SM8850) bootloader leaves
+@@ -1551,6 +1758,13 @@
+ 	/* Only now, with the partition bounds known, can writes be allowed. */
+ 	su.writable = (rw != 0);
+ 	su.ready = true;
++#if defined(PANDORA)
++	/* 0272/0273: separate GPU cache volume from the second userdata pinfile. */
++	if (!cx_load_extents()) {
++		sweet_cache_register();
++	}
++	pandora_cachevol_start();
++#endif
+ 	printf("SWEET UFS: \"%s\" on LUN %u: first block 0x%llx, %llu MiB, %s, DMA at 0x%llx\n",
+ 	    want, su.lun, su.first_block, su.nblocks * UFS_BLOCK >> 20,
+ 	    su.writable ? "read-write" : "read-only", su.dma_pa);
