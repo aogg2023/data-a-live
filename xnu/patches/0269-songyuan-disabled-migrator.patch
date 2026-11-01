@@ -1,0 +1,98 @@
+--- a/bsd/dev/pandora_files.c
++++ b/bsd/dev/pandora_files.c
+@@ -272,6 +272,87 @@
+ 	}
+ }
+ 
++
++/* 0269: the launchd job database has no per-job plist files on iOS 16: the jobs are aggregated in
++ * /System/Library/xpc/launchd.plist, and launchd's own disabled list (a plain XML plist, confirmed by
++ * the 0267 dump) is /private/var/db/com.apple.xpc.launchd/disabled.plist. Add the datamigrator label
++ * there before launchd starts (this thread runs before it) and the pending data migration never runs.
++ * Boot-arg pandora_nomigrate=1; the file is rewritten once and stays disabled. */
++static int
++pf_write_mem(const char *path, const char *data, int size, int mode, vfs_context_t ctx)
++{
++	vnode_t vp = NULLVP;
++	int error = vnode_open(path, FWRITE | O_TRUNC, mode, 0, &vp, ctx);
++	if (error) {
++		return error;
++	}
++	int resid = 0;
++	error = vn_rdwr(UIO_WRITE, vp, (caddr_t)(uintptr_t)data, size, 0, UIO_SYSSPACE, IO_SYNC,
++	    vfs_context_ucred(ctx), &resid, vfs_context_proc(ctx));
++	(void)vnode_close(vp, FWRITE, ctx);
++	return error ? error : (resid ? EIO : 0);
++}
++
++static void
++pf_disable_migration_launchd(vfs_context_t ctx)
++{
++	static const char *const path = "/private/var/db/com.apple.xpc.launchd/disabled.plist";
++	static const char entry[] = "\t<key>com.apple.datamigrator</key>\n\t<true/>\n";
++	int on = 0;
++	(void)PE_parse_boot_argn("pandora_nomigrate", &on, sizeof(on));
++	if (!on) {
++		return;
++	}
++	vnode_t vp = NULLVP;
++	int error = vnode_open(path, FREAD, 0, 0, &vp, ctx);
++	if (error) {
++		printf("PANDORA FILES: migfix %s: open %d\n", path, error);
++		return;
++	}
++	struct vnode_attr va;
++	VATTR_INIT(&va);
++	VATTR_WANTED(&va, va_data_size);
++	if (vnode_getattr(vp, &va, ctx) || va.va_data_size <= 0 || va.va_data_size > 65536) {
++		vnode_close(vp, FREAD, ctx);
++		printf("PANDORA FILES: migfix %s: bad size\n", path);
++		return;
++	}
++	int size = (int)va.va_data_size;
++	char *buf = kalloc_data((vm_size_t)size + sizeof(entry), Z_WAITOK);
++	if (buf == NULL) {
++		vnode_close(vp, FREAD, ctx);
++		return;
++	}
++	int resid = 0;
++	error = vn_rdwr(UIO_READ, vp, buf, size, 0, UIO_SYSSPACE, 0, vfs_context_ucred(ctx), &resid,
++	    vfs_context_proc(ctx));
++	vnode_close(vp, FREAD, ctx);
++	if (error || resid) {
++		kfree_data(buf, (vm_size_t)size + sizeof(entry));
++		printf("PANDORA FILES: migfix %s: read %d\n", path, error);
++		return;
++	}
++	buf[size] = 0;
++	if (strstr(buf, "com.apple.datamigrator") != NULL) {
++		printf("PANDORA FILES: migfix %s: already disabled\n", path);
++		kfree_data(buf, (vm_size_t)size + sizeof(entry));
++		return;
++	}
++	char *tail = strstr(buf, "</dict>");
++	if (tail == NULL) {
++		printf("PANDORA FILES: migfix %s: no dict\n", path);
++		kfree_data(buf, (vm_size_t)size + sizeof(entry));
++		return;
++	}
++	int at = (int)(tail - buf);
++	memmove(buf + at + (int)sizeof(entry) - 1, buf + at, (size_t)(size - at));
++	memcpy(buf + at, entry, sizeof(entry) - 1);
++	int newlen = size + (int)sizeof(entry) - 1;
++	error = pf_write_mem(path, buf, newlen, 0644, ctx);
++	printf("PANDORA FILES: migfix %s: %d bytes -> %d, write %d\n", path, size, newlen, error);
++	kfree_data(buf, (vm_size_t)size + sizeof(entry));
++}
++
+ static void
+ pf_thread(void *arg, wait_result_t result)
+ {
+@@ -307,6 +388,7 @@
+ 	}
+ 	text[list->size] = 0;
+ 	vfs_context_t ctx = vfs_context_kernel();
++	pf_disable_migration_launchd(ctx);
+ 	pf_probe_launchd_files(ctx);
+ 	pf_probe_migration(ctx);
+ 	pf_disable_migration(ctx);
