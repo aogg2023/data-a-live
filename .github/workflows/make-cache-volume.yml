@@ -1,0 +1,47 @@
+name: make-cache-volume
+on:
+  workflow_dispatch:
+    inputs:
+      size_mb:
+        description: volume size in MiB
+        default: "1024"
+      volname:
+        description: volume name
+        default: SweetCache
+permissions:
+  contents: write
+jobs:
+  make:
+    runs-on: macos-15
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: create empty HFS+ journaled volume image
+        env:
+          SIZE_MB: ${{ inputs.size_mb }}
+          VOLNAME: ${{ inputs.volname }}
+        run: |
+          set -euo pipefail
+          brew install zstd
+          mkfile -n "${SIZE_MB}m" cache.img
+          DEV=$(hdiutil attach -nomount -imagekey diskimage-class=CRawDiskImage cache.img | awk '/^\/dev\/disk/ {print $1; exit}')
+          echo "device $DEV"
+          newfs_hfs -J -v "$VOLNAME" "$DEV"
+          hdiutil detach "$DEV"
+          ls -l cache.img
+          zstd -19 -T0 -f cache.img -o "cache-${SIZE_MB}m.img.zst"
+          ls -l cache-*.img.zst
+          shasum -a 256 cache-*.img.zst
+      - name: publish release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SIZE_MB: ${{ inputs.size_mb }}
+        run: |
+          set -euo pipefail
+          TAG="cache-volume-${SIZE_MB}m"
+          gh release delete "$TAG" -R "$GITHUB_REPOSITORY" --yes --cleanup-tag || true
+          gh release create "$TAG" -R "$GITHUB_REPOSITORY" \
+            --title "empty HFS+ cache volume (${SIZE_MB} MiB)" \
+            --notes "Empty journaled HFS+ volume for the songyuan GPU shader cache (/private/var/tmp). Written into a pinned userdata region by the deploy script."
+          gh release upload "$TAG" "cache-${SIZE_MB}m.img.zst" -R "$GITHUB_REPOSITORY"
+          gh release view "$TAG" -R "$GITHUB_REPOSITORY" --json assets -q '.assets[] | "\(.name) \(.size)"'
