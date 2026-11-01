@@ -1,10 +1,11 @@
 --- a/bsd/vfs/vfs_syscalls.c
 +++ b/bsd/vfs/vfs_syscalls.c
-@@ -80,6 +80,12 @@
+@@ -80,6 +80,13 @@
  #include <sys/stat.h>
  #include <sys/vnode_internal.h>
  #include <sys/mount_internal.h>
 +
++#include <sys/buf.h>
 +/* 0271: mount() of a kernel-resolved block device (pandora GPU cache volume). mount_common()
 + * otherwise expects a user-space device path; this flag says the data argument is a kernel
 + * "char **" pointing at a kernel string, and that the file system gets no mount arguments
@@ -13,7 +14,7 @@
  #include <sys/proc_internal.h>
  #include <sys/kauth.h>
  #include <sys/uio_internal.h>
-@@ -375,6 +381,28 @@
+@@ -375,6 +382,56 @@
  	return error;
  }
  
@@ -31,6 +32,34 @@
 +
 +	pair[0] = __DECONST(char *, dev);
 +	pair[1] = hfs_args;
++	{
++		/* 0271 diagnostics: what does the block device report and return at the volume header? */
++		vnode_t dvp = NULLVP;
++		vfs_context_t dctx = vfs_context_kernel();
++		if (vnode_lookup(dev, 0, &dvp, dctx) == 0) {
++			int bs = 0, wr = 0;
++			uint64_t bc = 0;
++			buf_t bp = NULL;
++			VNOP_IOCTL(dvp, DKIOCGETBLOCKSIZE, (caddr_t)&bs, 0, dctx);
++			VNOP_IOCTL(dvp, DKIOCGETBLOCKCOUNT, (caddr_t)&bc, 0, dctx);
++			VNOP_IOCTL(dvp, DKIOCISWRITABLE, (caddr_t)&wr, 0, dctx);
++			int br = buf_meta_bread(dvp, bs ? (1024 / bs) : 2, 512, NOCRED, &bp);
++			if (br == 0) {
++				unsigned char *p = (unsigned char *)buf_dataptr(bp);
++				printf("PANDORA CACHE: dev %s vtype %d bs %d count %llu wr %d vh %02x%02x%02x%02x blocksize %08x total %08x free %08x\n",
++				    dev, dvp->v_type, bs, bc, wr, p[0], p[1], p[2], p[3],
++				    (p[40] << 24) | (p[41] << 16) | (p[42] << 8) | p[43],
++				    (p[44] << 24) | (p[45] << 16) | (p[46] << 8) | p[47],
++				    (p[48] << 24) | (p[49] << 16) | (p[50] << 8) | p[51]);
++				buf_brelse(bp);
++			} else {
++				printf("PANDORA CACHE: dev %s vh read %d\n", dev, br);
++			}
++			vnode_put(dvp);
++		} else {
++			printf("PANDORA CACHE: vnode_lookup %s failed\n", dev);
++		}
++	}
 +	error = kernel_mount("hfs", NULLVP, NULLVP, mnt, (void *)pair, 0,
 +	    MNT_DONTBROWSE, KERNEL_MOUNT_PANDORADEV, vfs_context_kernel());
 +	if (error) {
@@ -42,7 +71,7 @@
  int
  vfs_mount_override_type_name(mount_t mp, const char *name)
  {
-@@ -1307,6 +1335,14 @@
+@@ -1307,6 +1364,14 @@
  	if (vfsp->vfc_vfsflags & VFC_VFSLOCALARGS &&
  	    !(internal_flags & (KERNEL_MOUNT_SNAPSHOT | KERNEL_MOUNT_VOLBYROLE_MASK))) {
  		boolean_t do_copyin_devpath = true;
@@ -57,7 +86,7 @@
  #if CONFIG_BASESYSTEMROOT
  		if (internal_flags & KERNEL_MOUNT_BASESYSTEMROOT) {
  			// KERNEL_MOUNT_BASESYSTEMROOT implies subtle behavior worh nothing:
-@@ -1351,6 +1387,9 @@
+@@ -1351,6 +1416,9 @@
  			struct nameidata nd;
  
  			enum uio_seg seg = UIO_USERSPACE;
@@ -67,3 +96,13 @@
  #if CONFIG_BASESYSTEMROOT
  			if (internal_flags & KERNEL_MOUNT_BASESYSTEMROOT) {
  				seg = UIO_SYSSPACE;
+@@ -1595,6 +1663,9 @@
+ #endif
+ 	} else {
+ 		error = VFS_MOUNT(mp, device_vnode, fsmountargs, ctx);
++		if (internal_flags & KERNEL_MOUNT_PANDORADEV) {
++			printf("PANDORA CACHE: VFS_MOUNT(%s) -> %d\n", fstypename, error);
++		}
+ 	}
+ 
+ 	if (flags & MNT_UPDATE) {
