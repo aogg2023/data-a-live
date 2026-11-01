@@ -1,0 +1,24 @@
+--- a/bsd/sweet_hfs/core/hfs_vfsops.c
++++ b/bsd/sweet_hfs/core/hfs_vfsops.c
+@@ -190,11 +190,16 @@
+ 	int retval = E_NONE;
+ 	u_int32_t cmdflags;
+ 
+-	if (data && (retval = copyin(data, (caddr_t)&args, sizeof(args)))) {
+-		if (HFS_MOUNT_DEBUG) {
+-			printf("hfs_mount: copyin returned %d for fs\n", retval);
+-		}
+-		return (retval);
++	if (data) {
++		if (vfs_iskernelmount(mp)) {
++			/* 0275: a kernel mount (pandora GPU cache volume) passes a kernel buffer. */
++			bcopy((const void *)(uintptr_t)data, (caddr_t)&args, sizeof(args));
++		} else if ((retval = copyin(data, (caddr_t)&args, sizeof(args)))) {
++			if (HFS_MOUNT_DEBUG) {
++				printf("hfs_mount: copyin returned %d for fs\n", retval);
++			}
++			return (retval);
++		}
+ 	}
+ 	cmdflags = (u_int32_t)vfs_flags(mp) & MNT_CMDFLAGS;
+ 	if (cmdflags & MNT_UPDATE) {
