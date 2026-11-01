@@ -1,6 +1,15 @@
 --- a/bsd/sweet_hfs/core/hfs_vfsops.c
 +++ b/bsd/sweet_hfs/core/hfs_vfsops.c
-@@ -190,11 +190,16 @@
+@@ -172,6 +172,8 @@
+  * mount system call
+  */
+ 
++#undef HFS_MOUNT_DEBUG
++#define HFS_MOUNT_DEBUG 1
+ int
+ hfs_mount(struct mount *mp, vnode_t devvp, user_addr_t data, vfs_context_t context)
+ {
+@@ -190,11 +192,16 @@
  	int retval = E_NONE;
  	u_int32_t cmdflags;
  
