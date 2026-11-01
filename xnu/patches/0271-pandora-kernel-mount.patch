@@ -71,7 +71,17 @@
  int
  vfs_mount_override_type_name(mount_t mp, const char *name)
  {
-@@ -1307,6 +1364,14 @@
+@@ -1173,7 +1230,8 @@
+ 	 */
+ 	if (kernelmount && (vfsp->vfc_vfsflags & VFC_VFSLOCALARGS) &&
+ 	    ((internal_flags & KERNEL_MOUNT_VOLBYROLE_MASK) == 0) &&
+-	    ((internal_flags & KERNEL_MOUNT_BASESYSTEMROOT) == 0)) {
++	    ((internal_flags & KERNEL_MOUNT_BASESYSTEMROOT) == 0) &&
++	    ((internal_flags & KERNEL_MOUNT_PANDORADEV) == 0)) {
+ 		error = EINVAL;  /* unsupported request */
+ 		goto out1;
+ 	}
+@@ -1307,6 +1365,14 @@
  	if (vfsp->vfc_vfsflags & VFC_VFSLOCALARGS &&
  	    !(internal_flags & (KERNEL_MOUNT_SNAPSHOT | KERNEL_MOUNT_VOLBYROLE_MASK))) {
  		boolean_t do_copyin_devpath = true;
@@ -86,7 +96,7 @@
  #if CONFIG_BASESYSTEMROOT
  		if (internal_flags & KERNEL_MOUNT_BASESYSTEMROOT) {
  			// KERNEL_MOUNT_BASESYSTEMROOT implies subtle behavior worh nothing:
-@@ -1351,6 +1416,9 @@
+@@ -1351,6 +1417,9 @@
  			struct nameidata nd;
  
  			enum uio_seg seg = UIO_USERSPACE;
@@ -96,7 +106,7 @@
  #if CONFIG_BASESYSTEMROOT
  			if (internal_flags & KERNEL_MOUNT_BASESYSTEMROOT) {
  				seg = UIO_SYSSPACE;
-@@ -1595,6 +1663,9 @@
+@@ -1595,6 +1664,9 @@
  #endif
  	} else {
  		error = VFS_MOUNT(mp, device_vnode, fsmountargs, ctx);
