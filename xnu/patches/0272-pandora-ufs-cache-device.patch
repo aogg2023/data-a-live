@@ -8,7 +8,26 @@
  #include <machine/atomic.h>
  
  extern ppnum_t pmap_find_phys(pmap_t pmap, addr64_t va);
-@@ -952,6 +953,257 @@
+@@ -585,6 +586,8 @@
+ 	return 0;
+ }
+ 
++static bool cx_write_allowed(uint64_t lba, uint64_t count);   /* 0272 cache volume */
++
+ /* READ(10) of count device blocks at lba into the bounce buffer. */
+ static int
+ ufs_read_blocks(uint64_t lba, uint32_t count)
+@@ -608,7 +611,8 @@
+ ufs_write_blocks(uint64_t lba, uint32_t count)
+ {
+ #if defined(FUXI)
+-	if (!su.writable || !fx_write_allowed(lba, count) || count > BOUNCE_SIZE / UFS_BLOCK ||
++	if (!su.writable || (!fx_write_allowed(lba, count) && !cx_write_allowed(lba, count)) ||
++	    count > BOUNCE_SIZE / UFS_BLOCK ||
+ 	    lba + count - 1 > UINT32_MAX) {
+ #else
+ 	if (!su.writable || !su.nblocks || count == 0 || count > BOUNCE_SIZE / UFS_BLOCK ||
+@@ -952,6 +956,273 @@
  	.d_type       = D_DISK,
  };
  
@@ -82,6 +101,22 @@
 +			uint64_t off = lblk - cx_ext[i].file;
 +			*dev_lba = su.first_block + cx_ext[i].part + off;
 +			*run = cx_ext[i].count - off;
++			return true;
++		}
++	}
++	return false;
++}
++
++static bool
++cx_write_allowed(uint64_t lba, uint64_t count)
++{
++	if (!cx_blocks || count == 0 || lba < su.first_block) {
++		return false;
++	}
++	uint64_t rel = lba - su.first_block;
++	for (unsigned i = 0; i < cx_next; i++) {
++		if (rel >= cx_ext[i].part && rel - cx_ext[i].part < cx_ext[i].count &&
++		    count <= cx_ext[i].count - (rel - cx_ext[i].part)) {
 +			return true;
 +		}
 +	}
@@ -266,7 +301,7 @@
  #if defined(PANDORA)
  /*
   * pandora_ufs_probe=1: read-only look at what the 17 Pro (SM8850) bootloader leaves
-@@ -1551,6 +1803,13 @@
+@@ -1551,6 +1822,13 @@
  	/* Only now, with the partition bounds known, can writes be allowed. */
  	su.writable = (rw != 0);
  	su.ready = true;
