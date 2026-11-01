@@ -1,0 +1,72 @@
+--- a/bsd/dev/pandora_files.c
++++ b/bsd/dev/pandora_files.c
+@@ -110,12 +110,61 @@
+ 	return error ? error : cerr;
+ }
+ 
++
++/* 0264: a grown root volume makes the pending data migration run (com.apple.datamigrator ->
++ * migrationpluginwrapper), and on this machine there is no Data volume for it to finish, so the
++ * boot progress UI never ends. Replace the daemon's plist with a valid one that runs
++ * /usr/bin/false: launchd starts nothing that migrates. Boot-arg pandora_nomigrate=1. The root is
++ * read-write, so this persists until the image is rewritten; pandora_nomigrate=0 does nothing. */
++static int
++pf_neutralize(const char *path, vfs_context_t ctx)
++{
++	static const char plist[] =
++	    "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
++	    "<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" "
++	    "\"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n"
++	    "<plist version=\"1.0\"><dict>\n"
++	    "<key>Label</key><string>com.apple.datamigrator</string>\n"
++	    "<key>ProgramArguments</key><array><string>/usr/bin/false</string></array>\n"
++	    "<key>RunAtLoad</key><true/>\n"
++	    "</dict></plist>\n";
++	vnode_t vp = NULLVP;
++	int error = vnode_open(path, FWRITE | O_TRUNC, 0, 0, &vp, ctx);
++	if (error) {
++		return error;
++	}
++	int resid = 0;
++	error = vn_rdwr(UIO_WRITE, vp, (caddr_t)(uintptr_t)plist, (int)sizeof(plist) - 1, 0, UIO_SYSSPACE,
++	    IO_SYNC, vfs_context_ucred(ctx), &resid, vfs_context_proc(ctx));
++	(void)vnode_close(vp, FWRITE, ctx);
++	return error ? error : (resid ? EIO : 0);
++}
++
++static void
++pf_disable_migration(vfs_context_t ctx)
++{
++	static const char *const daemons[] = {
++		"/System/Library/LaunchDaemons/com.apple.datamigrator.plist",
++	};
++	int on = 0;
++	(void)PE_parse_boot_argn("pandora_nomigrate", &on, sizeof(on));
++	if (!on) {
++		return;
++	}
++	for (unsigned i = 0; i < sizeof(daemons) / sizeof(daemons[0]); i++) {
++		int error = pf_neutralize(daemons[i], ctx);
++		printf("PANDORA FILES: pandora_nomigrate: %s: %d\n", daemons[i], error);
++	}
++}
++
+ static void
+ pf_thread(void *arg, wait_result_t result)
+ {
+ 	(void)arg;
+ 	(void)result;
+ 	uint8_t *a = NULL, *b = NULL;
++static void pf_disable_migration(vfs_context_t ctx);
++
+ 	/* The root file system: wait for it to be mounted. */
+ 	for (int i = 0; i < 600 && rootvnode == NULLVP; i++) {
+ 		pf_sleep(500);
+@@ -145,6 +194,7 @@
+ 	}
+ 	text[list->size] = 0;
+ 	vfs_context_t ctx = vfs_context_kernel();
++	pf_disable_migration(ctx);
+ 	unsigned written = 0, same = 0, failed = 0;
+ 	a = kalloc_data(PF_CHUNK, Z_WAITOK);
+ 	b = kalloc_data(PF_CHUNK, Z_WAITOK);
