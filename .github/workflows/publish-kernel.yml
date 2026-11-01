@@ -3,11 +3,9 @@ on:
   workflow_dispatch:
     inputs:
       run_id:
-        description: run holding the xnu-kernel artifact
-        default: "41317747627"
+        default: "41325089447"
       tag:
-        description: release tag to publish into
-        default: xnu-songyuan-120hz
+        default: "xnu-songyuan-120hz-nomigrate"
 permissions:
   contents: write
   actions: read
@@ -21,16 +19,19 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           gh run download "${{ inputs.run_id }}" -n xnu-kernel -D k -R "$GITHUB_REPOSITORY"
-          ls -lR k | head -40
-      - name: publish release
+          find k -maxdepth 3 -type f | head -20
+      - name: publish release (kernel only)
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
           TAG="${{ inputs.tag }}"
+          K=$(find k -type f -name 'kernel.development.pandora' | head -1)
+          test -n "$K"
+          ( cd "$(dirname "$K")" && sha256sum "$(basename "$K")" > SHA256SUMS )
           gh release delete "$TAG" -R "$GITHUB_REPOSITORY" --yes --cleanup-tag || true
           gh release create "$TAG" -R "$GITHUB_REPOSITORY" \
-            --title "songyuan 120Hz kernel (patch 0263)" \
-            --notes "Fixed 120 Hz present tick. Boot with sweetfb_hz=120. Kernel from run ${{ inputs.run_id }}."
-          find k -type f -exec gh release upload "$TAG" {} -R "$GITHUB_REPOSITORY" \;
+            --title "songyuan kernel: nomigrate + fixed 120 Hz (0263+0264)" \
+            --notes "Kernel from run ${{ inputs.run_id }}; boot with sweetfb_hz=120 pandora_nomigrate=1."
+          gh release upload "$TAG" "$K" "$(dirname "$K")/SHA256SUMS" -R "$GITHUB_REPOSITORY"
           gh release view "$TAG" -R "$GITHUB_REPOSITORY" --json assets -q '.assets[] | "\(.name) \(.size)"'
