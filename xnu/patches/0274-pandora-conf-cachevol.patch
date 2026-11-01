@@ -1,0 +1,10 @@
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -124,6 +124,7 @@
+ bsd/dev/pandora_ipcrtr.c		standard
+ bsd/dev/songyuan_haptic.c		standard
+ bsd/dev/pandora_files.c			standard
++bsd/dev/pandora_cachevol.c		standard
+ bsd/dev/pandora_gpu.c			standard
+ bsd/dev/pandora_cpu.c			standard
+ bsd/dev/pandora_autoswipe.c		standard
