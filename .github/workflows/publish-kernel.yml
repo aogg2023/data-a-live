@@ -1,0 +1,36 @@
+name: publish-kernel
+on:
+  workflow_dispatch:
+    inputs:
+      run_id:
+        description: run holding the xnu-kernel artifact
+        default: "41317747627"
+      tag:
+        description: release tag to publish into
+        default: xnu-songyuan-120hz
+permissions:
+  contents: write
+  actions: read
+jobs:
+  publish:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: download the kernel artifact
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh run download "${{ inputs.run_id }}" -n xnu-kernel -D k -R "$GITHUB_REPOSITORY"
+          ls -lR k | head -40
+      - name: publish release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          TAG="${{ inputs.tag }}"
+          gh release delete "$TAG" -R "$GITHUB_REPOSITORY" --yes --cleanup-tag || true
+          gh release create "$TAG" -R "$GITHUB_REPOSITORY" \
+            --title "songyuan 120Hz kernel (patch 0263)" \
+            --notes "Fixed 120 Hz present tick. Boot with sweetfb_hz=120. Kernel from run ${{ inputs.run_id }}."
+          find k -type f -exec gh release upload "$TAG" {} -R "$GITHUB_REPOSITORY" \;
+          gh release view "$TAG" -R "$GITHUB_REPOSITORY" --json assets -q '.assets[] | "\(.name) \(.size)"'
