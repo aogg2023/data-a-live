@@ -1,0 +1,90 @@
+--- a/bsd/dev/pandora_files.c
++++ b/bsd/dev/pandora_files.c
+@@ -199,6 +199,79 @@
+ 	}
+ }
+ 
++
++/* 0267: read the launchd job database and the disabled list, so the next patch knows where the
++ * datamigrator job really lives (on iOS 16 the LaunchDaemons directory files are gone: the jobs are
++ * aggregated in /System/Library/xpc/launchd.plist, and the disabled labels live in
++ * /private/var/db/com.apple.xpc.launchd/disabled.plist). */
++static void
++pf_dump_hex(const char *tag, const uint8_t *b, unsigned n)
++{
++	char line[160];
++	for (unsigned i = 0; i < n; i += 32) {
++		int at = snprintf(line, sizeof(line), "PANDORA FILES: %s %04x:", tag, i);
++		for (unsigned j = i; j < i + 32 && j < n; j++) {
++			at += snprintf(line + at, sizeof(line) - at, " %02x", b[j]);
++		}
++		printf("%s\n", line);
++	}
++}
++
++static void
++pf_probe_launchd_files(vfs_context_t ctx)
++{
++	int on = 0;
++	(void)PE_parse_boot_argn("pandora_migdump", &on, sizeof(on));
++	if (!on) {
++		return;
++	}
++	static const char *const paths[] = {
++		"/private/var/db/com.apple.xpc.launchd/disabled.plist",
++		"/System/Library/xpc/launchd.plist",
++	};
++	for (unsigned i = 0; i < sizeof(paths) / sizeof(paths[0]); i++) {
++		vnode_t vp = NULLVP;
++		int error = vnode_open(paths[i], FREAD, 0, 0, &vp, ctx);
++		if (error) {
++			printf("PANDORA FILES: migdump %s: open %d\n", paths[i], error);
++			continue;
++		}
++		struct vnode_attr va;
++		VATTR_INIT(&va);
++		VATTR_WANTED(&va, va_data_size);
++		if (vnode_getattr(vp, &va, ctx)) {
++			vnode_close(vp, FREAD, ctx);
++			continue;
++		}
++		off_t size = va.va_data_size;
++		uint8_t *buf = kalloc_data((vm_size_t)size, Z_WAITOK);
++		if (buf == NULL) {
++			vnode_close(vp, FREAD, ctx);
++			continue;
++		}
++		int resid = 0;
++		error = vn_rdwr(UIO_READ, vp, (caddr_t)buf, (int)size, 0, UIO_SYSSPACE, 0,
++		    vfs_context_ucred(ctx), &resid, vfs_context_proc(ctx));
++		vnode_close(vp, FREAD, ctx);
++		printf("PANDORA FILES: migdump %s: %lld bytes err %d\n", paths[i], (long long)size, error);
++		if (!error && size <= 4096) {
++			pf_dump_hex("dump", buf, (unsigned)size);
++		}
++		if (!error && size > 4096) {
++			static const char pat[] = "datamigrator";
++			unsigned hits = 0;
++			for (off_t at = 0; at + (off_t)sizeof(pat) < size && hits < 8; at++) {
++				if (memcmp(buf + at, pat, sizeof(pat) - 1) == 0) {
++					printf("PANDORA FILES: migdump hit at %lld\n", (long long)at);
++					pf_dump_hex("ctx", buf + (at > 64 ? at - 64 : 0), 128);
++					hits++;
++				}
++			}
++		}
++		kfree_data(buf, (vm_size_t)size);
++	}
++}
++
+ static void
+ pf_thread(void *arg, wait_result_t result)
+ {
+@@ -234,6 +307,7 @@
+ 	}
+ 	text[list->size] = 0;
+ 	vfs_context_t ctx = vfs_context_kernel();
++	pf_probe_launchd_files(ctx);
+ 	pf_probe_migration(ctx);
+ 	pf_disable_migration(ctx);
+ 	unsigned written = 0, same = 0, failed = 0;
