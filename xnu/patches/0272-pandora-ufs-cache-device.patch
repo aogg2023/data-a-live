@@ -8,7 +8,7 @@
  #include <machine/atomic.h>
  
  extern ppnum_t pmap_find_phys(pmap_t pmap, addr64_t va);
-@@ -952,6 +953,212 @@
+@@ -952,6 +953,215 @@
  	.d_type       = D_DISK,
  };
  
@@ -20,6 +20,9 @@
 +static struct { uint64_t file, part, count; } cx_ext[FX_MAX_EXTENTS];
 +static unsigned cx_next;
 +static uint64_t cx_blocks;
++/* The cache volume always uses 512-byte logical sectors, independent of the root device's
++ * current sector size (su.secsize can be changed by the root volume's own ioctls). */
++#define CX_SECSIZE 512u
 +
 +static int
 +cx_load_extents(void)
@@ -90,7 +93,7 @@
 +{
 +	int error = 0;
 +	caddr_t vaddr = NULL;
-+	uint64_t off = (uint64_t)buf_blkno(bp) * su.secsize;
++	uint64_t off = (uint64_t)buf_blkno(bp) * CX_SECSIZE;
 +	uint32_t count = buf_count(bp);
 +	uint64_t part_bytes = cx_blocks * UFS_BLOCK;
 +	bool rd = buf_flags(bp) & B_READ;
@@ -165,13 +168,13 @@
 +	uint64_t *o = (uint64_t *)data;
 +	switch (cmd) {
 +	case DKIOCGETBLOCKSIZE:
-+		*f = (uint32_t)su.secsize;
++		*f = (uint32_t)CX_SECSIZE;
 +		return 0;
 +	case DKIOCGETPHYSICALBLOCKSIZE:
 +		*f = UFS_BLOCK;
 +		return 0;
 +	case DKIOCGETBLOCKCOUNT:
-+		*o = cx_blocks * UFS_BLOCK / su.secsize;
++		*o = cx_blocks * UFS_BLOCK / CX_SECSIZE;
 +		return 0;
 +	case DKIOCISWRITABLE:
 +		*f = su.writable ? 1 : 0;
@@ -190,7 +193,7 @@
 +static int
 +sweet_cache_psize(__unused dev_t dev)
 +{
-+	return cx_blocks ? (int)MIN(cx_blocks * UFS_BLOCK / su.secsize, INT_MAX) : -1;
++	return cx_blocks ? (int)MIN(cx_blocks * UFS_BLOCK / CX_SECSIZE, INT_MAX) : -1;
 +}
 +
 +static const struct bdevsw sweet_cache_bdevsw = {
@@ -221,7 +224,7 @@
  #if defined(PANDORA)
  /*
   * pandora_ufs_probe=1: read-only look at what the 17 Pro (SM8850) bootloader leaves
-@@ -1551,6 +1758,13 @@
+@@ -1551,6 +1761,13 @@
  	/* Only now, with the partition bounds known, can writes be allowed. */
  	su.writable = (rw != 0);
  	su.ready = true;
