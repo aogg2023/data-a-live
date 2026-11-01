@@ -13,7 +13,7 @@
  #include <sys/proc_internal.h>
  #include <sys/kauth.h>
  #include <sys/uio_internal.h>
-@@ -375,6 +381,25 @@
+@@ -375,6 +381,24 @@
  	return error;
  }
  
@@ -30,8 +30,7 @@
 +	error = kernel_mount("hfs", NULLVP, NULLVP, mnt, (void *)&devname, 0,
 +	    MNT_DONTBROWSE, KERNEL_MOUNT_PANDORADEV, vfs_context_kernel());
 +	if (error) {
-+		printf("PANDORA CACHE: kernel_mount(hfs) %s on %s failed %d
-+", dev, mnt, error);
++		printf("PANDORA CACHE: kernel_mount(hfs) %s on %s failed %d\n", dev, mnt, error);
 +	}
 +	return error;
 +}
@@ -39,7 +38,7 @@
  int
  vfs_mount_override_type_name(mount_t mp, const char *name)
  {
-@@ -1307,6 +1332,12 @@
+@@ -1307,6 +1331,12 @@
  	if (vfsp->vfc_vfsflags & VFC_VFSLOCALARGS &&
  	    !(internal_flags & (KERNEL_MOUNT_SNAPSHOT | KERNEL_MOUNT_VOLBYROLE_MASK))) {
  		boolean_t do_copyin_devpath = true;
@@ -52,7 +51,7 @@
  #if CONFIG_BASESYSTEMROOT
  		if (internal_flags & KERNEL_MOUNT_BASESYSTEMROOT) {
  			// KERNEL_MOUNT_BASESYSTEMROOT implies subtle behavior worh nothing:
-@@ -1351,6 +1382,9 @@
+@@ -1351,6 +1381,9 @@
  			struct nameidata nd;
  
  			enum uio_seg seg = UIO_USERSPACE;
