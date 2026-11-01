@@ -1,6 +1,6 @@
 --- a/bsd/dev/pandora_files.c
 +++ b/bsd/dev/pandora_files.c
-@@ -110,12 +110,61 @@
+@@ -110,6 +110,53 @@
  	return error ? error : cerr;
  }
  
@@ -54,15 +54,7 @@
  static void
  pf_thread(void *arg, wait_result_t result)
  {
- 	(void)arg;
- 	(void)result;
- 	uint8_t *a = NULL, *b = NULL;
-+static void pf_disable_migration(vfs_context_t ctx);
-+
- 	/* The root file system: wait for it to be mounted. */
- 	for (int i = 0; i < 600 && rootvnode == NULLVP; i++) {
- 		pf_sleep(500);
-@@ -145,6 +194,7 @@
+@@ -145,6 +192,7 @@
  	}
  	text[list->size] = 0;
  	vfs_context_t ctx = vfs_context_kernel();
