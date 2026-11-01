@@ -8,7 +8,7 @@
  #include <machine/atomic.h>
  
  extern ppnum_t pmap_find_phys(pmap_t pmap, addr64_t va);
-@@ -952,6 +953,224 @@
+@@ -952,6 +953,257 @@
  	.d_type       = D_DISK,
  };
  
@@ -188,8 +188,41 @@
 +	case DKIOCISWRITABLE:
 +		*f = su.writable ? 1 : 0;
 +		return 0;
++	case DKIOCISVIRTUAL:
++		*f = 0;
++		return 0;
++	case DKIOCISSOLIDSTATE:
++		*f = 1;
++		return 0;
++	case DKIOCGETFEATURES:
++		*f = 0;
++		return 0;
++	case DKIOCGETMAXBLOCKCOUNTREAD:
++	case DKIOCGETMAXBLOCKCOUNTWRITE:
++		*o = BOUNCE_SIZE / cx_secsize;
++		return 0;
++	case DKIOCGETMAXBYTECOUNTREAD:
++	case DKIOCGETMAXBYTECOUNTWRITE:
++		*o = BOUNCE_SIZE;
++		return 0;
++	case DKIOCGETMAXSEGMENTCOUNTREAD:
++	case DKIOCGETMAXSEGMENTCOUNTWRITE:
++		*o = 1;
++		return 0;
++	case DKIOCSYNCHRONIZE:
++	case DKIOCSYNCHRONIZECACHE: {
++		if (!su.writable) {
++			return 0;
++		}
++		lck_mtx_lock(&sweet_ufs_lock);
++		int serr = ufs_sync_cache();
++		lck_mtx_unlock(&sweet_ufs_lock);
++		return serr;
++	}
++	case DKIOCUNMAP:
++		return 0;           /* discards are advisory; nothing to trim */
 +	default:
-+		return ENOTTY;
++		return ENOTTY;      /* CoreStorage, CS pin, throttle mask: not a CoreStorage device */
 +	}
 +}
 +
@@ -233,7 +266,7 @@
  #if defined(PANDORA)
  /*
   * pandora_ufs_probe=1: read-only look at what the 17 Pro (SM8850) bootloader leaves
-@@ -1551,6 +1770,13 @@
+@@ -1551,6 +1803,13 @@
  	/* Only now, with the partition bounds known, can writes be allowed. */
  	su.writable = (rw != 0);
  	su.ready = true;
