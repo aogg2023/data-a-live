@@ -14,7 +14,7 @@
  	fFlushTicks = (hz == 0 || hz >= 60) ? 1 : 60 / hz;
 +	/*
 +	 * 0263: fixed higher present rates. The panel already scans out at 120 Hz; below 60
-+	 * sweetfb_hz throttles the tick, above 60 it has to shorten the tick itself
++	 * sweetfb_hz throttles the tick, above 60 it shortens the tick itself
 +	 * (sweetfb_hz=120 -> 8333 us; sweetfb_refresh publishes the matching CoreAnimation rate).
 +	 */
 +	fTickUS = SWEET_FB_VSYNC_US;
