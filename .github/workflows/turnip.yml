@@ -140,6 +140,13 @@ jobs:
           fetch unixnu/kits/AdrenoPM4 https://github.com/UniXNU/AdrenoPM4.git "$ADRENOPM4_SHA"
           # NativeMetal includes ../NativeMobileDisplay/ (its sibling under UniXNU's drivers/)
           fetch NativeMobileDisplay https://github.com/UniXNU/NativeMobileDisplay.git "$NATIVEMOBILEDISPLAY_SHA"
+          # data-a-live's own metal2vulkan changes (tools/metal/m2v/NNNN-*.patch), made against the tree
+          # after NativeMetal's bridge patches: build_plugin.sh applies NativeMetal's on top (the two series
+          # go in either order, the resulting tree is the same), and does not apply these itself.
+          for p in tools/metal/m2v/[0-9][0-9][0-9][0-9]-*.patch; do
+            echo "   m2v/$(basename "$p")"
+            git -C metal2vulkan apply --whitespace=nowarn "$p"
+          done
           bash tools/metal/build_plugin.sh unixnu nativemetal nativeadreno metal2vulkan mesa out/metal
 
       - name: Metal summary
