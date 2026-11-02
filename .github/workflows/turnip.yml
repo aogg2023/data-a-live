@@ -19,7 +19,7 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  UNIXNU_SHA: 1a01c2afa197d975d04da892325c56b6b14aaecb
+  UNIXNU_SHA: cce1f89ee2052bcf53f2b6be90b053a73cc08837
   NATIVEADRENO_SHA: b686b9054f57d393c80195b82568a09f8ca106a2
   MESA_SHA: 85fda3b36405bcaea8bffc64aa4f2651dc90770d
   # UniXNU's pins for its Metal plugin (drivers/NativeMetal submodule, gpu-metal-vulkan-inputs.json)
