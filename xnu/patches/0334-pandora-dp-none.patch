@@ -1,0 +1,43 @@
+--- a/bsd/sweet_hfs/core/hfs_vnops.c
++++ b/bsd/sweet_hfs/core/hfs_vnops.c
+@@ -55,6 +55,10 @@
+ #include <miscfs/specfs/specdev.h>
+ #include <miscfs/fifofs/fifo.h>
+ #include <vfs/vfs_support.h>
++
++#if defined(PANDORA)
++#include <pexpert/pexpert.h>
++#endif
+ 
+ #include <sys/kdebug.h>
+ #include <sys/sysctl.h>
+@@ -1151,7 +1155,28 @@
+ 
+ #if CONFIG_PROTECT
+ 	if (VATTR_IS_ACTIVE(vap, va_dataprotect_class)) {
+-    		vap->va_dataprotect_class = cp->c_cpentry ? CP_CLASS(cp->c_cpentry->cp_pclass) : 0;
++#if defined(PANDORA)
++		/* 0334-dp-none: this port's data volume is plain HFS+ with no data protection
++		 * (no SEP; keybag logs "mount point (/private/var/) does not support Data
++		 * Protection"), so files have no cprotect entry and the class reads back as 0.
++		 * PosterBoard's data-store viability check requires its store URLs to read back
++		 * NSURLFileProtectionNone, i.e. PROTECTION_CLASS_D; with 0 the data store is not
++		 * created and the first-time switcher setup hits NSAssert and traps. Report D for
++		 * entries that have no cprotect record; pandora_dp_none=0 turns it off. */
++		static int pandora_dp_none = -1;
++		if (pandora_dp_none < 0) {
++			int on = 1;
++			(void)PE_parse_boot_argn("pandora_dp_none", &on, sizeof(on));
++			pandora_dp_none = on;
++		}
++		if (cp->c_cpentry) {
++			vap->va_dataprotect_class = CP_CLASS(cp->c_cpentry->cp_pclass);
++		} else {
++			vap->va_dataprotect_class = pandora_dp_none ? PROTECTION_CLASS_D : 0;
++		}
++#else
++		vap->va_dataprotect_class = cp->c_cpentry ? CP_CLASS(cp->c_cpentry->cp_pclass) : 0;
++#endif
+     		VATTR_SET_SUPPORTED(vap, va_dataprotect_class);
+     	} 	
+ #endif
