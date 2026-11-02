@@ -3,7 +3,11 @@ on:
   workflow_dispatch:
 jobs:
   build:
-    runs-on: macos-13
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-13, macos-14, macos-15]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
       - name: compile for iOS 16 arm64
@@ -15,6 +19,7 @@ jobs:
           file pandora-lsdiag || true
           ls -l pandora-lsdiag
       - uses: actions/upload-artifact@v4
+        if: success()
         with:
-          name: pandora-lsdiag
+          name: pandora-lsdiag-${{ matrix.os }}
           path: pandora-lsdiag
