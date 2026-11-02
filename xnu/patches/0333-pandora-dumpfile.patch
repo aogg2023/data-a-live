@@ -1,0 +1,149 @@
+--- a/bsd/dev/pandora_files.c
++++ b/bsd/dev/pandora_files.c
+@@ -23,12 +23,16 @@
+ #include <kern/sched_prim.h>
+ #include <kern/kalloc.h>
+ #include <pexpert/pexpert.h>
++#include <sys/stat.h>
++#include <sys/dirent.h>
++#include <sys/uio_internal.h>
+ 
+ extern kern_return_t thread_terminate(thread_t);
+ extern int pandora_fw_read(uint64_t off, void *dst, uint64_t len);
+ extern vnode_t rootvnode;
+ extern int pandora_mkdir(const char *path, int mode);   /* bsd/vfs/vfs_syscalls.c (patch 0185) */
+ void pandora_files_init(void);
++static void pf_dump_files(vfs_context_t ctx);
+ 
+ #define PF_MAX_FILE   (64u << 20)
+ 
+@@ -368,6 +372,7 @@
+ 		}
+ 	}
+ 	printf("PANDORA FILES: %u written, %u already the same, %u failed\n", written, same, failed);
++	pf_dump_files(ctx);
+ out:
+ 	if (a) {
+ 		kfree_data(a, PF_CHUNK);
+@@ -392,4 +397,121 @@
+ 		thread_deallocate(thread);
+ 	}
+ }
++
++/* 0333: diagnostic read-back for the console log. Boot-arg pandora_dumpfile takes a comma
++ * separated list of absolute paths; a directory is listed, a file is printed as text. Used to
++ * read PosterBoard's crash reports (/private/var/mobile/Library/Logs/CrashReporter) and to check
++ * which app-extension bundles exist, without any userland shell. Read only. */
++static void
++pf_dump_text(const char *tag, const uint8_t *b, unsigned n)
++{
++	char line[200];
++	unsigned at = 0;
++	for (unsigned i = 0; i < n; i++) {
++		char c = (char)b[i];
++		if (c == '\r') {
++			continue;
++		}
++		if (c == '\n' || at >= sizeof(line) - 1) {
++			line[at] = 0;
++			printf("PANDORA DUMP: %s %s\n", tag, line);
++			at = 0;
++			continue;
++		}
++		line[at++] = (c >= 32 && c < 127) ? c : '.';
++	}
++	if (at) {
++		line[at] = 0;
++		printf("PANDORA DUMP: %s %s\n", tag, line);
++	}
++}
++
++static void
++pf_dump_path(const char *path, vfs_context_t ctx)
++{
++	vnode_t vp = NULLVP;
++	int error = vnode_open(path, FREAD, 0, 0, &vp, ctx);
++	if (error) {
++		printf("PANDORA DUMP: open %s: %d\n", path, error);
++		return;
++	}
++	struct vnode_attr va;
++	VATTR_INIT(&va);
++	VATTR_WANTED(&va, va_mode);
++	VATTR_WANTED(&va, va_data_size);
++	if (vnode_getattr(vp, &va, ctx)) {
++		printf("PANDORA DUMP: getattr %s failed\n", path);
++		vnode_close(vp, FREAD, ctx);
++		return;
++	}
++	if (S_ISDIR(va.va_mode)) {
++		uint8_t *buf = kalloc_data(65536, Z_WAITOK);
++		if (buf) {
++			uio_t auio = uio_create(1, 0, UIO_SYSSPACE, UIO_READ);
++			if (auio) {
++				uio_addiov(auio, (uintptr_t)buf, 65536);
++				int eofflag = 0, numdirent = 0;
++				error = VNOP_READDIR(vp, auio, 0, &eofflag, &numdirent, ctx);
++				unsigned used = 65536 - (unsigned)uio_resid(auio);
++				printf("PANDORA DUMP: dir %s: %u bytes, %d entries, err %d\n",
++				    path, used, numdirent, error);
++				for (unsigned off = 0; !error && off + 8 < used; ) {
++					struct dirent *de = (struct dirent *)(void *)(buf + off);
++					if (de->d_reclen < 8 || off + de->d_reclen > used) {
++						break;
++					}
++					off += de->d_reclen;
++					if (de->d_name[0] == 0 || de->d_ino == 0) {
++						continue;
++					}
++					de->d_name[sizeof(de->d_name) - 1] = 0;
++					printf("PANDORA DUMP: dir %s/%s\n", path, de->d_name);
++				}
++				uio_free(auio);
++			}
++			kfree_data(buf, 65536);
++		}
++	} else {
++		off_t size = va.va_data_size;
++		if (size > (off_t)(512 * 1024)) {
++			size = 512 * 1024;
++		}
++		if (size > 0) {
++			uint8_t *buf = kalloc_data((vm_size_t)size, Z_WAITOK);
++			if (buf) {
++				int resid = 0;
++				error = vn_rdwr(UIO_READ, vp, (caddr_t)buf, (int)size, 0, UIO_SYSSPACE, 0,
++				    vfs_context_ucred(ctx), &resid, vfs_context_proc(ctx));
++				printf("PANDORA DUMP: file %s: %lld bytes err %d\n", path,
++				    (long long)size, error);
++				if (!error) {
++					pf_dump_text(path, buf, (unsigned)(size - resid));
++				}
++				kfree_data(buf, (vm_size_t)size);
++			}
++		} else {
++			printf("PANDORA DUMP: file %s: empty\n", path);
++		}
++	}
++	vnode_close(vp, FREAD, ctx);
++}
++
++static void
++pf_dump_files(vfs_context_t ctx)
++{
++	char list[256];
++	if (!PE_parse_boot_argn("pandora_dumpfile", list, sizeof(list)) || list[0] == 0) {
++		return;
++	}
++	for (char *p = list; p && *p; ) {
++		char *comma = strchr(p, ',');
++		if (comma) {
++			*comma = 0;
++		}
++		if (p[0] == '/') {
++			pf_dump_path(p, ctx);
++		}
++		p = comma ? comma + 1 : NULL;
++	}
++}
+ #endif /* PANDORA */
