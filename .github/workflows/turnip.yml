@@ -19,7 +19,7 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  UNIXNU_SHA: cce1f89ee2052bcf53f2b6be90b053a73cc08837
+  UNIXNU_SHA: 1a01c2afa197d975d04da892325c56b6b14aaecb
   NATIVEADRENO_SHA: b686b9054f57d393c80195b82568a09f8ca106a2
   MESA_SHA: 85fda3b36405bcaea8bffc64aa4f2651dc90770d
   # UniXNU's pins for its Metal plugin (drivers/NativeMetal submodule, gpu-metal-vulkan-inputs.json)
@@ -67,6 +67,8 @@ jobs:
           python3 tools/turnip/pandora_rpstats.py mesa
           # Fence waits of up to 100 ms a kernel call, not 1 ms (the kernel sleeps until the fence's interrupt).
           python3 tools/turnip/pandora_wait.py mesa
+          # A sync already on the ring is met by the ring itself, not a CPU wait (UniXNU 2c40ae9, 2026-10-28).
+          python3 tools/turnip/pandora_submit_wait.py mesa
           ls nativeadreno/NativeAdrenoABI.h
           # 128 IBs per submission, as the kernel takes them (0194): Turnip no longer splits larger ones.
           python3 tools/turnip/abi_128.py nativeadreno/NativeAdrenoABI.h
