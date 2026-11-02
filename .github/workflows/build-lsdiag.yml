@@ -1,0 +1,22 @@
+name: build-lsdiag
+on:
+  workflow_dispatch:
+jobs:
+  build:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - name: compile for iOS 16 arm64
+        run: |
+          set -euo pipefail
+          SDK=$(xcrun --sdk iphoneos --show-sdk-path)
+          echo "SDK=$SDK"
+          xcrun -sdk iphoneos clang -target arm64-apple-ios16.0 -isysroot "$SDK" -O2 -Wall \
+            -o pandora-lsdiag tools/pandora-lsdiag.c
+          file pandora-lsdiag || true
+          ls -l pandora-lsdiag
+          otool -L pandora-lsdiag || true
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pandora-lsdiag
+          path: pandora-lsdiag
