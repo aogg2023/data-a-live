@@ -25,15 +25,16 @@
  out:
  	if (a) {
  		kfree_data(a, PF_CHUNK);
-@@ -392,4 +397,121 @@
+@@ -392,4 +397,242 @@
  		thread_deallocate(thread);
  	}
  }
 +
-+/* 0333: diagnostic read-back for the console log. Boot-arg pandora_dumpfile takes a comma
-+ * separated list of absolute paths; a directory is listed, a file is printed as text. Used to
-+ * read PosterBoard's crash reports (/private/var/mobile/Library/Logs/CrashReporter) and to check
-+ * which app-extension bundles exist, without any userland shell. Read only. */
++/* 0333/0334: diagnostic read-back for the console log. Boot-arg pandora_dumpfile takes a comma
++ * separated list of absolute paths; a directory is listed, a file is printed as text. Boot-arg
++ * pandora_dumpmatch=<substring> limits directory listings to matching names. Boot-arg
++ * pandora_dumpnewest=<dir>,<prefix> prints the content of the newest file whose name starts with
++ * prefix. Read only. */
 +static void
 +pf_dump_text(const char *tag, const uint8_t *b, unsigned n)
 +{
@@ -58,6 +59,88 @@
 +	}
 +}
 +
++/* 0334: HFS+ readdir fills d_name but the step is d_namlen based (d_reclen is not reliable for
++ * every entry; using it produced name fragments). */
++static unsigned
++pf_dirent_len(struct dirent *de)
++{
++	unsigned n = (unsigned)__builtin_offsetof(struct dirent, d_name) + (unsigned)de->d_namlen + 1;
++	return (n + 7u) & ~7u;
++}
++
++static int
++pf_walk_dir(vnode_t vp, vfs_context_t ctx, uint8_t *buf, unsigned cap, unsigned *used, int *num)
++{
++	uio_t auio = uio_create(1, 0, UIO_SYSSPACE, UIO_READ);
++	if (auio == NULL) {
++		return ENOMEM;
++	}
++	uio_addiov(auio, (uintptr_t)buf, cap);
++	int eofflag = 0;
++	*num = 0;
++	int error = VNOP_READDIR(vp, auio, 0, &eofflag, num, ctx);
++	*used = cap - (unsigned)uio_resid(auio);
++	uio_free(auio);
++	return error;
++}
++
++static void
++pf_dump_dir(vnode_t vp, const char *path, vfs_context_t ctx)
++{
++	uint8_t *buf = kalloc_data(131072, Z_WAITOK);
++	if (buf == NULL) {
++		return;
++	}
++	unsigned used = 0;
++	int num = 0;
++	int error = pf_walk_dir(vp, ctx, buf, 131072, &used, &num);
++	char match[64];
++	int have = PE_parse_boot_argn("pandora_dumpmatch", match, sizeof(match)) && match[0] != 0;
++	printf("PANDORA DUMP: dir %s: %u bytes, %d entries, err %d%s%s\n", path, used, num, error,
++	    have ? ", match " : "", have ? match : "");
++	for (unsigned off = 0; !error && off + 8 < used; ) {
++		struct dirent *de = (struct dirent *)(void *)(buf + off);
++		unsigned len = pf_dirent_len(de);
++		if (len < 8 || off + len > used) {
++			break;
++		}
++		off += len;
++		if (de->d_name[0] == 0 || de->d_ino == 0) {
++			continue;
++		}
++		de->d_name[sizeof(de->d_name) - 1] = 0;
++		if (have && strstr(de->d_name, match) == NULL) {
++			continue;
++		}
++		printf("PANDORA DUMP: dir %s/%s\n", path, de->d_name);
++	}
++	kfree_data(buf, 131072);
++}
++
++static void
++pf_dump_file(vnode_t vp, const char *path, off_t size, vfs_context_t ctx)
++{
++	if (size > (off_t)(512 * 1024)) {
++		size = 512 * 1024;
++	}
++	if (size <= 0) {
++		printf("PANDORA DUMP: file %s: empty\n", path);
++		return;
++	}
++	uint8_t *buf = kalloc_data((vm_size_t)size, Z_WAITOK);
++	if (buf == NULL) {
++		return;
++	}
++	int resid = 0;
++	int error = vn_rdwr(UIO_READ, vp, (caddr_t)buf, (int)size, 0, UIO_SYSSPACE, 0,
++	    vfs_context_ucred(ctx), &resid, vfs_context_proc(ctx));
++	printf("PANDORA DUMP: file %s: %lld bytes err %d\n", path, (long long)size, error);
++	if (!error) {
++		pf_dump_text(path, buf, (unsigned)(size - resid));
++	}
++	kfree_data(buf, (vm_size_t)size);
++}
++
 +static void
 +pf_dump_path(const char *path, vfs_context_t ctx)
 +{
@@ -77,73 +160,111 @@
 +		return;
 +	}
 +	if (S_ISDIR(va.va_mode)) {
-+		uint8_t *buf = kalloc_data(65536, Z_WAITOK);
-+		if (buf) {
-+			uio_t auio = uio_create(1, 0, UIO_SYSSPACE, UIO_READ);
-+			if (auio) {
-+				uio_addiov(auio, (uintptr_t)buf, 65536);
-+				int eofflag = 0, numdirent = 0;
-+				error = VNOP_READDIR(vp, auio, 0, &eofflag, &numdirent, ctx);
-+				unsigned used = 65536 - (unsigned)uio_resid(auio);
-+				printf("PANDORA DUMP: dir %s: %u bytes, %d entries, err %d\n",
-+				    path, used, numdirent, error);
-+				for (unsigned off = 0; !error && off + 8 < used; ) {
-+					struct dirent *de = (struct dirent *)(void *)(buf + off);
-+					if (de->d_reclen < 8 || off + de->d_reclen > used) {
-+						break;
-+					}
-+					off += de->d_reclen;
-+					if (de->d_name[0] == 0 || de->d_ino == 0) {
-+						continue;
-+					}
-+					de->d_name[sizeof(de->d_name) - 1] = 0;
-+					printf("PANDORA DUMP: dir %s/%s\n", path, de->d_name);
-+				}
-+				uio_free(auio);
-+			}
-+			kfree_data(buf, 65536);
-+		}
++		pf_dump_dir(vp, path, ctx);
 +	} else {
-+		off_t size = va.va_data_size;
-+		if (size > (off_t)(512 * 1024)) {
-+			size = 512 * 1024;
-+		}
-+		if (size > 0) {
-+			uint8_t *buf = kalloc_data((vm_size_t)size, Z_WAITOK);
-+			if (buf) {
-+				int resid = 0;
-+				error = vn_rdwr(UIO_READ, vp, (caddr_t)buf, (int)size, 0, UIO_SYSSPACE, 0,
-+				    vfs_context_ucred(ctx), &resid, vfs_context_proc(ctx));
-+				printf("PANDORA DUMP: file %s: %lld bytes err %d\n", path,
-+				    (long long)size, error);
-+				if (!error) {
-+					pf_dump_text(path, buf, (unsigned)(size - resid));
-+				}
-+				kfree_data(buf, (vm_size_t)size);
-+			}
-+		} else {
-+			printf("PANDORA DUMP: file %s: empty\n", path);
-+		}
++		pf_dump_file(vp, path, va.va_data_size, ctx);
 +	}
 +	vnode_close(vp, FREAD, ctx);
++}
++
++/* pandora_dumpnewest=<dir>,<prefix>: the newest (mtime) entry whose name starts with prefix. */
++static void
++pf_dump_newest(const char *spec, vfs_context_t ctx)
++{
++	char tmp[256];
++	strlcpy(tmp, spec, sizeof(tmp));
++	char *comma = strchr(tmp, ',');
++	if (comma == NULL) {
++		printf("PANDORA DUMP: newest %s: no comma\n", spec);
++		return;
++	}
++	*comma = 0;
++	const char *dir = tmp, *prefix = comma + 1;
++	vnode_t dvp = NULLVP;
++	if (vnode_open(dir, FREAD, 0, 0, &dvp, ctx)) {
++		printf("PANDORA DUMP: newest: cannot open %s\n", dir);
++		return;
++	}
++	uint8_t *buf = kalloc_data(131072, Z_WAITOK);
++	if (buf == NULL) {
++		vnode_close(dvp, FREAD, ctx);
++		return;
++	}
++	unsigned used = 0;
++	int num = 0;
++	int error = pf_walk_dir(dvp, ctx, buf, 131072, &used, &num);
++	vnode_close(dvp, FREAD, ctx);
++	char best[256] = {0};
++	uint64_t best_time = 0;
++	size_t plen = strlen(prefix);
++	for (unsigned off = 0; !error && off + 8 < used; ) {
++		struct dirent *de = (struct dirent *)(void *)(buf + off);
++		unsigned len = pf_dirent_len(de);
++		if (len < 8 || off + len > used) {
++			break;
++		}
++		off += len;
++		if (de->d_name[0] == 0 || de->d_ino == 0) {
++			continue;
++		}
++		de->d_name[sizeof(de->d_name) - 1] = 0;
++		if (strncmp(de->d_name, prefix, plen) != 0) {
++			continue;
++		}
++		char path[512];
++		snprintf(path, sizeof(path), "%s/%s", dir, de->d_name);
++		vnode_t vp = NULLVP;
++		if (vnode_open(path, FREAD, 0, 0, &vp, ctx)) {
++			continue;
++		}
++		struct vnode_attr va;
++		VATTR_INIT(&va);
++		VATTR_WANTED(&va, va_mod_time);
++		if (!vnode_getattr(vp, &va, ctx) && (uint64_t)va.va_mod_time >= best_time) {
++			best_time = (uint64_t)va.va_mod_time;
++			strlcpy(best, de->d_name, sizeof(best));
++		}
++		vnode_close(vp, FREAD, ctx);
++	}
++	kfree_data(buf, 131072);
++	printf("PANDORA DUMP: newest %s/%s (mtime %llu) out of %d entries\n", dir, best,
++	    (unsigned long long)best_time, num);
++	if (best[0]) {
++		char path[512];
++		snprintf(path, sizeof(path), "%s/%s", dir, best);
++		vnode_t vp = NULLVP;
++		if (vnode_open(path, FREAD, 0, 0, &vp, ctx) == 0) {
++			struct vnode_attr va;
++			VATTR_INIT(&va);
++			VATTR_WANTED(&va, va_data_size);
++			if (!vnode_getattr(vp, &va, ctx)) {
++				pf_dump_file(vp, path, va.va_data_size, ctx);
++			}
++			vnode_close(vp, FREAD, ctx);
++		}
++	}
 +}
 +
 +static void
 +pf_dump_files(vfs_context_t ctx)
 +{
 +	char list[256];
-+	if (!PE_parse_boot_argn("pandora_dumpfile", list, sizeof(list)) || list[0] == 0) {
-+		return;
++	if (PE_parse_boot_argn("pandora_dumpfile", list, sizeof(list)) && list[0] != 0) {
++		for (char *p = list; p && *p; ) {
++			char *comma = strchr(p, ',');
++			if (comma) {
++				*comma = 0;
++			}
++			if (p[0] == '/') {
++				pf_dump_path(p, ctx);
++			}
++			p = comma ? comma + 1 : NULL;
++		}
 +	}
-+	for (char *p = list; p && *p; ) {
-+		char *comma = strchr(p, ',');
-+		if (comma) {
-+			*comma = 0;
-+		}
-+		if (p[0] == '/') {
-+			pf_dump_path(p, ctx);
-+		}
-+		p = comma ? comma + 1 : NULL;
++	char spec[256];
++	if (PE_parse_boot_argn("pandora_dumpnewest", spec, sizeof(spec)) && spec[0] != 0) {
++		pf_dump_newest(spec, ctx);
 +	}
 +}
++
  #endif /* PANDORA */
