@@ -25,16 +25,20 @@
  out:
  	if (a) {
  		kfree_data(a, PF_CHUNK);
-@@ -392,4 +397,257 @@
+@@ -392,4 +397,318 @@
  		thread_deallocate(thread);
  	}
  }
 +
-+/* 0333/0334: diagnostic read-back for the console log. Boot-arg pandora_dumpfile takes a comma
-+ * separated list of absolute paths; a directory is listed, a file is printed as text. Boot-arg
-+ * pandora_dumpmatch=<substring> limits directory listings to matching names. Boot-arg
-+ * pandora_dumpnewest=<dir>,<prefix> prints the content of the newest file whose name starts with
-+ * prefix. Read only. */
++/* 0333/0334/0336: diagnostic read-back for the console log. Boot-arg pandora_dumpfile takes a
++ * comma separated list of absolute paths; a directory is listed, a file is printed as text.
++ * pandora_dumpmatch=<substring> limits listings to matching names. pandora_dumpnewest=<dir>,<prefix>
++ * prints the newest (mtime) matching file's content. Read only.
++ *
++ * HFS+ gives readdir entries in either the 32-bit or the 64-bit dirent layout depending on the
++ * call; d_reclen (at offset 4 or 16) is the packed step, d_namlen (at 7 or 18) the name length.
++ * The layout is detected from the first entry, so the walk stays aligned for both. */
++#define PF_NAME_MAX 255
 +static void
 +pf_dump_text(const char *tag, const uint8_t *b, unsigned n)
 +{
@@ -59,13 +63,19 @@
 +	}
 +}
 +
-+/* 0334: HFS+ readdir fills d_name but the step is d_namlen based (d_reclen is not reliable for
-+ * every entry; using it produced name fragments). */
-+static unsigned
-+pf_dirent_len(struct dirent *de)
++static int
++pf_contains(const char *hay, const char *needle)
 +{
-+	unsigned n = (unsigned)__builtin_offsetof(struct dirent, d_name) + (unsigned)de->d_namlen + 1;
-+	return (n + 7u) & ~7u;
++	size_t n = strlen(needle);
++	if (n == 0) {
++		return 1;
++	}
++	for (const char *p = hay; *p; p++) {
++		if (strncmp(p, needle, n) == 0) {
++			return 1;
++		}
++	}
++	return 0;
 +}
 +
 +static int
@@ -84,52 +94,103 @@
 +	return error;
 +}
 +
-+static int
-+pf_contains(const char *hay, const char *needle)
++/* Copy the entry names out of a readdir buffer, one name per slot. Returns the count. */
++static unsigned
++pf_names(uint8_t *buf, unsigned used, char (*names)[256], unsigned max, int *ext_out)
 +{
-+	size_t n = strlen(needle);
-+	if (n == 0) {
-+		return 1;
++	unsigned off = 0, n = 0;
++	int ext = -1;
++	if (used < 24) {
++		*ext_out = -1;
++		return 0;
 +	}
-+	for (const char *p = hay; *p; p++) {
-+		if (strncmp(p, needle, n) == 0) {
-+			return 1;
++	/* detect the layout from the first entry's d_reclen / name */
++	{
++		unsigned reclen32 = *(uint16_t *)(void *)(buf + 4);
++		unsigned reclen64 = *(uint16_t *)(void *)(buf + 16);
++		if (reclen32 >= 8 && reclen32 <= used && buf[7] >= 1 && buf[7] <= 255 &&
++		    buf[8] == '.') {
++			ext = 0;
++		} else if (reclen64 >= 8 && reclen64 <= used && *(uint16_t *)(void *)(buf + 18) >= 1 &&
++		    *(uint16_t *)(void *)(buf + 18) <= 255 && buf[21] == '.') {
++			ext = 1;
++		} else {
++			ext = (reclen64 >= 8 && reclen64 <= used) ? 1 : 0;
 +		}
 +	}
-+	return 0;
++	while (off + 8 < used && n < max) {
++		unsigned reclen, namlen;
++		const char *name;
++		if (ext) {
++			if (off + 21 > used) {
++				break;
++			}
++			reclen = *(uint16_t *)(void *)(buf + off + 16);
++			namlen = *(uint16_t *)(void *)(buf + off + 18);
++			name = (const char *)(buf + off + 21);
++		} else {
++			if (off + 8 > used) {
++				break;
++			}
++			reclen = *(uint16_t *)(void *)(buf + off + 4);
++			namlen = (unsigned)*(uint8_t *)(buf + off + 7);
++			name = (const char *)(buf + off + 8);
++		}
++		if (reclen < 8 || off + reclen > used) {
++			break;
++		}
++		if (namlen > PF_NAME_MAX) {
++			namlen = PF_NAME_MAX;
++		}
++		/* keep the name inside the record */
++		if ((ext ? 21u : 8u) + namlen > reclen) {
++			namlen = reclen - (ext ? 21u : 8u);
++		}
++		if (namlen > 0 && (reclen > 0)) {
++			unsigned k;
++			for (k = 0; k < namlen; k++) {
++				names[n][k] = name[k];
++			}
++			names[n][k] = 0;
++			n++;
++		}
++		off += reclen;
++	}
++	*ext_out = ext;
++	return n;
 +}
 +
 +static void
 +pf_dump_dir(vnode_t vp, const char *path, vfs_context_t ctx)
 +{
-+	uint8_t *buf = kalloc_data(131072, Z_WAITOK);
-+	if (buf == NULL) {
++	uint8_t *buf = kalloc_data(262144, Z_WAITOK);
++	char (*names)[256] = kalloc_data(2048 * 256, Z_WAITOK);
++	if (buf == NULL || names == NULL) {
++		if (buf) {
++			kfree_data(buf, 262144);
++		}
++		if (names) {
++			kfree_data(names, 2048 * 256);
++		}
 +		return;
 +	}
 +	unsigned used = 0;
 +	int num = 0;
-+	int error = pf_walk_dir(vp, ctx, buf, 131072, &used, &num);
++	int ext = -1;
++	int error = pf_walk_dir(vp, ctx, buf, 262144, &used, &num);
++	unsigned n = pf_names(buf, used, names, 2048, &ext);
 +	char match[64];
 +	int have = PE_parse_boot_argn("pandora_dumpmatch", match, sizeof(match)) && match[0] != 0;
-+	printf("PANDORA DUMP: dir %s: %u bytes, %d entries, err %d%s%s\n", path, used, num, error,
-+	    have ? ", match " : "", have ? match : "");
-+	for (unsigned off = 0; !error && off + 8 < used; ) {
-+		struct dirent *de = (struct dirent *)(void *)(buf + off);
-+		unsigned len = pf_dirent_len(de);
-+		if (len < 8 || off + len > used) {
-+			break;
-+		}
-+		off += len;
-+		if (de->d_name[0] == 0 || de->d_ino == 0) {
++	printf("PANDORA DUMP: dir %s: %u bytes, %d entries, err %d, layout %d, names %u%s%s\n", path,
++	    used, num, error, ext, n, have ? ", match " : "", have ? match : "");
++	for (unsigned i = 0; i < n; i++) {
++		if (have && !pf_contains(names[i], match)) {
 +			continue;
 +		}
-+		de->d_name[sizeof(de->d_name) - 1] = 0;
-+		if (have && !pf_contains(de->d_name, match)) {
-+			continue;
-+		}
-+		printf("PANDORA DUMP: dir %s/%s\n", path, de->d_name);
++		printf("PANDORA DUMP: dir %s/%s\n", path, names[i]);
 +	}
-+	kfree_data(buf, 131072);
++	kfree_data(buf, 262144);
++	kfree_data(names, 2048 * 256);
 +}
 +
 +static void
@@ -182,7 +243,6 @@
 +	vnode_close(vp, FREAD, ctx);
 +}
 +
-+/* pandora_dumpnewest=<dir>,<prefix>: the newest (mtime) entry whose name starts with prefix. */
 +static void
 +pf_dump_newest(const char *spec, vfs_context_t ctx)
 +{
@@ -200,34 +260,35 @@
 +		printf("PANDORA DUMP: newest: cannot open %s\n", dir);
 +		return;
 +	}
-+	uint8_t *buf = kalloc_data(131072, Z_WAITOK);
-+	if (buf == NULL) {
++	uint8_t *buf = kalloc_data(262144, Z_WAITOK);
++	char (*names)[256] = kalloc_data(2048 * 256, Z_WAITOK);
++	if (buf == NULL || names == NULL) {
++		printf("PANDORA DUMP: newest: no memory\n");
++		if (buf) {
++			kfree_data(buf, 262144);
++		}
++		if (names) {
++			kfree_data(names, 2048 * 256);
++		}
 +		vnode_close(dvp, FREAD, ctx);
 +		return;
 +	}
 +	unsigned used = 0;
-+	int num = 0;
-+	int error = pf_walk_dir(dvp, ctx, buf, 131072, &used, &num);
++	int num = 0, ext = -1;
++	int error = pf_walk_dir(dvp, ctx, buf, 262144, &used, &num);
 +	vnode_close(dvp, FREAD, ctx);
++	unsigned n = pf_names(buf, used, names, 2048, &ext);
++	printf("PANDORA DUMP: newest %s: %d entries, layout %d, names %u, prefix %s\n", dir, num, ext, n,
++	    prefix);
++	size_t plen = strlen(prefix);
 +	char best[256] = {0};
 +	int64_t best_time = 0;
-+	size_t plen = strlen(prefix);
-+	for (unsigned off = 0; !error && off + 8 < used; ) {
-+		struct dirent *de = (struct dirent *)(void *)(buf + off);
-+		unsigned len = pf_dirent_len(de);
-+		if (len < 8 || off + len > used) {
-+			break;
-+		}
-+		off += len;
-+		if (de->d_name[0] == 0 || de->d_ino == 0) {
-+			continue;
-+		}
-+		de->d_name[sizeof(de->d_name) - 1] = 0;
-+		if (strncmp(de->d_name, prefix, plen) != 0) {
++	for (unsigned i = 0; i < n; i++) {
++		if (strncmp(names[i], prefix, plen) != 0) {
 +			continue;
 +		}
 +		char path[512];
-+		snprintf(path, sizeof(path), "%s/%s", dir, de->d_name);
++		snprintf(path, sizeof(path), "%s/%s", dir, names[i]);
 +		vnode_t vp = NULLVP;
 +		if (vnode_open(path, FREAD, 0, 0, &vp, ctx)) {
 +			continue;
@@ -237,13 +298,13 @@
 +		VATTR_WANTED(&va, va_modify_time);
 +		if (!vnode_getattr(vp, &va, ctx) && (int64_t)va.va_modify_time.tv_sec >= best_time) {
 +			best_time = (int64_t)va.va_modify_time.tv_sec;
-+			strlcpy(best, de->d_name, sizeof(best));
++			strlcpy(best, names[i], sizeof(best));
 +		}
 +		vnode_close(vp, FREAD, ctx);
 +	}
-+	kfree_data(buf, 131072);
-+	printf("PANDORA DUMP: newest %s/%s (mtime %lld) out of %d entries\n", dir, best,
-+	    (long long)best_time, num);
++	kfree_data(buf, 262144);
++	kfree_data(names, 2048 * 256);
++	printf("PANDORA DUMP: newest %s/%s (mtime %lld)\n", dir, best, (long long)best_time);
 +	if (best[0]) {
 +		char path[512];
 +		snprintf(path, sizeof(path), "%s/%s", dir, best);
