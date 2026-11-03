@@ -1,0 +1,71 @@
+--- a/bsd/kern/bsd_init.c
++++ b/bsd/kern/bsd_init.c
+@@ -85,6 +85,7 @@
+ #include <sys/mount_internal.h>
+ #include <sys/proc_internal.h>
+ #include <sys/kauth.h>
++#include <sys/uio_internal.h>		/* enum uio_seg / UIO_SYSSPACE (patch 0340) */
+ #include <sys/systm.h>
+ #include <sys/vnode_internal.h>
+ #include <sys/conf.h>
+@@ -405,6 +406,51 @@
+ #endif
+ void set_rootvnode(vnode_t);
+ 
++/*
++ * Patch 0340 (replica of ios-asteroids xnu/patches/0106-sweet-ls-reset.patch):
++ * boot-arg sweetlsreset=1 deletes the LaunchServices database before launchd
++ * starts, so lsd re-seeds it. A database seeded while the extension catalog was
++ * unreadable (before patch 0339) is reused as "seeded" forever and keeps every
++ * app extension ignored, so pkd finds 0 plugins and PosterBoard has no wallpaper
++ * (reference: docs/EXTENSION_POINTS_2.md). One-shot: drop the boot-arg after.
++ * The reference hard-codes its image's InternalDaemon container UUID; this image
++ * creates that container on first boot, so the UUID comes from
++ * sweetlsreset_uuid=<UUID> (read from the data volume) and falls back to the
++ * reference UUID. The removal goes through VFS and its journal, like the
++ * reference.
++ */
++extern int unlink1(vfs_context_t, vnode_t, user_addr_t, enum uio_seg, int);
++
++static void
++sweet_ls_reset(void)
++{
++	static const char *const names[] = {
++		"com.apple.LaunchServices-4035-v2.csstore",
++		"com.apple.LaunchServices-4035-v2.csstore-journal",
++		"SystemDataOnly-com.apple.LaunchServices-4035-v2.csstore",
++		"com.apple.LaunchServices.error",
++		"com.apple.LaunchServices.syncInterrupted",
++	};
++	char uuid[64];
++	uint32_t on = 0;
++
++	if (!PE_parse_boot_argn("sweetlsreset", &on, sizeof(on)) || on != 1) {
++		return;
++	}
++	if (!PE_parse_boot_argn("sweetlsreset_uuid", uuid, sizeof(uuid)) || uuid[0] == 0) {
++		snprintf(uuid, sizeof(uuid), "%s", "3ED48A87-B795-429E-9BCB-E3502EA1A6EC");
++	}
++	for (unsigned i = 0; i < sizeof(names) / sizeof(names[0]); i++) {
++		char path[256];
++		snprintf(path, sizeof(path),
++		    "/private/var/mobile/Containers/Data/InternalDaemon/%s/Library/Caches/%s",
++		    uuid, names[i]);
++		int error = unlink1(vfs_context_kernel(), NULLVP, CAST_USER_ADDR_T(path),
++		    UIO_SYSSPACE, 0);
++		printf("SWEET LS: unlink %s -> %d\n", path, error);
++	}
++}
++
+ 
+ extern lck_rw_t rootvnode_rw_lock;
+ 
+@@ -1052,6 +1098,8 @@
+ 	bsd_init_kprintf("calling siginit\n");
+ 	siginit(kernproc);
+ 
++	sweet_ls_reset();
++
+ 	bsd_init_kprintf("calling bsd_utaskbootstrap\n");
+ 	bsd_utaskbootstrap();
+ 
