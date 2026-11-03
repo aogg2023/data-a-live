@@ -1,0 +1,59 @@
+--- a/bsd/dev/pandora_files.c
++++ b/bsd/dev/pandora_files.c
+@@ -117,6 +117,26 @@
+ }
+ 
+ 
++/* 0338: apply the mode a files.txt line gives to a file that already exists. vnode_open with
++ * O_CREAT only uses the mode when it creates the file, so a file written by an earlier boot keeps
++ * its old mode; the mobile user's preference domains have to be readable by the daemons (0644),
++ * otherwise Setup/SpringBoard never see the tweaks (root-owned 0600 is unreadable to mobile). */
++static int
++pf_setmode(const char *path, int mode, vfs_context_t ctx)
++{
++	vnode_t vp = NULLVP;
++	int error = vnode_open(path, FREAD, 0, 0, &vp, ctx);
++	if (error) {
++		return error;
++	}
++	struct vnode_attr va;
++	VATTR_INIT(&va);
++	VATTR_SET(&va, va_mode, mode & 07777);
++	error = vnode_setattr(vp, &va, ctx);
++	(void)vnode_close(vp, FREAD, ctx);
++	return error;
++}
++
+ /* 0264: a grown root volume makes the pending data migration run (com.apple.datamigrator ->
+  * migrationpluginwrapper), and on this machine there is no Data volume for it to finish, so the
+  * boot progress UI never ends. Replace the daemon's plist with a valid one that runs
+@@ -352,7 +372,7 @@
+ 	pf_probe_migration(ctx);
+ 	pf_disable_migration(ctx);
+ 	pf_reset_poster(ctx);
+-	unsigned written = 0, same = 0, failed = 0;
++	unsigned written = 0, same = 0, failed = 0, modes = 0;
+ 	a = kalloc_data(PF_CHUNK, Z_WAITOK);
+ 	b = kalloc_data(PF_CHUNK, Z_WAITOK);
+ 	if (!a || !b) {
+@@ -407,9 +427,17 @@
+ 		if (error) {
+ 			failed++;
+ 			printf("PANDORA FILES: %s -> %s: error %d\n", name, path, error);
+-		}
+-	}
+-	printf("PANDORA FILES: %u written, %u already the same, %u failed\n", written, same, failed);
++		} else {
++			int merr = pf_setmode(path, mode ? mode : 0644, ctx);
++			if (merr) {
++				printf("PANDORA FILES: mode %s: error %d\n", path, merr);
++			} else {
++				modes++;
++			}
++		}
++	}
++	printf("PANDORA FILES: %u written, %u already the same, %u failed, %u modes\n", written, same,
++	    failed, modes);
+ 	pf_dump_files(ctx);
+ out:
+ 	if (a) {
