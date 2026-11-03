@@ -1,0 +1,92 @@
+--- a/bsd/vfs/vfs_syscalls.c
++++ b/bsd/vfs/vfs_syscalls.c
+@@ -14655,6 +14655,11 @@
+ #if defined(PANDORA)
+ /* For bsd/dev/pandora_files.c: mkdir of a kernel-space path as the mkdir syscall makes it (patch 0185). */
+ int pandora_mkdir(const char *path, int mode);
++/* 0336: for bsd/dev/pandora_files.c: remove a file (unlink) and an empty directory (rmdir) by absolute
++ * path through the same VFS code the syscalls use, so the HFS journal stays consistent. Used to move
++ * the inherited PosterBoard data store out of the way (pandora_poster_reset=1). */
++int pandora_rmdir(const char *path);
++int pandora_unlink(const char *path);
+ 
+ int
+ pandora_mkdir(const char *path, int mode)
+@@ -14665,4 +14670,16 @@
+ 	VATTR_SET(&va, va_mode, mode & ACCESSPERMS);
+ 	return mkdir1at(vfs_context_kernel(), CAST_USER_ADDR_T(path), &va, AT_FDCWD, UIO_SYSSPACE);
+ }
++
++int
++pandora_rmdir(const char *path)
++{
++	return rmdirat_internal(vfs_context_kernel(), AT_FDCWD, CAST_USER_ADDR_T(path), UIO_SYSSPACE, 0);
++}
++
++int
++pandora_unlink(const char *path)
++{
++	return unlinkat_internal(vfs_context_kernel(), AT_FDCWD, NULLVP, CAST_USER_ADDR_T(path), UIO_SYSSPACE, 0);
++}
+ #endif /* PANDORA */
+--- a/bsd/dev/pandora_files.c
++++ b/bsd/dev/pandora_files.c
+@@ -31,6 +31,8 @@
+ extern int pandora_fw_read(uint64_t off, void *dst, uint64_t len);
+ extern vnode_t rootvnode;
+ extern int pandora_mkdir(const char *path, int mode);   /* bsd/vfs/vfs_syscalls.c (patch 0185) */
++extern int pandora_rmdir(const char *path);    /* bsd/vfs/vfs_syscalls.c (patch 0336) */
++extern int pandora_unlink(const char *path);   /* bsd/vfs/vfs_syscalls.c (patch 0336) */
+ void pandora_files_init(void);
+ static void pf_dump_files(vfs_context_t ctx);
+ 
+@@ -276,6 +278,41 @@
+ 	}
+ }
+ 
++/* 0336: PosterBoard inherits a data store from the migrated donor data volume
++ * (/private/var/mobile/Library/Application Support/PRBPosterExtensionDataStore: an empty
++ * 59/{Extensions,GalleryCache} tree plus its preferences). On such a partial store PosterBoard's
++ * first-time switcher setup hits NSAssert(!_stateLock_switcherConfiguration) and traps. With
++ * pandora_poster_reset=1 remove the inherited store (its empty directories, then its preferences)
++ * so PosterBoard starts from a clean state. Does nothing by default. */
++static void
++pf_reset_poster(vfs_context_t ctx)
++{
++	int on = 0;
++	static const char *const dirs[] = {
++		"/private/var/mobile/Library/Application Support/PRBPosterExtensionDataStore/59/Extensions",
++		"/private/var/mobile/Library/Application Support/PRBPosterExtensionDataStore/59/GalleryCache",
++		"/private/var/mobile/Library/Application Support/PRBPosterExtensionDataStore/59",
++		"/private/var/mobile/Library/Application Support/PRBPosterExtensionDataStore",
++	};
++	static const char *const files[] = {
++		"/private/var/mobile/Library/Preferences/com.apple.PosterBoard.plist",
++		"/private/var/mobile/Library/Preferences/com.apple.PosterBoard.unprotectedUserDefaults.plist",
++	};
++	(void)ctx;
++	(void)PE_parse_boot_argn("pandora_poster_reset", &on, sizeof(on));
++	if (!on) {
++		return;
++	}
++	for (unsigned i = 0; i < sizeof(dirs) / sizeof(dirs[0]); i++) {
++		int error = pandora_rmdir(dirs[i]);
++		printf("PANDORA POSTER RESET: rmdir %s: %d\n", dirs[i], error);
++	}
++	for (unsigned i = 0; i < sizeof(files) / sizeof(files[0]); i++) {
++		int error = pandora_unlink(files[i]);
++		printf("PANDORA POSTER RESET: unlink %s: %d\n", files[i], error);
++	}
++}
++
+ static void
+ pf_thread(void *arg, wait_result_t result)
+ {
+@@ -314,6 +351,7 @@
+ 	pf_probe_launchd_files(ctx);
+ 	pf_probe_migration(ctx);
+ 	pf_disable_migration(ctx);
++	pf_reset_poster(ctx);
+ 	unsigned written = 0, same = 0, failed = 0;
+ 	a = kalloc_data(PF_CHUNK, Z_WAITOK);
+ 	b = kalloc_data(PF_CHUNK, Z_WAITOK);
