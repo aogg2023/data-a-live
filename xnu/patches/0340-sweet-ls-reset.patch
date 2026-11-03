@@ -57,10 +57,10 @@
 +	}
 +}
 +
- 
  extern lck_rw_t rootvnode_rw_lock;
  
-@@ -1052,6 +1098,8 @@
+ SECURITY_READ_ONLY_LATE(struct mach_vm_range) bsd_pageable_range = {};
+@@ -1051,6 +1097,8 @@
  	bsd_init_kprintf("calling siginit\n");
  	siginit(kernproc);
  
