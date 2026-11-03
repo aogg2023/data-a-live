@@ -1,0 +1,30 @@
+--- a/bsd/vfs/kpi_vfs.c
++++ b/bsd/vfs/kpi_vfs.c
+@@ -3737,6 +3737,13 @@
+ 	uio_free(uio);
+ 	vap->va_dataprotect_class = class;
+ 	VATTR_SET_SUPPORTED(vap, va_dataprotect_class);
++	{
++		static int probes;
++		if (probes < 12) {
++			probes++;
++			printf("PANDORA DPT: getattr pid %d class %u\n", proc_pid(current_proc()), class);
++		}
++	}
+ }
+ 
+ /* Keep the class asked for and take it out of what the file system is asked to set
+@@ -3750,6 +3757,13 @@
+ 		return;
+ 	}
+ 	uio_addiov(uio, CAST_USER_ADDR_T(&class), sizeof(class));
++	{
++		static int probes;
++		if (probes < 12) {
++			probes++;
++			printf("PANDORA DPT: setattr pid %d class %u\n", proc_pid(current_proc()), class);
++		}
++	}
+ 	if (vn_setxattr(vp, SWEET_DATAPROTECT_XATTR, uio, XATTR_NOSECURITY, ctx) == 0) {
+ 		VATTR_SET_SUPPORTED(vap, va_dataprotect_class);
+ 		VATTR_CLEAR_ACTIVE(vap, va_dataprotect_class);
