@@ -2,7 +2,7 @@ diff --git a/bsd/dev/songyuan_wlan.c b/bsd/dev/songyuan_wlan.c
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/songyuan_wlan.c
-@@ -0,0 +1,688 @@
+@@ -0,0 +1,687 @@
 +/*
 + * SONGYUAN WLAN, M1: bring up PCIe root complex 0 and read the WCN786x
 + * (17cb:110e) that sits behind it.
@@ -109,8 +109,6 @@ new file mode 100644
 +#define LINK_ACTIVE	0x20000000UL
 +#define PHY_STATUS	0x00000414UL	/* qcom,phy-status-offset, bit qcom,phy-status-bit=7 */
 +#define PHY_STATUS_BIT	0x00000080UL
-+#define PHY_SW_RESET	0x00001400UL	/* last two entries of the DT sequence */
-+#define PHY_START	0x00001444UL
 +
 +/* ---- iATU (pci-msm.c msm_pcie_iatu_config_shift) ---- */
 +#define IATU_REGION(n)	(0x200UL * (n))
@@ -398,7 +396,6 @@ new file mode 100644
 +		GCC_SLV_AXI, GCC_MSTR_AXI, GCC_CFG_AHB, GCC_AUX, GCC_Q2A, GCC_CNOC_SF
 +	};
 +
-+	sy_wr(gcc, GCC_VOTE_RSCC, sy_rd(gcc, GCC_VOTE_RSCC) | (1UL << 20) | (1UL << 21));
 +	if (!sy_gdsc_on(GCC_GDSC_PCIE, "root complex 0's power domain") ||
 +	    !sy_gdsc_on(GCC_GDSC_PHY, "the PHY's power domain")) {
 +		return false;
@@ -409,7 +406,7 @@ new file mode 100644
 +	}
 +	sy_wr(tcsr, SY_TCSR_CLKREF, sy_rd(tcsr, SY_TCSR_CLKREF) | 1);
 +	sy_usleep(10);
-+	sy_wr(gcc, GCC_VOTE_BRANCH, sy_rd(gcc, GCC_VOTE_BRANCH) | 0x2f);	/* without pipe (bit4) */
++	sy_wr(gcc, GCC_VOTE_BRANCH, sy_rd(gcc, GCC_VOTE_BRANCH) | 0x6f);	/* slv/mstr/cfg/aux/q2a/cnoc_sf, pipe added with the PHY */
 +	sy_wr(gcc, GCC_VOTE_BRANCH2, sy_rd(gcc, GCC_VOTE_BRANCH2) |
 +	    (1UL << 12) | (1UL << 19) | (1UL << 22));
 +	for (unsigned i = 0; i < ARRAY_SIZE(branches); i++) {
@@ -454,7 +451,7 @@ new file mode 100644
 +	sy_wr(parf, PARF_DBI_BASE + 4, 0);
 +	sy_wr(parf, PARF_ATU_BASE, (uint32_t)SY_IATU_PA);
 +	sy_wr(parf, PARF_ATU_BASE + 4, 0);
-+	sy_wr(parf, PARF_SYS_CTRL, sy_rd(parf, PARF_SYS_CTRL) & ~(1UL << 29));
++	sy_wr(parf, PARF_SYS_CTRL, 0x365e);	/* pci-msm.c msm_pcie_enable_link */
 +	sy_wr(parf, 0x174, sy_rd(parf, 0x174) | (1UL << 4));	/* MHI_CLOCK_RESET_CTRL bypass */
 +	sy_wr(parf, 0x020, sy_rd(parf, 0x020) & ~(1UL << 5));	/* PM_CTRL: no L1 entry */
 +	sy_wr(parf, 0x1a8, sy_rd(parf, 0x1a8) | (1UL << 31));	/* AXI_MSTR_WR_ADDR_HALT */
@@ -465,17 +462,19 @@ new file mode 100644
 +static bool
 +sy_phy_start(void)
 +{
++	/* pci-msm.c pcie_phy_init: the device tree sequence is written in order (its last
++	 * entries are the PCS SW_RESET and START_CONTROL writes), the PHY is given time to
++	 * stabilise, then the pipe clock is enabled and PHYSTATUS is awaited (bit set = the
++	 * PHY is not ready). */
 +	for (unsigned i = 0; i < ARRAY_SIZE(sy_phy_seq); i++) {
 +		sy_wr(phy, sy_phy_seq[i][0], sy_phy_seq[i][1]);
 +	}
-+	sy_wr(gcc, GCC_PIPE_MUX, sy_rd(gcc, GCC_PIPE_MUX) & ~3UL);	/* PHY pipe */
++	sy_usleep(1000);
++	sy_wr(gcc, GCC_PIPE_MUX, sy_rd(gcc, GCC_PIPE_MUX) & ~3UL);	/* the PHY's pipe clock */
 +	sy_wr(gcc, GCC_VOTE_BRANCH, sy_rd(gcc, GCC_VOTE_BRANCH) | (1UL << 4));
 +	if (!sy_poll(gcc, GCC_PIPE, CBCR_CLK_OFF, 0, 10, 1000, "the pipe clock")) {
 +		return false;
 +	}
-+	sy_wr(phy, PHY_SW_RESET, 0);
-+	sy_wr(phy, PHY_START, 3);
-+	sy_usleep(1200);
 +	if (!sy_poll(phy, PHY_STATUS, PHY_STATUS_BIT, 0, 200, 20000, "the PHY's PHYSTATUS")) {
 +		return false;
 +	}
