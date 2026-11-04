@@ -333,7 +333,7 @@
  
  static int cv_chan;
  
-@@ -51,21 +360,764 @@
+@@ -51,21 +360,889 @@
  		cv_sleep(100);
  	}
  	if (rootvnode == NULLVP) {
@@ -432,10 +432,6 @@
 +#define SY_TCSR_PA	0x01fd5000UL	/* /soc/clock-controller@1fd5044 qcom,canoe-tcsrcc */
 +#define SY_TCSR_SIZE	0x00001000UL
 +#define SY_TCSR_CLKREF	0x00000044UL	/* node start 0x1fd5044, tcsr_pcie_0_clkref_en reg 0 */
-+#define SY_RSC_PA	0x18920000UL	/* /soc/rsc@18900000 drv-2 */
-+#define SY_RSC_SIZE	0x00010000UL
-+#define SY_CMDDB_PA	0x81c60000UL	/* /reserved-memory/aop_cmd_db_region */
-+#define SY_CMDDB_SIZE	0x00020000UL
 +
 +/* ---- GCC (gcc-canoe.c) ---- */
 +#define GCC_GDSC_PCIE	0x0006b004UL	/* gcc_pcie_0_gdsc.gdscr */
@@ -570,130 +566,248 @@
 +	}
 +}
 +
-+/* ---- RPMh: command database and one TCS of apps RSC DRV-2 ---------------------- */
++/* ---- RPMh: command database and one ACTIVE TCS of apps RSC DRV-2
++ * This is songyuan_touch.c's proven vote (same phone, same RSC), generalised to
++ * any regulator resource: the layout is picked from the RSC version and the
++ * completion is read from the TCS and per-command status, not from an IRQ. */
++#define SY_RSC_PA	0x18920000u	/* live DT rsc@18900000 drv-2 */
++#define SY_RSC_SIZE	0x10000u	/* live DT drv-2 reg size */
++#define SY_CMDDB_PA	0x81c60000u	/* live DT aop_cmd_db_region@81c60000 */
++#define SY_CMDDB_SIZE	0x20000u	/* live DT aop_cmd_db_region size */
++#define SY_TCS_OFF	0xd00u		/* live DT qcom,tcs-offset */
++#define SY_TCS_STRIDE	0x2a0u		/* live DT qcom,tcs-distance */
++#define SY_TCS_ACTIVE	3u		/* live DT qcom,tcs-config: ACTIVE x3 */
++#define SY_RSC_DRV	2u		/* live DT qcom,drv-id */
++#define SY_VRM_MV	1800u		/* live DT regulator-min-microvolt */
++#define SY_VRM_MODE	7u		/* high power mode (PAND:787) */
++#define SY_VRM_ENABLE	1u		/* enable (PAND:787) */
++#define SY_RPMH_WRITE	(8u | (1u << 8) | (1u << 16))	/* PAND:669: write, 4-byte, ack */
++#define SY_RPMH_AMC	(1u << 16)	/* PAND:796: ACTIVE mode command */
++#define SY_RPMH_DONE	0x10100u	/* PAND:806: issued | complete */
++#define SY_RPMH_TRIGGER	(1u << 24)	/* PAND:799: start the TCS */
++#define SY_CMDDB_MAGIC	0x0c0330dbu	/* PAND:670 */
++#define SY_CMDDB_HEADER	144u		/* PAND:671 */
++#define SY_CMDDB_ENTRY	24u		/* PAND:672 */
 +
-+struct sy_cmddb_slave {
-+	uint16_t id, header_offset, data_offset, count, version, reserved[3];
++struct sy_rpmh_layout {
++	uint32_t wait, control, status, enable, msgid, addr, data, cmd_status, cmd_stride;
 +};
-+struct sy_cmddb_header {
-+	uint32_t version;
-+	uint8_t magic[4];
-+	struct sy_cmddb_slave slave[8];
-+	uint32_t checksum, reserved;
-+	uint8_t data[];
-+};
-+struct sy_cmddb_entry {
-+	char id[8];
-+	uint32_t priority[2];
-+	uint32_t address;
-+	uint16_t length, offset;
-+};
++static const struct sy_rpmh_layout sy_rpmh_v2 = {0x10, 0x14, 0x18, 0x1c, 0x30, 0x34, 0x38, 0x3c, 20};
++static const struct sy_rpmh_layout sy_rpmh_v3 = {0x20, 0x24, 0x28, 0x2c, 0x34, 0x38, 0x3c, 0x40, 24};
 +
-+#define RSC_TCS_BASE	(0x0d00UL + 2UL * 0x02a0UL)	/* set 2, rpmh-rsc v3 layout */
-+#define TCS_WAIT	(RSC_TCS_BASE + 0x20UL)
-+#define TCS_CONTROL	(RSC_TCS_BASE + 0x24UL)
-+#define TCS_STATUS	(RSC_TCS_BASE + 0x28UL)
-+#define TCS_ENABLE	(RSC_TCS_BASE + 0x2cUL)
-+#define TCS_MSGID(n)	(RSC_TCS_BASE + 0x34UL + 24UL * (n))
-+#define TCS_ADDR(n)	(TCS_MSGID(n) + 4UL)
-+#define TCS_DATA(n)	(TCS_MSGID(n) + 8UL)
-+#define TCS_BIT		(1UL << 2)
-+#define RSC_IRQ_EN	0x0d00UL
-+#define RSC_IRQ_STATUS	0x0d04UL
-+#define RSC_IRQ_CLEAR	0x0d08UL
-+#define TCS_CONTROL_ENABLE (1UL << 16)
-+#define TCS_CONTROL_TRIGGER (1UL << 24)
-+#define MSGID_WRITE_RESPONSE 0x10108UL
-+#define VRM_VOLTAGE	0UL
-+#define VRM_ENABLE	4UL
-+#define VRM_MODE	8UL
-+#define VRM_MODE_LDO_HPM 7UL
-+#define VRM_CLOCK_ENABLE 4UL
-+#define CMD_DB_VRM	4UL
++static vm_offset_t sy_rsc, sy_cmddb;
++static bool sy_rpmh_tried;	/* the vote runs once per boot */
++static int sy_rpmh_result;	/* 0: the vote landed, else its errno */
 +
-+static uint32_t
-+sy_rpmh_address(const char *name)
++static uint16_t
++sy_cmddb16(uint32_t off)
 +{
-+	const struct sy_cmddb_header *db = (const struct sy_cmddb_header *)cmddb;
-+	char id[8] = { 0 };
++	return (uint16_t)(sy_rd(sy_cmddb, off & ~3u) >> (8u * (off & 3u)));
++}
 +
-+	if (db->magic[0] != 0xdb || db->magic[1] != 0x30 || db->magic[2] != 0x03 ||
-+	    db->magic[3] != 0x0c) {
-+		printf("PANDORA WLAN: command database magic is %02x%02x%02x%02x\n",
-+		    db->magic[3], db->magic[2], db->magic[1], db->magic[0]);
-+		return 0;
-+	}
-+	strlcpy(id, name, sizeof(id));
-+	for (unsigned s = 0; s < 8; s++) {
-+		const struct sy_cmddb_slave *slave = &db->slave[s];
-+		const struct sy_cmddb_entry *entry;
-+
-+		if (slave->id == 0 || slave->header_offset >= SY_CMDDB_SIZE - 0x1000 ||
-+		    slave->count > 512) {
-+			continue;
++/* PAND:722-734: write, then read back until the register keeps the value. */
++static bool
++sy_rpmh_sync(uint32_t off, uint32_t v)
++{
++	sy_wr(sy_rsc, off, v);
++	for (unsigned i = 0; i < 1000; i++) {
++		if (sy_rd(sy_rsc, off) == v) {
++			return true;
 +		}
-+		entry = (const struct sy_cmddb_entry *)(db->data + slave->header_offset);
-+		for (unsigned i = 0; i < slave->count; i++) {
-+			if (memcmp(entry[i].id, id, sizeof(id)) == 0) {
-+				return entry[i].address;
++		delay(1);
++	}
++	return false;
++}
++
++/* PAND:682-720: the resource's RPMh address out of the cmd-db (slave 4 = VRM). */
++static int
++sy_rpmh_lookup(const char *res, uint32_t *address)
++{
++	uint32_t key[2] = {0, 0};
++	for (unsigned i = 0; i < 8 && res[i]; i++) {
++		key[i / 4] |= (uint32_t)(uint8_t)res[i] << (8u * (i % 4));
++	}
++	unsigned matches = 0;
++	for (unsigned i = 0; i < 8; i++) {
++		uint32_t h = 8u + 16u * i;
++		unsigned slave = sy_cmddb16(h);
++		if (!slave) {
++			break;
++		}
++		uint32_t entries = SY_CMDDB_HEADER + sy_cmddb16(h + 2);
++		unsigned count = sy_cmddb16(h + 6);
++		if ((entries & 3u) || entries + count * SY_CMDDB_ENTRY > SY_CMDDB_SIZE) {
++			printf("PANDORA WLAN: cmd-db slave header %u malformed\n", i);
++			return EINVAL;
++		}
++		for (unsigned j = 0; j < count; j++) {
++			uint32_t e = entries + SY_CMDDB_ENTRY * j;
++			if (sy_rd(sy_cmddb, e) != key[0] || sy_rd(sy_cmddb, e + 4) != key[1]) {
++				continue;
++			}
++			uint32_t addr = sy_rd(sy_cmddb, e + 16);
++			printf("PANDORA WLAN: cmd-db %s addr=%#x slave=%u\n", res, addr, slave);
++			if (slave == 4 && ((addr >> 16) & 7u) == 4 && !(addr & 15u)) {
++				*address = addr;
++				matches++;
 +			}
 +		}
++	}
++	if (matches != 1) {
++		printf("PANDORA WLAN: cmd-db %s: %u VRM matches; not voting\n", res, matches);
++		return ENODEV;
 +	}
 +	return 0;
 +}
 +
-+static uint32_t
-+sy_rpmh_vrm(const char *name)
++/*
++ * PAND:736-825: one ACTIVE TCS carries the three commands of the vote
++ * (voltage, mode, enable); the RSC is triggered and reports completion in the
++ * TCS status and in each command's status. Only this TCS's interrupt enable bit
++ * is touched, and it is put back. The first call's outcome is kept, so a second
++ * call cannot arm a second request for the same rail.
++ */
++static int
++sy_rpmh_vote_res(const char *res, uint32_t mv, uint32_t mode, bool ldo)
 +{
-+	static char lower[9], upper[9];
-+	uint32_t addr = sy_rpmh_address(name);
++	const struct sy_rpmh_layout *L = NULL;
++	uint32_t id = 0, config = 0, magic = 0, address = 0;
++	uint32_t major, minor, ntcs, ncpt, b = 0, bit = 0, irq_en = 0;
++	uint32_t word[3] = {0, 0, 0}, cs[3] = {0, 0, 0};
++	uint32_t vals[3] = {mv, SY_VRM_ENABLE, mode};
++	/* voltage, enable, mode: an LDO also gets its mode voted, an SMPS does not */
++	static const uint32_t offs[3] = {0, 4, 8};
++	unsigned t = 0;
++	unsigned ncmd = ldo ? 3u : 2u;
++	int chosen = -1, rc = 0;
++	bool done = false;
 +
-+	if (addr != 0) {
-+		return addr;
++	if (!sy_rsc) {
++		sy_rsc = ml_io_map(SY_RSC_PA, SY_RSC_SIZE);
++		sy_cmddb = ml_io_map(SY_CMDDB_PA, SY_CMDDB_SIZE);
++		if (!sy_rsc || !sy_cmddb) {
++			printf("PANDORA WLAN: RPMh: RSC/cmd-db mapping failed\n");
++			return ENOMEM;
++		}
 +	}
-+	for (unsigned i = 0; i < 8 && name[i]; i++) {
-+		char c = name[i];
-+		lower[i] = (c >= 'A' && c <= 'Z') ? (char)(c - 'A' + 'a') : c;
-+		upper[i] = (c >= 'a' && c <= 'z') ? (char)(c - 'a' + 'A') : c;
++	id = sy_rd(sy_rsc, 0);
++	config = sy_rd(sy_rsc, 0x0c);
++	major = (id >> 16) & 0xffu;
++	minor = (id >> 8) & 0xffu;
++	ntcs = (config >> (6u * SY_RSC_DRV)) & 0x3fu;
++	ncpt = (config >> 27) & 0x1fu;
++	printf("PANDORA WLAN: RPMh: rsc=%#x id=%#x (v%u.%u) solver=%#x config=%#x tcs=%u ncpt=%u\n",
++	    SY_RSC_PA, id, major, minor, sy_rd(sy_rsc, 4), config, ntcs, ncpt);
++	/* Linux uses the 3.0 layout for every major >= 3 (PAND:751-756). */
++	L = major >= 3 ? &sy_rpmh_v3 : (major == 2 ? &sy_rpmh_v2 : NULL);
++	if (!L || ntcs < SY_TCS_ACTIVE || ntcs > 16 || ncpt < 3 || ncpt > 16) {
++		printf("PANDORA WLAN: RPMh: RSC v%u.%u layout/geometry not known (tcs %u, "
++		    "ncpt %u); not voting\n", major, minor, ntcs, ncpt);
++		rc = ENODEV;
++		goto out;
 +	}
-+	lower[8] = upper[8] = 0;
-+	addr = sy_rpmh_address(lower);
-+	if (addr == 0) {
-+		addr = sy_rpmh_address(upper);
++	magic = sy_rd(sy_cmddb, 4);
++	printf("PANDORA WLAN: RPMh: cmd-db %#x size %#x version=%#x magic=%#x\n",
++	    SY_CMDDB_PA, SY_CMDDB_SIZE, sy_rd(sy_cmddb, 0), magic);
++	if (magic != SY_CMDDB_MAGIC) {
++		printf("PANDORA WLAN: RPMh: cmd-db magic %#x is not %#x; not voting\n",
++		    magic, SY_CMDDB_MAGIC);
++		rc = ENODEV;
++		goto out;
 +	}
-+	return addr;
++	if ((rc = sy_rpmh_lookup(res, &address))) {
++		goto out;
++	}
++	for (t = 0; t < SY_TCS_ACTIVE; t++) {
++		b = SY_TCS_OFF + t * SY_TCS_STRIDE;
++		uint32_t st = sy_rd(sy_rsc, b + L->status), ctl = sy_rd(sy_rsc, b + L->control);
++		uint32_t en = sy_rd(sy_rsc, b + L->enable), wt = sy_rd(sy_rsc, b + L->wait);
++		printf("PANDORA WLAN: RPMh: ACTIVE TCS%u idle=%#x control=%#x enable=%#x wait=%#x\n",
++		    t, st, ctl, en, wt);
++		if (chosen < 0 && st != 0 && st != 0xffffffffu && ctl == 0 && en == 0 && wt == 0 &&
++		    !(sy_rd(sy_rsc, SY_TCS_OFF + 4) & (1u << t))) {
++			chosen = (int)t;
++		}
++	}
++	if (chosen < 0) {
++		printf("PANDORA WLAN: RPMh: no free ACTIVE TCS; not voting\n");
++		rc = EBUSY;
++		goto out;
++	}
++	{
++		unsigned tc = (unsigned)chosen;
++		t = tc;
++		b = SY_TCS_OFF + tc * SY_TCS_STRIDE;
++		bit = 1u << tc;
++	}
++	irq_en = sy_rd(sy_rsc, SY_TCS_OFF);
++	if (!sy_rpmh_sync(SY_TCS_OFF, irq_en & ~bit)) {
++		printf("PANDORA WLAN: RPMh: IRQ enable readback failed (want %#x, got %#x)\n",
++		    irq_en & ~bit, sy_rd(sy_rsc, SY_TCS_OFF));
++		rc = EIO;
++		goto out;
++	}
++	for (unsigned c = 0; c < ncmd; c++) {
++		uint32_t cmd = b + c * L->cmd_stride;
++		word[c] = address + offs[c];
++		if (!sy_rpmh_sync(cmd + L->msgid, SY_RPMH_WRITE) ||
++		    !sy_rpmh_sync(cmd + L->addr, word[c]) ||
++		    !sy_rpmh_sync(cmd + L->data, vals[c])) {
++			printf("PANDORA WLAN: RPMh: command %u write failed: msgid %#x (want %#x), "
++			    "addr %#x (want %#x), data %#x (want %u); id=%#x (v%u.%u)\n", c,
++			    sy_rd(sy_rsc, cmd + L->msgid), SY_RPMH_WRITE,
++			    sy_rd(sy_rsc, cmd + L->addr), word[c],
++			    sy_rd(sy_rsc, cmd + L->data), vals[c], id, major, minor);
++			rc = EIO;
++			goto restore;
++		}
++	}
++	if (!sy_rpmh_sync(b + L->wait, (1u << ncmd) - 1u) ||
++	    !sy_rpmh_sync(b + L->enable, (1u << ncmd) - 1u) ||
++	    !sy_rpmh_sync(b + L->control, 0) || !sy_rpmh_sync(b + L->control, SY_RPMH_AMC)) {
++		printf("PANDORA WLAN: RPMh: TCS%u arm failed: wait=%#x enable=%#x control=%#x "
++		    "(want 7, 7, %#x), irq-enable=%#x, commands %#x/%#x/%#x = %u/%u/%u\n",
++		    t, sy_rd(sy_rsc, b + L->wait), sy_rd(sy_rsc, b + L->enable),
++		    sy_rd(sy_rsc, b + L->control), SY_RPMH_AMC, sy_rd(sy_rsc, SY_TCS_OFF),
++		    word[0], word[1], word[2], vals[0], vals[1], vals[2]);
++		rc = EIO;
++		goto restore;
++	}
++	sy_wr(sy_rsc, b + L->control, SY_RPMH_AMC | SY_RPMH_TRIGGER);
++	for (unsigned us = 0; us < 100000 && !done; us++) {
++		bool all = true;
++		for (unsigned c = 0; c < ncmd; c++) {
++			cs[c] = sy_rd(sy_rsc, b + L->cmd_status + c * L->cmd_stride);
++			all &= cs[c] != 0xffffffffu && (cs[c] & SY_RPMH_DONE) == SY_RPMH_DONE;
++		}
++		done = all && sy_rd(sy_rsc, b + L->status) != 0;
++		if (!done) {
++			delay(1);
++		}
++	}
++	printf("PANDORA WLAN: RPMh: %s %u mV/mode %u/enable on TCS%u done=%d irq=%#x "
++	    "status=%#x cmd-status=%#x/%#x/%#x\n", res, mv, mode, t, done,
++	    sy_rd(sy_rsc, SY_TCS_OFF + 4), sy_rd(sy_rsc, b + L->status),
++	    cs[0], cs[1], cs[2]);
++	if (!done) {
++		printf("PANDORA WLAN: RPMh: %s vote timed out: rsc id=%#x (v%u.%u), "
++		    "commands %#x/%#x/%#x = %u/%u/%u, control=%#x status=%#x\n", res, id,
++		    major, minor, word[0], word[1], word[2], vals[0], vals[1], vals[2],
++		    sy_rd(sy_rsc, b + L->control), sy_rd(sy_rsc, b + L->status));
++		rc = ETIMEDOUT;
++	}
++restore:
++	/* Proven or not, return the TCS to idle and put the interrupt mask back. */
++	(void)sy_rpmh_sync(b + L->control, SY_RPMH_AMC);
++	(void)sy_rpmh_sync(b + L->control, 0);
++	(void)sy_rpmh_sync(b + L->enable, 0);
++	(void)sy_rpmh_sync(b + L->wait, 0);
++	sy_wr(sy_rsc, SY_TCS_OFF + 8, bit);	/* W1C: only our TCS's bit */
++	(void)sy_rpmh_sync(SY_TCS_OFF, irq_en);
++out:
++	return rc;
 +}
 +
-+static bool
-+sy_rpmh_write(const uint32_t *address, const uint32_t *data, unsigned count)
-+{
-+	uint32_t mask = (1UL << count) - 1;
-+
-+	if (sy_rd(rsc, TCS_STATUS) == 0 || (sy_rd(rsc, TCS_CONTROL) & TCS_CONTROL_TRIGGER) != 0) {
-+		printf("PANDORA WLAN: RPMh set 2 busy (status %#x control %#x)\n",
-+		    sy_rd(rsc, TCS_STATUS), sy_rd(rsc, TCS_CONTROL));
-+		return false;
-+	}
-+	sy_wr(rsc, TCS_CONTROL, 0);
-+	sy_wr(rsc, RSC_IRQ_CLEAR, TCS_BIT);
-+	for (unsigned i = 0; i < count; i++) {
-+		sy_wr(rsc, TCS_MSGID(i), MSGID_WRITE_RESPONSE);
-+		sy_wr(rsc, TCS_ADDR(i), address[i]);
-+		sy_wr(rsc, TCS_DATA(i), data[i]);
-+	}
-+	sy_wr(rsc, TCS_WAIT, mask);
-+	sy_wr(rsc, TCS_ENABLE, mask);
-+	sy_wr(rsc, RSC_IRQ_EN, sy_rd(rsc, RSC_IRQ_EN) | TCS_BIT);
-+	sy_wr(rsc, TCS_CONTROL, TCS_CONTROL_ENABLE);
-+	sy_wr(rsc, TCS_CONTROL, TCS_CONTROL_ENABLE | TCS_CONTROL_TRIGGER);
-+	bool done = sy_poll(rsc, RSC_IRQ_STATUS, TCS_BIT, TCS_BIT, 100, 200000, "the RPMh completion");
-+	sy_wr(rsc, TCS_CONTROL, 0);
-+	sy_wr(rsc, TCS_ENABLE, 0);
-+	sy_wr(rsc, TCS_WAIT, 0);
-+	sy_wr(rsc, RSC_IRQ_CLEAR, TCS_BIT);
-+	sy_wr(rsc, RSC_IRQ_EN, sy_rd(rsc, RSC_IRQ_EN) & ~TCS_BIT);
-+	return done;
-+}
 +
 +/* The card's seven rails: live DT vdd-wlan-*-supply -> rpmh-regulator node ->
 + * qcom,resource-name and qcom,init-voltage; min/max are the regulator's range. */
@@ -715,34 +829,20 @@
 +static bool
 +sy_supplies_on(void)
 +{
-+	uint32_t found[SY_SUPPLY_N];
-+	bool all = true;
-+
-+	for (unsigned i = 0; i < SY_SUPPLY_N; i++) {
-+		found[i] = sy_rpmh_vrm(sy_supplies[i].name);
-+		printf("PANDORA WLAN: %s for %s at RPMh %#x\n", sy_supplies[i].name,
-+		    sy_supplies[i].what, found[i]);
-+		if (found[i] == 0 || (found[i] >> 16 & 0xf) != CMD_DB_VRM) {
-+			all = false;
-+		}
-+	}
-+	if (!all) {
-+		printf("PANDORA WLAN: a supply is missing or not a regulator; nothing is voted\n");
-+		return false;
-+	}
 +	for (unsigned i = 0; i < SY_SUPPLY_N; i++) {
 +		const struct sy_supply *s = &sy_supplies[i];
-+		uint32_t address[3] = { found[i] + VRM_VOLTAGE, found[i] + VRM_ENABLE,
-+		    found[i] + VRM_MODE };
-+		uint32_t data[3] = { s->mv, 1, VRM_MODE_LDO_HPM };
++		int rc;
 +
++		printf("PANDORA WLAN: voting %s (%s) at %u mV%s\n", s->name, s->what,
++		    s->mv, s->ldo ? " LDO" : " SMPS");
 +		if (s->mv * 1000 < s->min_uv || s->mv * 1000 > s->max_uv) {
 +			printf("PANDORA WLAN: %u mV for %s is outside %u-%u uV\n", s->mv,
 +			    s->name, s->min_uv, s->max_uv);
 +			return false;
 +		}
-+		if (!sy_rpmh_write(address, data, s->ldo ? 3 : 2)) {
-+			printf("PANDORA WLAN: the vote for %s was not confirmed\n", s->name);
++		rc = sy_rpmh_vote_res(s->name, s->mv, s->ldo ? 7 : 0, s->ldo);
++		if (rc != 0) {
++			printf("PANDORA WLAN: the vote for %s failed (%d)\n", s->name, rc);
 +			return false;
 +		}
 +		printf("PANDORA WLAN: %s on at %u mV\n", s->name, s->mv);
@@ -860,7 +960,7 @@
 +	sy_wr(parf, PARF_DBI_BASE, (uint32_t)SY_DBI_PA);
 +	sy_wr(parf, PARF_DBI_BASE + 4, 0);
 +	sy_wr(parf, PARF_ATU_BASE, (uint32_t)SY_IATU_PA);
-+	sy_wr(parf, PARF_ATU_BASE + 4, 0);
++	sy_wr(parf, PARF_ATU_BASE + 4, (uint32_t)(SY_IATU_PA >> 32));
 +	sy_wr(parf, PARF_SYS_CTRL, 0x365e);	/* pci-msm.c msm_pcie_enable_link */
 +	sy_wr(parf, 0x174, sy_rd(parf, 0x174) | (1UL << 4));	/* MHI_CLOCK_RESET_CTRL bypass */
 +	sy_wr(parf, 0x020, sy_rd(parf, 0x020) & ~(1UL << 5));	/* PM_CTRL: no L1 entry */
@@ -939,7 +1039,20 @@
 +	sy_wr(iatu, IATU_UBAR(0), 0);
 +	sy_wr(iatu, IATU_LAR(0), (uint32_t)(SY_CONF_PA + 0xfffff));
 +	sy_wr(iatu, IATU_CTRL2(0), IATU_ENABLE | IATU_CFG_SHIFT);
-+	printf("PANDORA WLAN: ECAM window %#lx via iATU region 0 (CFG0, cfg-shift)\n",
++	/* pci-msm.c msm_pcie_iatu_setup_ecam_blocker: point ECAM at the DBI base and block
++	 * every function of bus 0 except the root port's own config space. */
++	sy_wr(parf, PARF_ECAM_BASE, (uint32_t)SY_DBI_PA);
++	sy_wr(parf, PARF_ECAM_BASE + 4, 0);
++	sy_wr(parf, 0x360, (uint32_t)SY_DBI_PA + 0x1000);	/* BLOCK_SLV_AXI_WR_BASE */
++	sy_wr(parf, 0x364, 0);
++	sy_wr(parf, 0x370, (uint32_t)SY_DBI_PA + 0x1000);	/* BLOCK_SLV_AXI_RD_BASE */
++	sy_wr(parf, 0x374, 0);
++	sy_wr(parf, 0x368, (uint32_t)SY_DBI_PA + 0xfffff);	/* WR limit */
++	sy_wr(parf, 0x36c, 0);
++	sy_wr(parf, 0x378, (uint32_t)SY_DBI_PA + 0xfffff);	/* RD limit */
++	sy_wr(parf, 0x37c, 0);
++	sy_wr(parf, PARF_SYS_CTRL, 0x04000000);		/* PCIE_ECAM_BLOCKER_EN */
++	printf("PANDORA WLAN: ECAM window %#lx via iATU region 0 (CFG0, cfg-shift), blocker set\n",
 +	    (unsigned long)SY_CONF_PA);
 +}
 +
@@ -967,13 +1080,23 @@
 +	printf("PANDORA WLAN: state: votes br %#x br2 %#x rscc %#x aux-halt %#x pipe-halt %#x\n",
 +	    sy_gcc_rd(GCC_VOTE_BRANCH), sy_gcc_rd(GCC_VOTE_BRANCH2),
 +	    sy_gcc_rd(GCC_VOTE_RSCC), sy_gcc_rd(GCC_AUX), sy_gcc_rd(GCC_PIPE));
-+	printf("PANDORA WLAN: state: clkref %#x parf sys %#x ltssm %#x phy%#x %#x\n",
-+	    sy_rd(tcsr, SY_TCSR_CLKREF), sy_rd(parf, PARF_SYS_CTRL), sy_rd(parf, PARF_LTSSM),
-+	    PHY_STATUS, sy_rd(phy, PHY_STATUS));
-+	printf("PANDORA WLAN: state: dbi reglen %#x ver %#x bhi %#x bhie %#x ctrl %#x status %#x\n",
-+	    sy_rd(dbi, 0x00), sy_rd(dbi, 0x08), sy_rd(dbi, 0x28), sy_rd(dbi, 0x2c),
-+	    sy_rd(dbi, 0x38), sy_rd(dbi, 0x48));
-+	printf("PANDORA WLAN: state: link status %#x\n", sy_rd(dbi, DBI_LINKCTRLSTATUS));
++	if (sy_gcc_rd(GCC_GDSC_PHY) & GDSC_PWR_ON) {
++		printf("PANDORA WLAN: state: clkref %#x parf sys %#x ltssm %#x phy%#x %#x\n",
++		    sy_rd(tcsr, SY_TCSR_CLKREF), sy_rd(parf, PARF_SYS_CTRL), sy_rd(parf, PARF_LTSSM),
++		    PHY_STATUS, sy_rd(phy, PHY_STATUS));
++	} else {
++		printf("PANDORA WLAN: state: clkref %#x parf sys %#x ltssm %#x (PHY domain down)\n",
++		    sy_rd(tcsr, SY_TCSR_CLKREF), sy_rd(parf, PARF_SYS_CTRL), sy_rd(parf, PARF_LTSSM));
++	}
++	if ((sy_gcc_rd(GCC_GDSC_PCIE) & GDSC_PWR_ON) &&
++	    (sy_gcc_rd(GCC_GDSC_PHY) & GDSC_PWR_ON)) {
++		printf("PANDORA WLAN: state: dbi reglen %#x ver %#x bhi %#x bhie %#x ctrl %#x status %#x\n",
++		    sy_rd(dbi, 0x00), sy_rd(dbi, 0x08), sy_rd(dbi, 0x28), sy_rd(dbi, 0x2c),
++		    sy_rd(dbi, 0x38), sy_rd(dbi, 0x48));
++		printf("PANDORA WLAN: state: link status %#x\n", sy_rd(dbi, DBI_LINKCTRLSTATUS));
++	} else {
++		printf("PANDORA WLAN: state: DBI not read (power domains are down)\n");
++	}
 +}
 +
 +static void
@@ -999,6 +1122,8 @@
 +		printf("PANDORA WLAN: a window cannot be mapped\n");
 +		return;
 +	}
++	sy_rsc = rsc;	/* the RPMh block reuses these two mappings */
++	sy_cmddb = cmddb;
 +	printf("PANDORA WLAN: windows mapped\n");
 +	sy_dump_state();
 +	if (sy_step < 2) {
