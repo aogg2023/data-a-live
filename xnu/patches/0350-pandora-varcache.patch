@@ -1,6 +1,6 @@
 --- a/bsd/dev/pandora_cachevol.c
 +++ b/bsd/dev/pandora_cachevol.c
-@@ -4,10 +4,21 @@
+@@ -4,10 +4,27 @@
   * The GPU shader cache (/var/tmp/.../m2v) needs a writable file system with free space, but the
   * root volume is deliberately not grown (a grown volume makes the iOS data migration start and
   * never finish). Instead deploy writes a second, small empty HFS+ volume into a pinned userdata
@@ -10,21 +10,27 @@
 + *
 + * 0350: the volume is mounted at /private/var, not /private/var/tmp. On this port the root volume
 + * starts at 96.8 % used and /private/var is nearly empty in the image, so the whole data volume is
-+ * built at run time: measured across three boots it grew by ~204 MiB (db/uuidtext 116 MiB,
-+ * db/diagnostics 7 MiB, mobile/Library 58 MiB, log 5 MiB, Keychains 3 MiB, containers 3 MiB, ...)
-+ * and pushed the root to 99.1 % full. At that fill HFS+ can no longer grow its metadata reliably,
-+ * so securityd failed to open its keychain database (EMFILE + ENOSPC in the same millisecond),
-+ * ~80 user-session daemons died in libdispatch at 42.48 s and SpringBoard never drew the lock
-+ * screen. Moving the data volume onto the 2 GiB cache volume keeps the root at its static fill;
-+ * the empty cache volume then needs the directory skeleton the image used to provide, which
++ * built at run time: measured across boots it grew by ~200 MiB and pushed the root to 99.1 % full.
++ * At that fill HFS+ can no longer grow its metadata reliably, so securityd failed to open its
++ * keychain database (EMFILE + ENOSPC in the same millisecond) and the user session collapsed.
++ * Moving the data volume onto the 2 GiB cache volume keeps the root at its static fill, but the
++ * empty cache volume then needs the directory skeleton the image used to provide, which
 + * cv_seed_skeleton() recreates (170 directories taken from the image, parents first).
++ *
++ * The first version of this patch decided "did the mount land?" by opening
++ * /private/var/.journal_info_block and skipped the skeleton when that failed. HFS+ keeps .journal
++ * and .journal_info_block out of the namespace (hfs_catalog.c "Hide the journal files"), so the
++ * probe always failed, the skeleton was never created, keybagd could not open
++ * /private/var/keybags/systembag.kb and the kernel rebooted into recovery at 12 s
++ * ("FATAL KEYBAG ERROR: kb_load"). The mount itself returned 0; the skeleton now runs on that
++ * result, and the seeded directories are verified afterwards.
   *
   * Boot-arg pandora_cachevol=1 enables it (default off, so a bad volume can never stop the boot).
 + * Boot-arg pandora_varcache=0 keeps the mount but skips the skeleton, for a bisect.
   */
  #include <sys/param.h>
  #include <sys/systm.h>
-@@ -20,10 +31,235 @@
+@@ -20,10 +37,232 @@
  #include <kern/sched_prim.h>
  #include <pexpert/pexpert.h>
  
@@ -215,17 +221,16 @@
 +
 +extern int pandora_mkdir(const char *path, int mode);   /* bsd/vfs/vfs_syscalls.c (0185) */
 +
-+/* True when the path exists. The cache volume's HFS root carries .journal and .journal_info_block,
-+ * which is also how cv_seed_skeleton() proves the mount landed before it writes anything. */
++/* Directory existence by lookup (vnode_open cannot be used for directories). */
 +static int
-+cv_exists(const char *path)
++cv_dir_exists(const char *path)
 +{
 +	vnode_t vp = NULLVP;
 +
-+	if (vnode_open(path, FREAD, 0, 0, &vp, vfs_context_kernel()) != 0) {
++	if (vnode_lookup(path, 0, &vp, vfs_context_kernel()) != 0) {
 +		return 0;
 +	}
-+	(void)vnode_close(vp, FREAD, vfs_context_kernel());
++	vnode_put(vp);
 +	return 1;
 +}
 +
@@ -240,10 +245,6 @@
 +		printf("PANDORA CACHE: pandora_varcache=0, skeleton not seeded\n");
 +		return;
 +	}
-+	if (!cv_exists(CV_MOUNT "/.journal_info_block")) {
-+		printf("PANDORA CACHE: no cache volume on " CV_MOUNT ", skeleton not seeded\n");
-+		return;
-+	}
 +	for (unsigned i = 0; i < sizeof(cv_skeleton) / sizeof(cv_skeleton[0]); i++) {
 +		int error = pandora_mkdir(cv_skeleton[i], 0755);
 +		if (error == 0) {
@@ -255,12 +256,14 @@
 +			printf("PANDORA CACHE: skeleton %s: %d\n", cv_skeleton[i], error);
 +		}
 +	}
-+	printf("PANDORA CACHE: skeleton %u made, %u existing, %u failed\n", made, same, failed);
++	printf("PANDORA CACHE: skeleton %u made, %u existing, %u failed; keybags %d mobile %d db %d\n",
++	    made, same, failed, cv_dir_exists("/private/var/keybags"),
++	    cv_dir_exists("/private/var/mobile"), cv_dir_exists("/private/var/db"));
 +}
  
  static int cv_chan;
  
-@@ -55,8 +291,11 @@
+@@ -55,8 +294,11 @@
  		goto out;
  	}
  	cv_sleep(1500);
