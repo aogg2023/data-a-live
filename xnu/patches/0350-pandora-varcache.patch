@@ -27,7 +27,15 @@
   */
  #include <sys/param.h>
  #include <sys/systm.h>
-@@ -20,10 +34,305 @@
+@@ -15,16 +29,314 @@
+ #include <sys/vnode.h>
+ #include <sys/vnode_internal.h>
+ #include <sys/mount_internal.h>
++#include <sys/uio.h>
++#include <kern/vfs_context.h>
++#include <vm/vm_kern.h>
+ #include <kern/clock.h>
+ #include <kern/thread.h>
  #include <kern/sched_prim.h>
  #include <pexpert/pexpert.h>
  
@@ -37,7 +45,7 @@
  extern vnode_t rootvnode;
  extern kern_return_t thread_terminate(thread_t);
  extern int kernel_thread_start(thread_continue_t, void *, thread_t *);
-+
+ 
 +/* 0350: data volume skeleton. Generated from the image's own /private/var (every directory except
 + * the staged_system_apps subtree), parents before children, so a single-level mkdir of each entry
 + * in order recreates it on the cache volume. */
@@ -330,10 +338,123 @@
 +	    cv_dir_exists("/private/var/keybags"), cv_dir_exists("/private/var/mobile"),
 +	    cv_dir_exists("/private/var/db"));
 +}
- 
++
  static int cv_chan;
  
-@@ -51,21 +360,889 @@
+ static void
+@@ -34,6 +346,111 @@
+ 	clock_interval_to_deadline(ms, NSEC_PER_MSEC, &deadline);
+ 	(void)assert_wait_deadline(&cv_chan, THREAD_UNINT, deadline);
+ 	thread_block(THREAD_CONTINUE_NULL);
++}
++
++
++/*
++ * 0351: the firmware pack re-installs /private/var/mobile/Library/Preferences/
++ * com.apple.purplebuddy.plist on every boot. pf only writes a file whose bytes differ, and the
++ * pack's seed (SetupDone/SetupFinishedAllSteps/SetupVersion 11) is older than what iOS writes once
++ * it has completed setup, so the second and every later boot gets the setup state rolled back and
++ * SpringBoard launches Setup Assistant again (log: "exec Setup" only on later boots; the fresh
++ * volume boot did not). Keep the phone's own copy across the pack install and put it back, so the
++ * seed only ever fills a first boot (when the file does not exist yet).
++ */
++static const char *const cv_prefs[] = {
++	"/private/var/mobile/Library/Preferences/com.apple.purplebuddy.plist",
++	"/private/var/mobile/Library/Preferences/com.apple.purplebuddy.notbackedup.plist",
++};
++
++struct cv_saved {
++	const char *path;
++	uint8_t *data;
++	size_t size;
++	uid_t uid;
++	gid_t gid;
++	mode_t mode;
++};
++
++#define CV_SAVED_MAX 4
++static struct cv_saved cv_saved[CV_SAVED_MAX];
++static unsigned cv_saved_n;
++
++static void
++cv_preserve_prefs(void)
++{
++	vfs_context_t ctx = vfs_context_kernel();
++	unsigned saved = 0;
++
++	for (unsigned i = 0; i < sizeof(cv_prefs) / sizeof(cv_prefs[0]); i++) {
++		vnode_t vp = NULLVP;
++		vnode_attr va;
++
++		if (vnode_lookup(cv_prefs[i], 0, &vp, ctx) != 0) {
++			continue;	/* first boot: nothing to keep, the pack seeds it */
++		}
++		VATTR_INIT(&va);
++		VATTR_WANTED(&va, va_data_size);
++		VATTR_WANTED(&va, va_uid);
++		VATTR_WANTED(&va, va_gid);
++		VATTR_WANTED(&va, va_mode);
++		if (vnode_getattr(vp, &va, ctx) == 0 && va.va_data_size > 0 &&
++		    va.va_data_size <= 16384 && cv_saved_n < CV_SAVED_MAX) {
++			size_t n = (size_t)va.va_data_size;
++			uint8_t *buf = kmem_alloc(n, KM_SLEEP);
++			int resid = 0;
++
++			if (buf != NULL &&
++			    vn_rdwr(UIO_READ, vp, (caddr_t)buf, (int)n, 0, UIO_SYSSPACE, 0,
++			    ctx, &resid) == 0 && resid == 0) {
++				cv_saved[cv_saved_n].path = cv_prefs[i];
++				cv_saved[cv_saved_n].data = buf;
++				cv_saved[cv_saved_n].size = n;
++				cv_saved[cv_saved_n].uid = va.va_uid;
++				cv_saved[cv_saved_n].gid = va.va_gid;
++				cv_saved[cv_saved_n].mode = va.va_mode;
++				cv_saved_n++;
++				saved++;
++				vnode_put(vp);
++				continue;
++			}
++			if (buf != NULL) {
++				kmem_free(kernel_map, (vm_offset_t)buf, n);
++			}
++		}
++		vnode_put(vp);
++	}
++	if (saved != 0) {
++		printf("PANDORA CACHE: kept %u setup-state file(s) across the firmware pack\n", saved);
++	}
++}
++
++static void
++cv_restore_prefs(void)
++{
++	vfs_context_t ctx = vfs_context_kernel();
++	unsigned restored = 0;
++
++	for (unsigned i = 0; i < cv_saved_n; i++) {
++		vnode_t vp = NULLVP;
++		vnode_attr va;
++		int resid = 0;
++
++		if (vnode_lookup(cv_saved[i].path, 0, &vp, ctx) != 0) {
++			continue;
++		}
++		(void)vn_rdwr(UIO_WRITE, vp, (caddr_t)cv_saved[i].data,
++		    (int)cv_saved[i].size, 0, UIO_SYSSPACE, 0, ctx, &resid);
++		VATTR_INIT(&va);
++		VATTR_SET(&va, va_data_size, (off_t)cv_saved[i].size);
++		VATTR_SET(&va, va_uid, cv_saved[i].uid);
++		VATTR_SET(&va, va_gid, cv_saved[i].gid);
++		VATTR_SET(&va, va_mode, cv_saved[i].mode);
++		(void)vnode_setattr(vp, &va, ctx);
++		vnode_put(vp);
++		restored++;
++	}
++	printf("PANDORA CACHE: put back %u setup-state file(s) after the firmware pack\n", restored);
+ }
+ 
+ static void
+@@ -51,21 +468,896 @@
  		cv_sleep(100);
  	}
  	if (rootvnode == NULLVP) {
@@ -351,6 +472,13 @@
 +	printf("PANDORA CACHE: mount /dev/ufscache0 on " CV_MOUNT " -> %d\n", error);
 +	if (error == 0) {
 +		cv_seed_skeleton();
++		/* 0351: pf installs the pack at ~2.9 s; keep the phone's setup state and put it
++		 * back at ~4.4 s, before SpringBoard at ~12.4 s reads it. */
++		cv_preserve_prefs();
++		if (cv_saved_n != 0) {
++			cv_sleep(2500);
++			cv_restore_prefs();
++		}
 +	}
  out:
  	(void)thread_terminate(current_thread());
@@ -817,13 +945,13 @@
 +	bool ldo;
 +};
 +static const struct sy_supply sy_supplies[] = {
-+	{ "s1j_e1", "vdd-wlan-cx (S1J, pmh0104 S1)", 852, 400000, 1000000, false },
-+	{ "s2j_e1", "vdd-wlan-dig (S2J, pmh0104 S2)", 852, 500000, 1100000, false },
-+	{ "l3g_e0", "vdd-wlan-io12 (L3G, pmh0110 G L3)", 1200, 1200000, 1200000, true },
-+	{ "l2g_e0", "vdd-wlan-aon (L2G, pmh0110 G L2)", 1800, 1800000, 1800000, true },
-+	{ "s8f_e0", "vdd-wlan-rfa1 (S8F, pmh0110 F S8)", 1856, 1800000, 2000000, false },
-+	{ "s7f_e0", "vdd-wlan-rfa2 (S7F, pmh0110 F S7)", 1256, 1224000, 1372000, false },
-+	{ "l3k_e1", "vdd-wlan-ant-share (L3K, pmr735d L3)", 1200, 1200000, 1200000, true },
++	{ "S1J_E1", "vdd-wlan-cx (S1J, pmh0104 S1)", 852, 400000, 1000000, false },
++	{ "S2J_E1", "vdd-wlan-dig (S2J, pmh0104 S2)", 852, 500000, 1100000, false },
++	{ "L3G_E0", "vdd-wlan-io12 (L3G, pmh0110 G L3)", 1200, 1200000, 1200000, true },
++	{ "L2G_E0", "vdd-wlan-aon (L2G, pmh0110 G L2)", 1800, 1800000, 1800000, true },
++	{ "S8F_E0", "vdd-wlan-rfa1 (S8F, pmh0110 F S8)", 1856, 1800000, 2000000, false },
++	{ "S7F_E0", "vdd-wlan-rfa2 (S7F, pmh0110 F S7)", 1256, 1224000, 1372000, false },
++	{ "L3K_E1", "vdd-wlan-ant-share (L3K, pmr735d L3)", 1200, 1200000, 1200000, true },
 +};
 +
 +static bool
