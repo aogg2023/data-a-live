@@ -333,7 +333,7 @@
  
  static int cv_chan;
  
-@@ -51,21 +360,723 @@
+@@ -51,21 +360,733 @@
  		cv_sleep(100);
  	}
  	if (rootvnode == NULLVP) {
@@ -791,11 +791,20 @@
 +
 +/* ---- pins (port-proven TLMM CTL layout) ---------------------------------------- */
 +
++/* TLMM CTL low bits: pull [1:0], func [5:2], drive [8:6], OE [9]; EGPIO present [11],
++ * enable [12]. The port's proven sy_gpio() keeps everything above the low mask and mirrors
++ * ENABLE from whatever PRESENT the boot chain left, so the pad is never re-purposed. */
 +static void
-+sy_pin_out(uint32_t pin, uint32_t ctl)
++sy_pin_ctl(uint32_t pin, uint32_t low)
 +{
-+	*(volatile uint32_t *)(tlmm + (pin * 0x1000UL) + 4UL) = 0;
-+	*(volatile uint32_t *)(tlmm + (pin * 0x1000UL)) = ctl;
++	vm_offset_t ctl = tlmm + pin * 0x1000UL;
++	uint32_t old = *(volatile uint32_t *)ctl;
++	uint32_t value = (old & ~(0x3ffu | (1u << 12))) | (low & 0x3ffu);
++
++	if (old & (1u << 11)) {
++		value |= (1u << 12);
++	}
++	*(volatile uint32_t *)ctl = value;
 +}
 +
 +static void
@@ -805,9 +814,10 @@
 +}
 +
 +static void
-+sy_pin_ctl(uint32_t pin, uint32_t ctl)
++sy_pin_out(uint32_t pin, uint32_t low)
 +{
-+	*(volatile uint32_t *)(tlmm + (pin * 0x1000UL)) = ctl;
++	sy_pin_level(pin, 0);	/* level before the output enable, so the pin never glitches */
++	sy_pin_ctl(pin, low);
 +}
 +
 +/* ---- PARF, PHY, root port, link ------------------------------------------------ */
@@ -845,7 +855,7 @@
 +	if (!sy_poll(gcc, GCC_PIPE, CBCR_CLK_OFF, 0, 10, 1000, "the pipe clock")) {
 +		return false;
 +	}
-+	if (!sy_poll(phy, PHY_STATUS, PHY_STATUS_BIT, 0, 200, 20000, "the PHY's PHYSTATUS")) {
++	if (!sy_poll(phy, PHY_STATUS, PHY_STATUS_BIT, 0, 200, 200000, "the PHY's PHYSTATUS")) {
 +		return false;
 +	}
 +	printf("PANDORA WLAN: PHY started (%u writes), pipe clock running\n",
@@ -1029,7 +1039,7 @@
 +	(void)arg;
 +	(void)wr;
 +	printf("PANDORA WLAN: thread, step %u\n", sy_step);
-+	delay_for_interval(2000, NSEC_PER_MSEC);
++	delay_for_interval(6000, NSEC_PER_MSEC);
 +	sy_run();
 +	(void)thread_terminate(current_thread());
 +	thread_block(THREAD_CONTINUE_NULL);
