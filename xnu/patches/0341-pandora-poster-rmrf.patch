@@ -1,0 +1,95 @@
+--- a/bsd/vfs/vfs_syscalls.c
++++ b/bsd/vfs/vfs_syscalls.c
+@@ -14682,4 +14682,71 @@
+ {
+ 	return unlinkat_internal(vfs_context_kernel(), AT_FDCWD, NULLVP, CAST_USER_ADDR_T(path), UIO_SYSSPACE, 0);
+ }
++
++/* 0341: remove a whole directory tree through the VFS. pandora_rmdir (0336) only removes empty
++ * directories, so a PosterBoard store that a previous boot already populated could not be reset;
++ * this walks it with VNOP_READDIR and removes every entry bottom up. */
++int pandora_rmrf(const char *path);
++
++static int
++pandora_rmrf_walk(vnode_t vp, const char *path)
++{
++	vfs_context_t ctx = vfs_context_kernel();
++	UIO_STACKBUF(uio_buf, 1);
++	char dbuf[4096];
++	off_t loff = 0;
++
++	for (;;) {
++		uio_t auio = uio_createwithbuffer(1, loff, UIO_SYSSPACE, UIO_READ,
++		    &uio_buf[0], sizeof(uio_buf));
++		if (auio == NULL) {
++			return ENOMEM;
++		}
++		uio_addiov(auio, (uint64_t)(uintptr_t)dbuf, sizeof(dbuf));
++		int eofflag = 0, numdirent = 0;
++		int error = VNOP_READDIR(vp, auio, 0, &eofflag, &numdirent, ctx);
++		if (error) {
++			return error;
++		}
++		unsigned used = (unsigned)(sizeof(dbuf) - uio_resid(auio));
++		loff = uio_offset(auio);
++		if (used == 0) {
++			break;
++		}
++		for (unsigned at = 0; at + sizeof(struct dirent) <= used; ) {
++			struct dirent *dp = (struct dirent *)(void *)(dbuf + at);
++			if (dp->d_reclen == 0 || at + dp->d_reclen > used) {
++				break;
++			}
++			if (strcmp(dp->d_name, ".") != 0 && strcmp(dp->d_name, "..") != 0) {
++				char sub[PATH_MAX];
++				snprintf(sub, sizeof(sub), "%s/%s", path, dp->d_name);
++				(void)pandora_rmrf(sub);
++			}
++			at += dp->d_reclen;
++		}
++		if (eofflag) {
++			break;
++		}
++	}
++	return 0;
++}
++
++int
++pandora_rmrf(const char *path)
++{
++	vfs_context_t ctx = vfs_context_kernel();
++	vnode_t vp = NULLVP;
++
++	if (vnode_lookup(path, 0, &vp, ctx) != 0) {
++		return ENOENT;
++	}
++	if (vp->v_type != VDIR) {
++		vnode_put(vp);
++		return pandora_unlink(path);
++	}
++	(void)pandora_rmrf_walk(vp, path);
++	vnode_put(vp);
++	return pandora_rmdir(path);
++}
+ #endif /* PANDORA */
+--- a/bsd/dev/pandora_files.c
++++ b/bsd/dev/pandora_files.c
+@@ -33,6 +33,7 @@
+ extern int pandora_mkdir(const char *path, int mode);   /* bsd/vfs/vfs_syscalls.c (patch 0185) */
+ extern int pandora_rmdir(const char *path);    /* bsd/vfs/vfs_syscalls.c (patch 0336) */
+ extern int pandora_unlink(const char *path);   /* bsd/vfs/vfs_syscalls.c (patch 0336) */
++extern int pandora_rmrf(const char *path);     /* bsd/vfs/vfs_syscalls.c (patch 0341) */
+ void pandora_files_init(void);
+ static void pf_dump_files(vfs_context_t ctx);
+ 
+@@ -324,8 +325,8 @@
+ 		return;
+ 	}
+ 	for (unsigned i = 0; i < sizeof(dirs) / sizeof(dirs[0]); i++) {
+-		int error = pandora_rmdir(dirs[i]);
+-		printf("PANDORA POSTER RESET: rmdir %s: %d\n", dirs[i], error);
++		int error = pandora_rmrf(dirs[i]);
++		printf("PANDORA POSTER RESET: rmrf %s: %d\n", dirs[i], error);
+ 	}
+ 	for (unsigned i = 0; i < sizeof(files) / sizeof(files[0]); i++) {
+ 		int error = pandora_unlink(files[i]);
