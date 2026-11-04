@@ -1,6 +1,6 @@
 --- a/bsd/dev/pandora_cachevol.c
 +++ b/bsd/dev/pandora_cachevol.c
-@@ -4,10 +4,27 @@
+@@ -4,10 +4,24 @@
   * The GPU shader cache (/var/tmp/.../m2v) needs a writable file system with free space, but the
   * root volume is deliberately not grown (a grown volume makes the iOS data migration start and
   * never finish). Instead deploy writes a second, small empty HFS+ volume into a pinned userdata
@@ -8,29 +8,26 @@
 - * /private/var/tmp before launchd starts.
 + * region; sweet_ufs exposes it as /dev/ufscache0 (0272) and this file mounts it before launchd starts.
 + *
-+ * 0350: the volume is mounted at /private/var, not /private/var/tmp. On this port the root volume
-+ * starts at 96.8 % used and /private/var is nearly empty in the image, so the whole data volume is
-+ * built at run time: measured across boots it grew by ~200 MiB and pushed the root to 99.1 % full.
-+ * At that fill HFS+ can no longer grow its metadata reliably, so securityd failed to open its
-+ * keychain database (EMFILE + ENOSPC in the same millisecond) and the user session collapsed.
-+ * Moving the data volume onto the 2 GiB cache volume keeps the root at its static fill, but the
-+ * empty cache volume then needs the directory skeleton the image used to provide, which
-+ * cv_seed_skeleton() recreates (170 directories taken from the image, parents first).
++ * 0350: the volume is mounted at /private/var, not /private/var/tmp, and the data volume skeleton
++ * the image used to provide is recreated on it (170 directories taken from the image). Measured
++ * cause on this port: the root volume starts at 96.8 % used and /private/var is nearly empty in the
++ * image, so the whole data volume is built at run time (~200 MiB per cold boot) and the root fills
++ * up; at that fill securityd could not open its keychain database (EMFILE + ENOSPC in the same
++ * millisecond) and the user session collapsed.
 + *
-+ * The first version of this patch decided "did the mount land?" by opening
-+ * /private/var/.journal_info_block and skipped the skeleton when that failed. HFS+ keeps .journal
-+ * and .journal_info_block out of the namespace (hfs_catalog.c "Hide the journal files"), so the
-+ * probe always failed, the skeleton was never created, keybagd could not open
-+ * /private/var/keybags/systembag.kb and the kernel rebooted into recovery at 12 s
-+ * ("FATAL KEYBAG ERROR: kb_load"). The mount itself returned 0; the skeleton now runs on that
-+ * result, and the seeded directories are verified afterwards.
++ * 0351: the skeleton must also carry the OWNERSHIP and MODE the image gave those directories. A
++ * directory created by the kernel is uid 0 / gid 20 / 0755, so /var/mobile/Library/Caches ended up
++ * root-owned and SpringBoard (running as uid 501) could not create its caches: the boot stalled at
++ * the Apple logo with 127 x NSCocoaErrorDomain 513 (NSFileWriteNoPermission) and backboardd
++ * "Sustaining the boot logo". The attributes are copied from the root volume, which still has the
++ * image's tree, BEFORE mounting, because the mount hides it afterwards.
   *
   * Boot-arg pandora_cachevol=1 enables it (default off, so a bad volume can never stop the boot).
-+ * Boot-arg pandora_varcache=0 keeps the mount but skips the skeleton, for a bisect.
++ * Boot-arg pandora_varcache=0 keeps the mount but skips the skeleton and its attributes.
   */
  #include <sys/param.h>
  #include <sys/systm.h>
-@@ -20,10 +37,232 @@
+@@ -20,10 +34,305 @@
  #include <kern/sched_prim.h>
  #include <pexpert/pexpert.h>
  
@@ -219,7 +216,77 @@
 +	"/private/var/MobileAsset/PreinstalledAssetsV2/InstallWithOs/com_apple_MobileAsset_SoundScapesPickerAssets/5223134c9d602a6a5ddada7b8fd315e09f1dd351.asset/AssetData/Resources/zh_TW.lproj",
 +};
 +
++#define CV_DIRS (sizeof(cv_skeleton) / sizeof(cv_skeleton[0]))
++
 +extern int pandora_mkdir(const char *path, int mode);   /* bsd/vfs/vfs_syscalls.c (0185) */
++
++/* 0351: ownership/mode of each skeleton directory, read from the root volume before the mount. */
++struct cv_dirattr {
++	uint32_t uid;
++	uint32_t gid;
++	uint16_t mode;
++	uint8_t have;
++};
++
++static struct cv_dirattr cv_attr[CV_DIRS];
++static unsigned cv_captured;
++
++static unsigned
++cv_capture_attrs(void)
++{
++	vfs_context_t ctx = vfs_context_kernel();
++	unsigned got = 0;
++
++	for (unsigned i = 0; i < CV_DIRS; i++) {
++		vnode_t vp = NULLVP;
++		struct vnode_attr va;
++
++		if (vnode_lookup(cv_skeleton[i], 0, &vp, ctx) != 0) {
++			continue;
++		}
++		VATTR_INIT(&va);
++		VATTR_WANTED(&va, va_uid);
++		VATTR_WANTED(&va, va_gid);
++		VATTR_WANTED(&va, va_mode);
++		if (vnode_getattr(vp, &va, ctx) == 0) {
++			cv_attr[i].uid = (uint32_t)va.va_uid;
++			cv_attr[i].gid = (uint32_t)va.va_gid;
++			cv_attr[i].mode = (uint16_t)(va.va_mode & 07777);
++			cv_attr[i].have = 1;
++			got++;
++		}
++		vnode_put(vp);
++	}
++	return got;
++}
++
++static unsigned
++cv_apply_attrs(void)
++{
++	vfs_context_t ctx = vfs_context_kernel();
++	unsigned done = 0;
++
++	for (unsigned i = 0; i < CV_DIRS; i++) {
++		vnode_t vp = NULLVP;
++		struct vnode_attr va;
++
++		if (!cv_attr[i].have) {
++			continue;
++		}
++		if (vnode_lookup(cv_skeleton[i], 0, &vp, ctx) != 0) {
++			continue;
++		}
++		VATTR_INIT(&va);
++		VATTR_SET(&va, va_uid, cv_attr[i].uid);
++		VATTR_SET(&va, va_gid, cv_attr[i].gid);
++		VATTR_SET(&va, va_mode, cv_attr[i].mode);
++		if (vnode_setattr(vp, &va, ctx) == 0) {
++			done++;
++		}
++		vnode_put(vp);
++	}
++	return done;
++}
 +
 +/* Directory existence by lookup (vnode_open cannot be used for directories). */
 +static int
@@ -238,14 +305,14 @@
 +cv_seed_skeleton(void)
 +{
 +	int on = 1;
-+	unsigned made = 0, same = 0, failed = 0;
++	unsigned made = 0, same = 0, failed = 0, applied;
 +
 +	(void)PE_parse_boot_argn("pandora_varcache", &on, sizeof(on));
 +	if (!on) {
 +		printf("PANDORA CACHE: pandora_varcache=0, skeleton not seeded\n");
 +		return;
 +	}
-+	for (unsigned i = 0; i < sizeof(cv_skeleton) / sizeof(cv_skeleton[0]); i++) {
++	for (unsigned i = 0; i < CV_DIRS; i++) {
 +		int error = pandora_mkdir(cv_skeleton[i], 0755);
 +		if (error == 0) {
 +			made++;
@@ -256,19 +323,30 @@
 +			printf("PANDORA CACHE: skeleton %s: %d\n", cv_skeleton[i], error);
 +		}
 +	}
-+	printf("PANDORA CACHE: skeleton %u made, %u existing, %u failed; keybags %d mobile %d db %d\n",
-+	    made, same, failed, cv_dir_exists("/private/var/keybags"),
-+	    cv_dir_exists("/private/var/mobile"), cv_dir_exists("/private/var/db"));
++	applied = cv_apply_attrs();
++	printf("PANDORA CACHE: skeleton %u made, %u existing, %u failed, attributes %u/%u applied;"
++	    " keybags %d mobile %d db %d\n",
++	    made, same, failed, applied, cv_captured,
++	    cv_dir_exists("/private/var/keybags"), cv_dir_exists("/private/var/mobile"),
++	    cv_dir_exists("/private/var/db"));
 +}
  
  static int cv_chan;
  
-@@ -55,8 +294,11 @@
+@@ -51,12 +360,18 @@
+ 		cv_sleep(100);
+ 	}
+ 	if (rootvnode == NULLVP) {
+-		printf("PANDORA CACHE: no root, not mounting /private/var/tmp\n");
++		printf("PANDORA CACHE: no root, not mounting " CV_MOUNT "\n");
  		goto out;
  	}
  	cv_sleep(1500);
 -	int error = pandora_mount_hfs("/dev/ufscache0", "/private/var/tmp");
 -	printf("PANDORA CACHE: mount /dev/ufscache0 on /private/var/tmp -> %d\n", error);
++	cv_captured = cv_capture_attrs();
++	printf("PANDORA CACHE: captured attributes of %u of %u skeleton dirs from the root volume\n",
++	    cv_captured, (unsigned)CV_DIRS);
 +	int error = pandora_mount_hfs("/dev/ufscache0", CV_MOUNT);
 +	printf("PANDORA CACHE: mount /dev/ufscache0 on " CV_MOUNT " -> %d\n", error);
 +	if (error == 0) {
