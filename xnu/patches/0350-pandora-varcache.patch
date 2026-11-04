@@ -333,7 +333,7 @@
  
  static int cv_chan;
  
-@@ -51,21 +360,733 @@
+@@ -51,21 +360,764 @@
  		cv_sleep(100);
  	}
  	if (rootvnode == NULLVP) {
@@ -421,12 +421,14 @@
 +#define SY_IATU_SIZE	0x00001000UL
 +#define SY_CONF_PA	0x40100000UL	/* ECAM: dbi + 1 MiB, pci-msm.c cfg0_ecam_base */
 +#define SY_CONF_SIZE	0x00001000UL
-+#define SY_PCIE_SM_PA	0x01d07000UL	/* "pcie_sm", 0x7000 */
-+#define SY_PCIE_SM_SIZE	0x00007000UL
-+#define SY_GCC_PA	0x00100000UL	/* /soc/clock-controller@100000 */
-+#define SY_GCC_SIZE	0x001f4200UL
-+#define SY_TLMM_PA	0x0f100000UL	/* port-proven pin window (songyuan_touch.c) */
-+#define SY_TLMM_SIZE	0x00102000UL
++#define SY_GCC_LOW_PA	0x00100000UL	/* gcc@100000 offset 0x10058 (cnoc_sf status) */
++#define SY_GCC_LOW_SIZE	0x00001000UL
++#define SY_GCC_PA	0x00150000UL	/* gcc@100000 offsets 0x52000..0x6c02c */
++#define SY_GCC_SIZE	0x0001d000UL
++#define SY_TLMM_LOW_PA	0x0f110000UL	/* pins 16..19 */
++#define SY_TLMM_LOW_SIZE 0x00004000UL
++#define SY_TLMM_PA	0x0f166000UL	/* pins 102..104 */
++#define SY_TLMM_SIZE	0x00003000UL
 +#define SY_TCSR_PA	0x01fd5000UL	/* /soc/clock-controller@1fd5044 qcom,canoe-tcsrcc */
 +#define SY_TCSR_SIZE	0x00001000UL
 +#define SY_TCSR_CLKREF	0x00000044UL	/* node start 0x1fd5044, tcsr_pcie_0_clkref_en reg 0 */
@@ -506,10 +508,29 @@
 +
 +
 +
-+static vm_offset_t parf, phy, dbi, iatu, conf, pcie_sm, gcc, tlmm, tcsr, rsc, cmddb;
++static vm_offset_t parf, phy, dbi, iatu, conf, gcc_low, gcc, tlmm_low, tlmm, tcsr, rsc, cmddb;
 +#define SY_PHY_ROWS (sizeof(sy_phy_seq) / sizeof(sy_phy_seq[0]))
 +#define SY_SUPPLY_N (sizeof(sy_supplies) / sizeof(sy_supplies[0]))
 +static unsigned sy_step;
++
++static uint32_t
++sy_gcc_rd(uint32_t off)
++{
++	if (off < 0x10000UL) {
++		return *(volatile uint32_t *)(gcc_low + off);
++	}
++	return *(volatile uint32_t *)(gcc + (off - 0x50000UL));
++}
++
++static void
++sy_gcc_wr(uint32_t off, uint32_t val)
++{
++	if (off < 0x10000UL) {
++		*(volatile uint32_t *)(gcc_low + off) = val;
++		return;
++	}
++	*(volatile uint32_t *)(gcc + (off - 0x50000UL)) = val;
++}
 +
 +static uint32_t
 +sy_rd(vm_offset_t base, uint32_t off)
@@ -734,11 +755,11 @@
 +static bool
 +sy_gdsc_on(uint32_t gdscr, const char *name)
 +{
-+	if (sy_rd(gcc, gdscr) & GDSC_PWR_ON) {
-+		printf("PANDORA WLAN: %s already on (%#x)\n", name, sy_rd(gcc, gdscr));
++	if (sy_gcc_rd(gdscr) & GDSC_PWR_ON) {
++		printf("PANDORA WLAN: %s already on (%#x)\n", name, sy_gcc_rd(gdscr));
 +		return true;
 +	}
-+	sy_wr(gcc, gdscr, sy_rd(gcc, gdscr) & ~GDSC_SW_COLLAPSE);
++	sy_gcc_wr(gdscr, sy_gcc_rd(gdscr) & ~GDSC_SW_COLLAPSE);
 +	return sy_poll(gcc, gdscr + GCC_GDSC_CFG, GDSC_PWR_UP_DONE, GDSC_PWR_UP_DONE, 50, 2000,
 +	    name);
 +}
@@ -746,16 +767,16 @@
 +static bool
 +sy_rcg_set(uint32_t rcg, uint32_t cfg, const char *name)
 +{
-+	sy_wr(gcc, rcg, sy_rd(gcc, rcg) | RCG_ROOT_EN);
++	sy_gcc_wr(rcg, sy_gcc_rd(rcg) | RCG_ROOT_EN);
 +	if (!sy_poll(gcc, rcg, RCG_ROOT_OFF, 0, 10, 500, name)) {
 +		return false;
 +	}
-+	sy_wr(gcc, rcg + 4, cfg);
-+	sy_wr(gcc, rcg, sy_rd(gcc, rcg) | RCG_UPDATE);
++	sy_gcc_wr(rcg + 4, cfg);
++	sy_gcc_wr(rcg, sy_gcc_rd(rcg) | RCG_UPDATE);
 +	if (!sy_poll(gcc, rcg, RCG_UPDATE, 0, 10, 500, name)) {
 +		return false;
 +	}
-+	sy_wr(gcc, rcg, sy_rd(gcc, rcg) & ~RCG_ROOT_EN);
++	sy_gcc_wr(rcg, sy_gcc_rd(rcg) & ~RCG_ROOT_EN);
 +	return true;
 +}
 +
@@ -776,8 +797,8 @@
 +	}
 +	sy_wr(tcsr, SY_TCSR_CLKREF, sy_rd(tcsr, SY_TCSR_CLKREF) | 1);
 +	sy_usleep(10);
-+	sy_wr(gcc, GCC_VOTE_BRANCH, sy_rd(gcc, GCC_VOTE_BRANCH) | 0x6f);	/* slv/mstr/cfg/aux/q2a/cnoc_sf, pipe added with the PHY */
-+	sy_wr(gcc, GCC_VOTE_BRANCH2, sy_rd(gcc, GCC_VOTE_BRANCH2) |
++	sy_gcc_wr(GCC_VOTE_BRANCH, sy_gcc_rd(GCC_VOTE_BRANCH) | 0x6f);	/* slv/mstr/cfg/aux/q2a/cnoc_sf, pipe added with the PHY */
++	sy_gcc_wr(GCC_VOTE_BRANCH2, sy_gcc_rd(GCC_VOTE_BRANCH2) |
 +	    (1UL << 12) | (1UL << 19) | (1UL << 22));
 +	for (unsigned i = 0; i < (sizeof(branches) / sizeof(branches[0])); i++) {
 +		if (!sy_poll(gcc, branches[i], CBCR_CLK_OFF, 0, 10, 1000, "a PCIe clock branch")) {
@@ -794,10 +815,19 @@
 +/* TLMM CTL low bits: pull [1:0], func [5:2], drive [8:6], OE [9]; EGPIO present [11],
 + * enable [12]. The port's proven sy_gpio() keeps everything above the low mask and mirrors
 + * ENABLE from whatever PRESENT the boot chain left, so the pad is never re-purposed. */
++static vm_offset_t
++sy_pin_reg(uint32_t pin, uint32_t add)
++{
++	if (pin >= 16 && pin <= 19) {
++		return tlmm_low + (pin - 16) * 0x1000UL + add;
++	}
++	return tlmm + (pin - 102) * 0x1000UL + add;
++}
++
 +static void
 +sy_pin_ctl(uint32_t pin, uint32_t low)
 +{
-+	vm_offset_t ctl = tlmm + pin * 0x1000UL;
++	vm_offset_t ctl = sy_pin_reg(pin, 0);
 +	uint32_t old = *(volatile uint32_t *)ctl;
 +	uint32_t value = (old & ~(0x3ffu | (1u << 12))) | (low & 0x3ffu);
 +
@@ -810,7 +840,7 @@
 +static void
 +sy_pin_level(uint32_t pin, uint32_t level)
 +{
-+	*(volatile uint32_t *)(tlmm + (pin * 0x1000UL) + 4UL) = level;
++	*(volatile uint32_t *)sy_pin_reg(pin, 4) = level;
 +}
 +
 +static void
@@ -850,8 +880,8 @@
 +		sy_wr(phy, sy_phy_seq[i][0], sy_phy_seq[i][1]);
 +	}
 +	sy_usleep(1000);
-+	sy_wr(gcc, GCC_PIPE_MUX, sy_rd(gcc, GCC_PIPE_MUX) & ~3UL);	/* the PHY's pipe clock */
-+	sy_wr(gcc, GCC_VOTE_BRANCH, sy_rd(gcc, GCC_VOTE_BRANCH) | (1UL << 4));
++	sy_gcc_wr(GCC_PIPE_MUX, sy_gcc_rd(GCC_PIPE_MUX) & ~3UL);	/* the PHY's pipe clock */
++	sy_gcc_wr(GCC_VOTE_BRANCH, sy_gcc_rd(GCC_VOTE_BRANCH) | (1UL << 4));
 +	if (!sy_poll(gcc, GCC_PIPE, CBCR_CLK_OFF, 0, 10, 1000, "the pipe clock")) {
 +		return false;
 +	}
@@ -932,11 +962,11 @@
 +sy_dump_state(void)
 +{
 +	printf("PANDORA WLAN: state: pcie0 gdsc %#x/%#x phy gdsc %#x/%#x\n",
-+	    sy_rd(gcc, GCC_GDSC_PCIE), sy_rd(gcc, GCC_GDSC_PCIE + 4),
-+	    sy_rd(gcc, GCC_GDSC_PHY), sy_rd(gcc, GCC_GDSC_PHY + 4));
++	    sy_gcc_rd(GCC_GDSC_PCIE), sy_gcc_rd(GCC_GDSC_PCIE + 4),
++	    sy_gcc_rd(GCC_GDSC_PHY), sy_gcc_rd(GCC_GDSC_PHY + 4));
 +	printf("PANDORA WLAN: state: votes br %#x br2 %#x rscc %#x aux-halt %#x pipe-halt %#x\n",
-+	    sy_rd(gcc, GCC_VOTE_BRANCH), sy_rd(gcc, GCC_VOTE_BRANCH2),
-+	    sy_rd(gcc, GCC_VOTE_RSCC), sy_rd(gcc, GCC_AUX), sy_rd(gcc, GCC_PIPE));
++	    sy_gcc_rd(GCC_VOTE_BRANCH), sy_gcc_rd(GCC_VOTE_BRANCH2),
++	    sy_gcc_rd(GCC_VOTE_RSCC), sy_gcc_rd(GCC_AUX), sy_gcc_rd(GCC_PIPE));
 +	printf("PANDORA WLAN: state: clkref %#x parf sys %#x ltssm %#x phy%#x %#x\n",
 +	    sy_rd(tcsr, SY_TCSR_CLKREF), sy_rd(parf, PARF_SYS_CTRL), sy_rd(parf, PARF_LTSSM),
 +	    PHY_STATUS, sy_rd(phy, PHY_STATUS));
@@ -957,14 +987,15 @@
 +	dbi = ml_io_map(SY_DBI_PA, SY_DBI_SIZE);
 +	iatu = ml_io_map(SY_IATU_PA, SY_IATU_SIZE);
 +	conf = ml_io_map(SY_CONF_PA, SY_CONF_SIZE);
-+	pcie_sm = ml_io_map(SY_PCIE_SM_PA, SY_PCIE_SM_SIZE);
++	gcc_low = ml_io_map(SY_GCC_LOW_PA, SY_GCC_LOW_SIZE);
 +	gcc = ml_io_map(SY_GCC_PA, SY_GCC_SIZE);
++	tlmm_low = ml_io_map(SY_TLMM_LOW_PA, SY_TLMM_LOW_SIZE);
 +	tlmm = ml_io_map(SY_TLMM_PA, SY_TLMM_SIZE);
 +	tcsr = ml_io_map(SY_TCSR_PA, SY_TCSR_SIZE);
 +	rsc = ml_io_map(SY_RSC_PA, SY_RSC_SIZE);
 +	cmddb = ml_io_map_wcomb(SY_CMDDB_PA, SY_CMDDB_SIZE);
-+	if (!parf || !phy || !dbi || !iatu || !conf || !pcie_sm || !gcc || !tlmm || !tcsr ||
-+	    !rsc || !cmddb) {
++	if (!parf || !phy || !dbi || !iatu || !conf || !gcc_low || !gcc || !tlmm_low ||
++	    !tlmm || !tcsr || !rsc || !cmddb) {
 +		printf("PANDORA WLAN: a window cannot be mapped\n");
 +		return;
 +	}
@@ -986,11 +1017,11 @@
 +		return;
 +	}
 +	printf("PANDORA WLAN: step %u: resets and PARF\n", sy_step);
-+	sy_wr(gcc, GCC_BCR_PCIE, sy_rd(gcc, GCC_BCR_PCIE) | 1);
-+	sy_wr(gcc, GCC_BCR_PHY, sy_rd(gcc, GCC_BCR_PHY) | 1);
++	sy_gcc_wr(GCC_BCR_PCIE, sy_gcc_rd(GCC_BCR_PCIE) | 1);
++	sy_gcc_wr(GCC_BCR_PHY, sy_gcc_rd(GCC_BCR_PHY) | 1);
 +	sy_usleep(1000);
-+	sy_wr(gcc, GCC_BCR_PHY, sy_rd(gcc, GCC_BCR_PHY) & ~1UL);
-+	sy_wr(gcc, GCC_BCR_PCIE, sy_rd(gcc, GCC_BCR_PCIE) & ~1UL);
++	sy_gcc_wr(GCC_BCR_PHY, sy_gcc_rd(GCC_BCR_PHY) & ~1UL);
++	sy_gcc_wr(GCC_BCR_PCIE, sy_gcc_rd(GCC_BCR_PCIE) & ~1UL);
 +	sy_usleep(1000);
 +	sy_parf_setup();
 +	if (sy_step < 4) {
@@ -1011,8 +1042,8 @@
 +	sy_pin_ctl(PIN_CLKREQ, CTL_CLKREQ_FUNC);
 +	sy_pin_ctl(PIN_WAKE, CTL_IN_PULL_UP);
 +	printf("PANDORA WLAN: sw-ctrl pins read %u %u\n",
-+	    (unsigned)(*(volatile uint32_t *)(tlmm + 18 * 0x1000UL + 4UL) & 1),
-+	    (unsigned)(*(volatile uint32_t *)(tlmm + 19 * 0x1000UL + 4UL) & 1));
++	    (unsigned)(*(volatile uint32_t *)sy_pin_reg(18, 4) & 1),
++	    (unsigned)(*(volatile uint32_t *)sy_pin_reg(19, 4) & 1));
 +	sy_root_port_setup();
 +	delay_for_interval(50, NSEC_PER_MSEC);
 +	sy_pin_level(PIN_PERST, IO_HIGH);
