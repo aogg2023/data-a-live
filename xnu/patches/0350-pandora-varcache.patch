@@ -456,7 +456,7 @@
  }
  
  static void
-@@ -51,21 +470,1138 @@
+@@ -51,21 +470,1149 @@
  		cv_sleep(100);
  	}
  	if (rootvnode == NULLVP) {
@@ -860,7 +860,16 @@
 +	/* voltage, enable, mode: an LDO also gets its mode voted, an SMPS does not */
 +	static const uint32_t offs[3] = {0, 4, 8};
 +	unsigned t = 0;
-+	unsigned ncmd = ldo ? 3u : 2u;
++	static int sy_ldo2 = -1;
++	unsigned ncmd;
++
++	if (sy_ldo2 < 0) {
++		int v = 0;
++		sy_ldo2 = (PE_parse_boot_argn("songyuan_wlan_ldo2", &v, sizeof(v)) && v) ? 1 : 0;
++		printf("PANDORA WLAN: RPMh: LDO votes use %u commands (songyuan_wlan_ldo2=%d)\n",
++		    (ldo && !sy_ldo2) ? 3u : 2u, sy_ldo2);
++	}
++	ncmd = (ldo && !sy_ldo2) ? 3u : 2u;
 +	int rc = 0;
 +	bool done = false;
 +
@@ -922,6 +931,8 @@
 +	for (unsigned c = 0; c < ncmd; c++) {
 +		uint32_t cmd = b + c * L->cmd_stride;
 +		word[c] = address + offs[c];
++		printf("PANDORA WLAN: RPMh: cmd %u/%u at rsc+%#x: msgid %#x addr %#x data %u\n",
++		    c, ncmd, cmd + L->msgid, SY_RPMH_WRITE, word[c], vals[c]);
 +		if (!sy_rpmh_sync(cmd + L->msgid, SY_RPMH_WRITE) ||
 +		    !sy_rpmh_sync(cmd + L->addr, word[c]) ||
 +		    !sy_rpmh_sync(cmd + L->data, vals[c])) {
