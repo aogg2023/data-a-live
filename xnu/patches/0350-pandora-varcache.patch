@@ -456,7 +456,7 @@
  }
  
  static void
-@@ -51,21 +470,1015 @@
+@@ -51,21 +470,1006 @@
  		cv_sleep(100);
  	}
  	if (rootvnode == NULLVP) {
@@ -1233,46 +1233,6 @@
 +}
 +
 +static void
-+sy_dump_link_state(const char *when)
-+{
-+	printf("PANDORA WLAN: link state %s: parf ltssm %#x sys %#x phy_ctrl %#x\n", when,
-+	    sy_rd(parf, PARF_LTSSM), sy_rd(parf, PARF_SYS_CTRL), sy_rd(parf, PARF_PHY_CTRL));
-+	printf("PANDORA WLAN: link state %s: dbi id %#x cmd %#x status %#x link %#x clk %#x\n", when,
-+	    sy_rd(dbi, 0x00), sy_rd(dbi, 0x04), sy_rd(dbi, 0x08), sy_rd(dbi, DBI_LINKCTRLSTATUS),
-+	    sy_rd(dbi, 0x78));
-+	printf("PANDORA WLAN: link state %s: gcc aux %#x pipe %#x ref %#x\n", when,
-+	    sy_gcc_rd(GCC_AUX), sy_gcc_rd(GCC_PIPE), sy_rd(tcsr, SY_TCSR_CLKREF));
-+	printf("PANDORA WLAN: link state %s: elbi ctrl %#x stts %#x\n", when,
-+	    sy_rd(dbi, 0xf24), sy_rd(dbi, 0xf28));
-+	sy_sm_state("after the timeout");
-+}
-+
-+static bool
-+sy_link_wait(void)
-+{
-+	unsigned ltssm = sy_rd(parf, PARF_LTSSM) & 0x3f;
-+
-+	printf("PANDORA WLAN: LTSSM before enable %#x\n", ltssm);
-+	sy_wr(parf, PARF_LTSSM, sy_rd(parf, PARF_LTSSM) | PARF_LTSSM_EN);
-+	printf("PANDORA WLAN: LTSSM after enable %#x\n", sy_rd(parf, PARF_LTSSM));
-+	for (unsigned i = 0; i < 500; i++) {
-+		uint32_t status = sy_rd(dbi, DBI_LINKCTRLSTATUS);
-+		ltssm = sy_rd(parf, PARF_LTSSM) & 0x3f;
-+
-+		if ((status & LINK_ACTIVE) && ltssm == 0x11) {
-+			printf("PANDORA WLAN: link up: LTSSM %#x, link status %#x (%u ms)\n",
-+			    ltssm, status, i * 10);
-+			return true;
-+		}
-+		sy_usleep(10000);
-+	}
-+	printf("PANDORA WLAN: link did not come up; LTSSM %#x, link status %#x\n",
-+	    sy_rd(parf, PARF_LTSSM) & 0x3f, sy_rd(dbi, DBI_LINKCTRLSTATUS));
-+	sy_dump_link_state("after the timeout");
-+	return false;
-+}
-+
-+static void
 +sy_iatu_ecam(void)
 +{
 +	sy_wr(iatu, IATU_CTRL2(0), 0);
@@ -1298,6 +1258,28 @@
 +	    (unsigned long)SY_CONF_PA);
 +}
 +
++/* Size a 32-bit BAR the way the PCI core does: disable decode, write all ones, read the
++ * mask, restore. One config cycle each way, no loop. */
++static uint64_t
++sy_bar0_size(void)
++{
++	uint32_t cmd = sy_rd(conf, 0x04);
++	uint32_t bar = sy_rd(conf, 0x10);
++	uint32_t mask;
++
++	sy_wr(conf, 0x04, cmd & ~0x2UL);		/* memory space decode off while sizing */
++	sy_usleep(1000);
++	sy_wr(conf, 0x10, 0xffffffffUL);
++	mask = sy_rd(conf, 0x10);
++	sy_wr(conf, 0x10, bar);
++	sy_wr(conf, 0x04, cmd);
++	if (mask == 0 || mask == 0xffffffffUL) {
++		return 0;
++	}
++
++	return ~(uint64_t)(mask & ~0xfUL) + 1;
++}
++
 +static bool
 +sy_config_read(void)
 +{
@@ -1307,10 +1289,12 @@
 +	printf("PANDORA WLAN: config: root port (bus 0) id %#x, endpoint (bus 1) id %#x\n", rc, ep);
 +	printf("PANDORA WLAN: endpoint config[0] = %#x -> vendor %#x device %#x\n", ep,
 +	    ep & 0xffff, ep >> 16);
-+	if ((ep & 0xffff) == 0x17cb && (ep >> 16) == 0x110e) {
-+		return true;
++	if ((ep & 0xffff) != 0x17cb || (ep >> 16) != 0x110e) {
++		return false;
 +	}
-+	return false;
++	printf("PANDORA WLAN: M1 endpoint found; BAR0 raw %#x, size %#llx\n", sy_rd(conf, 0x10),
++	    (unsigned long long)sy_bar0_size());
++	return true;
 +}
 +
 +/* ---- the run ------------------------------------------------------------------- */
@@ -1346,8 +1330,6 @@
 +static void
 +sy_run(void)
 +{
-+	bool ok;
-+
 +	printf("PANDORA WLAN: step %u: mapping windows\n", sy_step);
 +	parf = ml_io_map(SY_PARF_PA, SY_PARF_SIZE);
 +	phy = ml_io_map(SY_PHY_PA, SY_PHY_SIZE);
@@ -1370,7 +1352,14 @@
 +	sy_rsc = rsc;	/* the RPMh block reuses these two mappings */
 +	sy_cmddb = cmddb;
 +	printf("PANDORA WLAN: windows mapped\n");
-+	sy_sm_load();
++	{
++		int sm_on = 0;
++
++		(void)PE_parse_boot_argn("pandora_sm", &sm_on, sizeof(sm_on));
++		if (sm_on) {
++			sy_sm_load();
++		}
++	}
 +	sy_dump_state();
 +	if (sy_step < 2) {
 +		return;
@@ -1421,15 +1410,17 @@
 +	sy_root_port_setup();
 +	delay_for_interval(50, NSEC_PER_MSEC);
 +	sy_pin_level(PIN_PERST, IO_HIGH);
-+	ok = sy_link_wait();
-+	if (!ok) {
-+		return;
-+	}
++	/* PCIe CEM TPVPERL: let the reference clock and the PHY settle before the first
++	 * configuration cycle. The document makes PARF+0x1b0 and the DBI informational only;
++	 * the single outbound config read below is M1's pass criterion. */
++	delay_for_interval(100, NSEC_PER_MSEC);
++	printf("PANDORA WLAN: after PERST: parf ltssm %#x sys %#x (information only)\n",
++	    sy_rd(parf, PARF_LTSSM), sy_rd(parf, PARF_SYS_CTRL));
 +	if (sy_step < 6) {
 +		return;
 +	}
 +
-+	printf("PANDORA WLAN: step %u: ECAM and the endpoint\n", sy_step);
++	printf("PANDORA WLAN: step %u: ECAM and the endpoint (one outbound config read)\n", sy_step);
 +	sy_iatu_ecam();
 +	if (sy_config_read()) {
 +		printf("PANDORA WLAN: M1 DONE: 17cb:110e answers on PCIe0\n");
