@@ -364,3 +364,43 @@ GMU 的寄存器地址都按"GPU 基地址 `0x3d00000` 加偏移"换算，所以
 - 不要把缓存放回会被 dirs_cleaner 清理的 `/private/var/tmp`；
 - 不要为省事把 `default.pipelinelib` 的 AGX 二进制硬塞给 Adreno；它只能走"AIR 现编 + 持久缓存/pack"这条路；
 - 管线缓存 key 必须排除每次启动都会变的量（registryID/UUID/路径），否则即使目录持久也永远 miss。
+
+## 2026-11-05 下午：管线包修复与实测结果（承接上午的根因）
+
+上午的结论是"管线缓存落在会被清空的 temp 目录，需要持久化/镜像包"。下午把这条链路真正打通，并发现两个关键实现事实：
+
+### 1. 插件必须在 **clientDevice** 路径导入包（adapt_ios16.py 第 5 条改动）
+
+- `NativeAdrenoMetal.clients` 里有 `backboardd`，adapt 之后发现流程对所有进程都走 `publish::clientDevice()`；
+- 而 `cacheexport::importPack("NativeAdrenoMetal.m2vpack")` 原来只写在 `deviceForPort()`（publish 路径）里，**clientDevice 的候选目录循环没有导入代码**；
+- 这解释了第一次加包（fwpack B）完全无效：`PANDORA FILES` 显示包装进了根卷，但缓存命中仍是 `hit0`，盘上也没有导入的文件；
+- 修法：在 `tools/metal/adapt_ios16.py` 末尾加第 5 条 `edit()`，把导入逻辑加进 clientDevice 的候选目录循环（导入后打印 `pandora-metal: imported N pipeline cache files from …`）；
+- 重建插件（`gpu-plugin-build` 工作流，run 41981342981）后，新插件 `587449cd…` 才真正带导入。
+
+### 2. 包格式与工具
+
+- 包 = `SHEXP001` + u32 stream bytes + u32 compressed bytes + zlib(流)；
+- 流 = `M2VCACH1` + 目录长度/目录 + 文件数 + 每文件 `path_len, mode, uid, gid, size, path, bytes`；
+- 工具 `mk_m2vpack.py`（新增）：直接读 pinned 缓存卷里的 `/tmp/com.apple.backboardd/m2v` 目录生成包，并离线按 `CacheExport.h` 的 `importPack` 逻辑校验（含路径安全检查、逐文件字节比对）。
+
+### 3. 真机结果（这是第一次真正命中）
+
+| fwpack | 包内容 | 导入日志 | 缓存统计 |
+|---|---|---|---|
+| B | 605 文件 | **未导入**（clientDevice 无导入代码） | `hit0 miss111`（与无包相同） |
+| C | 605 文件 + 新插件 | `imported 605 pipeline cache files` | `T0 hit90 miss2`；使用中 `T3 hit106 miss31` |
+| D | 690 文件 | `imported 690` | `T0 hit90 miss16`；本次会话累计 `hit144 miss214`（操作多、新变体多） |
+| E | 1266 文件（`a0c3…` 937 + `529a…` 328） | 待测 | — |
+
+结论：
+
+- 命中从 **0 → 90+**，用户主观感受"好多了，只剩偶尔小掉帧"；
+- 剩余掉帧 = 会话中新出现的管线变体（每条首次使用现编，max 114–141 ms），已随迭代收进下一版包（690 → 1266 文件）；
+- 缓存 key 是 `v1/<hash>`，与 **Turnip(libvulkan) 构建版本**绑定：换 Turnip 必须重新生成包；插件更新且 Turnip 不变时 key 不变，旧包仍有效（C→D 已验证）；
+- 当前部署的 libvulkan 保持 `d4a3c4b6…`（16.4 MB 级 17,193,616 B），插件 `487449cd…`（22,238,176 B）。
+
+### 4. 仍待做
+
+- 用 fwpack E 复测，确认典型使用下的 miss 收敛到个位数；
+- 若要把首次开机就做到零现编：把"日常操作"的变体全部收进包（继续迭代），或启用插件自带的 `primelist` 预热；
+- 本节的部署参数：`songyuan_wlan=6 pandora_sm=1`，fwpack 用 `-FwPack` 重新 pin（见各次测试记录）。
