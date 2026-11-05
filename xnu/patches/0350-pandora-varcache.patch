@@ -27,7 +27,7 @@
   */
  #include <sys/param.h>
  #include <sys/systm.h>
-@@ -15,16 +29,316 @@
+@@ -15,16 +29,315 @@
  #include <sys/vnode.h>
  #include <sys/vnode_internal.h>
  #include <sys/mount_internal.h>
@@ -35,7 +35,6 @@
 +#include <sys/kauth.h>
 +#include <sys/stat.h>
 +#include <sys/uio_internal.h>
-+#include <kern/kalloc.h>
  #include <kern/clock.h>
  #include <kern/thread.h>
  #include <kern/sched_prim.h>
@@ -344,7 +343,7 @@
  static int cv_chan;
  
  static void
-@@ -34,6 +348,113 @@
+@@ -34,6 +347,112 @@
  	clock_interval_to_deadline(ms, NSEC_PER_MSEC, &deadline);
  	(void)assert_wait_deadline(&cv_chan, THREAD_UNINT, deadline);
  	thread_block(THREAD_CONTINUE_NULL);
@@ -375,7 +374,9 @@
 +};
 +
 +#define CV_SAVED_MAX 4
++#define CV_SAVED_BYTES 16384
 +static struct cv_saved cv_saved[CV_SAVED_MAX];
++static uint8_t cv_saved_data[CV_SAVED_MAX][CV_SAVED_BYTES];
 +static unsigned cv_saved_n;
 +
 +static void
@@ -399,10 +400,10 @@
 +		if (vnode_getattr(vp, &va, ctx) == 0 && va.va_data_size > 0 &&
 +		    va.va_data_size <= 16384 && cv_saved_n < CV_SAVED_MAX) {
 +			size_t n = (size_t)va.va_data_size;
-+			uint8_t *buf = kalloc(n);
++			uint8_t *buf = cv_saved_data[cv_saved_n];
 +			int resid = 0;
 +
-+			if (buf != NULL &&
++			if (n <= CV_SAVED_BYTES &&
 +			    vn_rdwr(UIO_READ, vp, (caddr_t)buf, (int)n, 0, UIO_SYSSPACE, 0,
 +			    vfs_context_ucred(ctx), &resid, vfs_context_proc(ctx)) == 0 &&
 +			    resid == 0) {
@@ -416,9 +417,6 @@
 +				saved++;
 +				vnode_put(vp);
 +				continue;
-+			}
-+			if (buf != NULL) {
-+				kfree(buf, n);
 +			}
 +		}
 +		vnode_put(vp);
@@ -458,7 +456,7 @@
  }
  
  static void
-@@ -51,21 +472,896 @@
+@@ -51,21 +470,896 @@
  		cv_sleep(100);
  	}
  	if (rootvnode == NULLVP) {
