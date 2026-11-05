@@ -351,112 +351,112 @@
 +
 +
 +/*
-+ * 0351: the firmware pack re-installs /private/var/mobile/Library/Preferences/
-+ * com.apple.purplebuddy.plist on every boot. pf only writes a file whose bytes differ, and the
-+ * pack's seed (SetupDone/SetupFinishedAllSteps/SetupVersion 11) is older than what iOS writes once
-+ * it has completed setup, so the second and every later boot gets the setup state rolled back and
-+ * SpringBoard launches Setup Assistant again (log: "exec Setup" only on later boots; the fresh
-+ * volume boot did not). Keep the phone's own copy across the pack install and put it back, so the
-+ * seed only ever fills a first boot (when the file does not exist yet).
++ * 0352: Setup Assistant itself rewrites com.apple.purplebuddy.plist with only
++ * {lastPrepareLaunchSentinel, UserChoseLanguage} when it runs (seen on the phone: 115 bytes,
++ * no SetupDone), so after the first run it runs again on every boot. These are the firmware
++ * pack's own seed bytes (SetupDone true, SetupFinishedAllSteps true, SetupVersion 11): write
++ * them after the pack install and again just before SpringBoard starts.
 + */
-+static const char *const cv_prefs[] = {
-+	"/private/var/mobile/Library/Preferences/com.apple.purplebuddy.plist",
-+	"/private/var/mobile/Library/Preferences/com.apple.purplebuddy.notbackedup.plist",
++static const uint8_t cv_seed_purplebuddy[] = {
++	0x62, 0x70, 0x6c, 0x69, 0x73, 0x74, 0x30, 0x30, 0xd4, 0x01, 0x02, 0x03, 0x04, 0x05, 0x05,
++	0x06, 0x07, 0x59, 0x53, 0x65, 0x74, 0x75, 0x70, 0x44, 0x6f, 0x6e, 0x65, 0x5f, 0x10, 0x15,
++	0x53, 0x65, 0x74, 0x75, 0x70, 0x46, 0x69, 0x6e, 0x69, 0x73, 0x68, 0x65, 0x64, 0x41, 0x6c,
++	0x6c, 0x53, 0x74, 0x65, 0x70, 0x73, 0x5c, 0x53, 0x65, 0x74, 0x75, 0x70, 0x56, 0x65, 0x72,
++	0x73, 0x69, 0x6f, 0x6e, 0x5f, 0x10, 0x13, 0x64, 0x61, 0x65, 0x6d, 0x6f, 0x6e, 0x69, 0x7a,
++	0x65, 0x4e, 0x65, 0x65, 0x64, 0x73, 0x54, 0x6f, 0x52, 0x75, 0x6e, 0x09, 0x10, 0x0b, 0x08,
++	0x08, 0x11, 0x1b, 0x33, 0x40, 0x56, 0x57, 0x59, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01,
++	0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x5a,
++};
++static const uint8_t cv_seed_notbackedup[] = {
++	0x62, 0x70, 0x6c, 0x69, 0x73, 0x74, 0x30, 0x30, 0xd7, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06,
++	0x07, 0x08, 0x08, 0x08, 0x08, 0x08, 0x08, 0x08, 0x5f, 0x10, 0x1d, 0x53, 0x68, 0x6f, 0x75,
++	0x6c, 0x64, 0x52, 0x75, 0x6e, 0x44, 0x69, 0x61, 0x67, 0x6e, 0x6f, 0x73, 0x74, 0x69, 0x63,
++	0x73, 0x4d, 0x69, 0x6e, 0x69, 0x42, 0x75, 0x64, 0x64, 0x79, 0x5f, 0x10, 0x16, 0x53, 0x68,
++	0x6f, 0x75, 0x6c, 0x64, 0x52, 0x75, 0x6e, 0x48, 0x53, 0x41, 0x32, 0x4d, 0x69, 0x6e, 0x69,
++	0x42, 0x75, 0x64, 0x64, 0x79, 0x5f, 0x10, 0x1e, 0x53, 0x68, 0x6f, 0x75, 0x6c, 0x64, 0x52,
++	0x75, 0x6e, 0x4b, 0x65, 0x79, 0x63, 0x68, 0x61, 0x69, 0x6e, 0x53, 0x79, 0x6e, 0x63, 0x4d,
++	0x69, 0x6e, 0x69, 0x42, 0x75, 0x64, 0x64, 0x79, 0x5f, 0x10, 0x16, 0x53, 0x68, 0x6f, 0x75,
++	0x6c, 0x64, 0x52, 0x75, 0x6e, 0x4d, 0x65, 0x73, 0x61, 0x4d, 0x69, 0x6e, 0x69, 0x42, 0x75,
++	0x64, 0x64, 0x79, 0x5f, 0x10, 0x19, 0x53, 0x68, 0x6f, 0x75, 0x6c, 0x64, 0x52, 0x75, 0x6e,
++	0x50, 0x61, 0x79, 0x6d, 0x65, 0x6e, 0x74, 0x4d, 0x69, 0x6e, 0x69, 0x42, 0x75, 0x64, 0x64,
++	0x79, 0x5f, 0x10, 0x1a, 0x53, 0x68, 0x6f, 0x75, 0x6c, 0x64, 0x52, 0x75, 0x6e, 0x53, 0x74,
++	0x61, 0x6e, 0x64, 0x61, 0x72, 0x64, 0x4d, 0x69, 0x6e, 0x69, 0x42, 0x75, 0x64, 0x64, 0x79,
++	0x5f, 0x10, 0x11, 0x53, 0x69, 0x6c, 0x65, 0x6e, 0x74, 0x49, 0x43, 0x44, 0x50, 0x55, 0x70,
++	0x67, 0x72, 0x61, 0x64, 0x65, 0x08, 0x08, 0x17, 0x37, 0x50, 0x71, 0x8a, 0xa6, 0xc3, 0xd7,
++	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++	0x09, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++	0x00, 0xd8,
 +};
 +
-+struct cv_saved {
-+	const char *path;
-+	uint8_t *data;
-+	size_t size;
-+	uid_t uid;
-+	gid_t gid;
-+	mode_t mode;
-+};
-+
-+#define CV_SAVED_MAX 4
-+#define CV_SAVED_BYTES 16384
-+static struct cv_saved cv_saved[CV_SAVED_MAX];
-+static uint8_t cv_saved_data[CV_SAVED_MAX][CV_SAVED_BYTES];
-+static unsigned cv_saved_n;
-+
-+static void
-+cv_preserve_prefs(void)
++static int
++cv_prefs_write(const char *path, const uint8_t *data, size_t len)
 +{
 +	vfs_context_t ctx = vfs_context_kernel();
-+	unsigned saved = 0;
++	vnode_t vp = NULLVP;
++	vnode_attr va;
++	int error, resid = 0;
 +
-+	for (unsigned i = 0; i < sizeof(cv_prefs) / sizeof(cv_prefs[0]); i++) {
-+		vnode_t vp = NULLVP;
-+		struct vnode_attr va;
-+
-+		if (vnode_lookup(cv_prefs[i], 0, &vp, ctx) != 0) {
-+			continue;	/* first boot: nothing to keep, the pack seeds it */
-+		}
++	error = vnode_lookup(path, 0, &vp, ctx);
++	if (error != 0) {
++		return error;
++	}
++	error = vn_rdwr(UIO_WRITE, vp, (caddr_t)data, (int)len, 0, UIO_SYSSPACE, IO_SYNC,
++	    vfs_context_ucred(ctx), &resid, vfs_context_proc(ctx));
++	if (error == 0 && resid != 0) {
++		error = EIO;
++	}
++	if (error == 0) {
 +		VATTR_INIT(&va);
-+		VATTR_WANTED(&va, va_data_size);
-+		VATTR_WANTED(&va, va_uid);
-+		VATTR_WANTED(&va, va_gid);
-+		VATTR_WANTED(&va, va_mode);
-+		if (vnode_getattr(vp, &va, ctx) == 0 && va.va_data_size > 0 &&
-+		    va.va_data_size <= 16384 && cv_saved_n < CV_SAVED_MAX) {
-+			size_t n = (size_t)va.va_data_size;
-+			uint8_t *buf = cv_saved_data[cv_saved_n];
-+			int resid = 0;
-+
-+			if (n <= CV_SAVED_BYTES &&
-+			    vn_rdwr(UIO_READ, vp, (caddr_t)buf, (int)n, 0, UIO_SYSSPACE, 0,
-+			    vfs_context_ucred(ctx), &resid, vfs_context_proc(ctx)) == 0 &&
-+			    resid == 0) {
-+				cv_saved[cv_saved_n].path = cv_prefs[i];
-+				cv_saved[cv_saved_n].data = buf;
-+				cv_saved[cv_saved_n].size = n;
-+				cv_saved[cv_saved_n].uid = va.va_uid;
-+				cv_saved[cv_saved_n].gid = va.va_gid;
-+				cv_saved[cv_saved_n].mode = va.va_mode;
-+				cv_saved_n++;
-+				saved++;
-+				vnode_put(vp);
-+				continue;
-+			}
-+		}
-+		vnode_put(vp);
++		VATTR_SET(&va, va_data_size, (off_t)len);
++		VATTR_SET(&va, va_uid, 501);
++		VATTR_SET(&va, va_gid, 501);
++		VATTR_SET(&va, va_mode, S_IFREG | 0644);
++		error = vnode_setattr(vp, &va, ctx);
 +	}
-+	if (saved != 0) {
-+		printf("PANDORA CACHE: kept %u setup-state file(s) across the firmware pack\n", saved);
-+	}
++	vnode_put(vp);
++	return error;
 +}
 +
 +static void
-+cv_restore_prefs(void)
++cv_prefs_seed(const char *when)
++{
++	int e1 = cv_prefs_write("/private/var/mobile/Library/Preferences/com.apple.purplebuddy.plist",
++	    cv_seed_purplebuddy, sizeof(cv_seed_purplebuddy));
++	int e2 = cv_prefs_write("/private/var/mobile/Library/Preferences/com.apple.purplebuddy.notbackedup.plist",
++	    cv_seed_notbackedup, sizeof(cv_seed_notbackedup));
++
++	printf("PANDORA CACHE: setup state seeded (%s): purplebuddy %d, notbackedup %d\n", when, e1, e2);
++}
++
++static void
++cv_prefs_probe(const char *when)
 +{
 +	vfs_context_t ctx = vfs_context_kernel();
-+	unsigned restored = 0;
++	vnode_t vp = NULLVP;
++	vnode_attr va;
++	uint8_t head[24] = { 0 };
 +
-+	for (unsigned i = 0; i < cv_saved_n; i++) {
-+		vnode_t vp = NULLVP;
-+		struct vnode_attr va;
-+		int resid = 0;
-+
-+		if (vnode_lookup(cv_saved[i].path, 0, &vp, ctx) != 0) {
-+			continue;
-+		}
-+		(void)vn_rdwr(UIO_WRITE, vp, (caddr_t)cv_saved[i].data,
-+		    (int)cv_saved[i].size, 0, UIO_SYSSPACE, IO_SYNC,
-+		    vfs_context_ucred(ctx), &resid, vfs_context_proc(ctx));
-+		VATTR_INIT(&va);
-+		VATTR_SET(&va, va_data_size, (off_t)cv_saved[i].size);
-+		VATTR_SET(&va, va_uid, cv_saved[i].uid);
-+		VATTR_SET(&va, va_gid, cv_saved[i].gid);
-+		VATTR_SET(&va, va_mode, cv_saved[i].mode);
-+		(void)vnode_setattr(vp, &va, ctx);
-+		vnode_put(vp);
-+		restored++;
++	if (vnode_lookup("/private/var/mobile/Library/Preferences/com.apple.purplebuddy.plist", 0,
++	    &vp, ctx) != 0) {
++		printf("PANDORA CACHE: purplebuddy.plist absent (%s)\n", when);
++		return;
 +	}
-+	printf("PANDORA CACHE: put back %u setup-state file(s) after the firmware pack\n", restored);
++	va.va_data_size = 0;
++	VATTR_INIT(&va);
++	VATTR_WANTED(&va, va_data_size);
++	if (vnode_getattr(vp, &va, ctx) == 0 && va.va_data_size > 0 && va.va_data_size <= 4096) {
++		int resid = 0;
++		(void)vn_rdwr(UIO_READ, vp, (caddr_t)head, (int)MIN(sizeof(head), (size_t)va.va_data_size),
++		    0, UIO_SYSSPACE, 0, vfs_context_ucred(ctx), &resid, vfs_context_proc(ctx));
++	}
++	printf("PANDORA CACHE: purplebuddy.plist before seeding (%s): %lld bytes, head %02x%02x%02x%02x\n",
++	    when, (long long)va.va_data_size, head[0], head[1], head[2], head[3]);
++	vnode_put(vp);
  }
  
  static void
-@@ -51,21 +470,917 @@
+@@ -51,21 +470,932 @@
  		cv_sleep(100);
  	}
  	if (rootvnode == NULLVP) {
@@ -474,13 +474,12 @@
 +	printf("PANDORA CACHE: mount /dev/ufscache0 on " CV_MOUNT " -> %d\n", error);
 +	if (error == 0) {
 +		cv_seed_skeleton();
-+		/* 0351: pf installs the pack at ~2.9 s; keep the phone's setup state and put it
-+		 * back at ~4.4 s, before SpringBoard at ~12.4 s reads it. */
-+		cv_preserve_prefs();
-+		if (cv_saved_n != 0) {
-+			cv_sleep(2500);
-+			cv_restore_prefs();
-+		}
++		/* 0352: the pack installs at ~2.9 s; SpringBoard starts at ~12.4 s. */
++		cv_prefs_probe("before the firmware pack");
++		cv_sleep(2500);
++		cv_prefs_seed("after the firmware pack");
++		cv_sleep(7000);
++		cv_prefs_seed("just before SpringBoard");
 +	}
  out:
  	(void)thread_terminate(current_thread());
@@ -1112,6 +1111,8 @@
 +	sy_wr(parf, PARF_DBI_BASE + 4, 0);
 +	sy_wr(parf, PARF_ATU_BASE, (uint32_t)SY_IATU_PA);
 +	sy_wr(parf, PARF_ATU_BASE + 4, (uint32_t)(SY_IATU_PA >> 32));
++	sy_wr(parf, 0x358, 0);				/* SLV_ADDR_SPACE_SIZE */
++	sy_wr(parf, 0x35c, 0x80000000);		/* SLV_ADDR_SPACE_SIZE_HI (pci-msm.c: 0x80000000) */
 +	sy_wr(parf, PARF_SYS_CTRL, 0x365e);	/* pci-msm.c msm_pcie_enable_link */
 +	sy_wr(parf, 0x174, sy_rd(parf, 0x174) | (1UL << 4));	/* MHI_CLOCK_RESET_CTRL bypass */
 +	sy_wr(parf, 0x020, sy_rd(parf, 0x020) & ~(1UL << 5));	/* PM_CTRL: no L1 entry */
@@ -1158,6 +1159,18 @@
 +	sy_wr(dbi, 0x8bc, sy_rd(dbi, 0x8bc) & ~1UL);
 +}
 +
++static void
++sy_dump_link_state(const char *when)
++{
++	printf("PANDORA WLAN: link state %s: parf ltssm %#x sys %#x phy_ctrl %#x\n", when,
++	    sy_rd(parf, PARF_LTSSM), sy_rd(parf, PARF_SYS_CTRL), sy_rd(parf, PARF_PHY_CTRL));
++	printf("PANDORA WLAN: link state %s: dbi id %#x cmd %#x status %#x link %#x clk %#x\n", when,
++	    sy_rd(dbi, 0x00), sy_rd(dbi, 0x04), sy_rd(dbi, 0x08), sy_rd(dbi, DBI_LINKCTRLSTATUS),
++	    sy_rd(dbi, 0x78));
++	printf("PANDORA WLAN: link state %s: gcc aux %#x pipe %#x ref %#x\n", when,
++	    sy_gcc_rd(GCC_AUX), sy_gcc_rd(GCC_PIPE), sy_rd(tcsr, SY_TCSR_CLKREF));
++}
++
 +static bool
 +sy_link_wait(void)
 +{
@@ -1165,6 +1178,7 @@
 +
 +	printf("PANDORA WLAN: LTSSM before enable %#x\n", ltssm);
 +	sy_wr(parf, PARF_LTSSM, sy_rd(parf, PARF_LTSSM) | PARF_LTSSM_EN);
++	printf("PANDORA WLAN: LTSSM after enable %#x\n", sy_rd(parf, PARF_LTSSM));
 +	for (unsigned i = 0; i < 500; i++) {
 +		uint32_t status = sy_rd(dbi, DBI_LINKCTRLSTATUS);
 +		ltssm = sy_rd(parf, PARF_LTSSM) & 0x3f;
@@ -1178,6 +1192,7 @@
 +	}
 +	printf("PANDORA WLAN: link did not come up; LTSSM %#x, link status %#x\n",
 +	    sy_rd(parf, PARF_LTSSM) & 0x3f, sy_rd(dbi, DBI_LINKCTRLSTATUS));
++	sy_dump_link_state("after the timeout");
 +	return false;
 +}
 +
