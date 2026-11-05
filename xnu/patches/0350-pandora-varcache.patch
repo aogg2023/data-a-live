@@ -549,7 +549,7 @@
 +#define SY_IATU_PA	0x410000000UL	/* "iatu", 0x1000 (separate region on this SoC) */
 +#define SY_IATU_SIZE	0x00001000UL
 +#define SY_CONF_PA	0x400100000UL	/* ECAM: dbi + 1 MiB (pci-msm.c cfg0_ecam_base) */
-+#define SY_CONF_SIZE	0x00001000UL
++#define SY_CONF_SIZE	0x00020000UL	/* bus 0..1 config space (bus 1 is the WLAN endpoint) */
 +#define SY_GCC_LOW_PA	0x00100000UL	/* gcc@100000 offset 0x10058 (cnoc_sf status) */
 +#define SY_GCC_LOW_SIZE	0x00001000UL
 +#define SY_GCC_PA	0x00150000UL	/* gcc@100000 offsets 0x52000..0x6c02c */
