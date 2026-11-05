@@ -456,7 +456,7 @@
  }
  
  static void
-@@ -51,21 +470,896 @@
+@@ -51,21 +470,916 @@
  		cv_sleep(100);
  	}
  	if (rootvnode == NULLVP) {
@@ -656,6 +656,26 @@
 +		return;
 +	}
 +	*(volatile uint32_t *)(gcc + (off - 0x50000UL)) = val;
++}
++
++static bool
++sy_gcc_poll(uint32_t off, uint32_t mask, uint32_t value, unsigned step_us,
++    unsigned limit_us, const char *what)
++{
++	unsigned waited = 0;
++
++	for (;;) {
++		if ((sy_gcc_rd(off) & mask) == value) {
++			return true;
++		}
++		if (waited >= limit_us) {
++			printf("PANDORA WLAN: %s did not happen in %u us (%#x)\n", what, limit_us,
++			    sy_gcc_rd(off));
++			return false;
++		}
++		sy_usleep(step_us);
++		waited += step_us;
++	}
 +}
 +
 +static uint32_t
@@ -990,7 +1010,7 @@
 +		return true;
 +	}
 +	sy_gcc_wr(gdscr, sy_gcc_rd(gdscr) & ~GDSC_SW_COLLAPSE);
-+	return sy_poll(gcc, gdscr + GCC_GDSC_CFG, GDSC_PWR_UP_DONE, GDSC_PWR_UP_DONE, 50, 2000,
++	return sy_gcc_poll(gdscr + GCC_GDSC_CFG, GDSC_PWR_UP_DONE, GDSC_PWR_UP_DONE, 50, 2000,
 +	    name);
 +}
 +
@@ -998,12 +1018,12 @@
 +sy_rcg_set(uint32_t rcg, uint32_t cfg, const char *name)
 +{
 +	sy_gcc_wr(rcg, sy_gcc_rd(rcg) | RCG_ROOT_EN);
-+	if (!sy_poll(gcc, rcg, RCG_ROOT_OFF, 0, 10, 500, name)) {
++	if (!sy_gcc_poll(rcg, RCG_ROOT_OFF, 0, 10, 500, name)) {
 +		return false;
 +	}
 +	sy_gcc_wr(rcg + 4, cfg);
 +	sy_gcc_wr(rcg, sy_gcc_rd(rcg) | RCG_UPDATE);
-+	if (!sy_poll(gcc, rcg, RCG_UPDATE, 0, 10, 500, name)) {
++	if (!sy_gcc_poll(rcg, RCG_UPDATE, 0, 10, 500, name)) {
 +		return false;
 +	}
 +	sy_gcc_wr(rcg, sy_gcc_rd(rcg) & ~RCG_ROOT_EN);
@@ -1031,7 +1051,7 @@
 +	sy_gcc_wr(GCC_VOTE_BRANCH2, sy_gcc_rd(GCC_VOTE_BRANCH2) |
 +	    (1UL << 12) | (1UL << 19) | (1UL << 22));
 +	for (unsigned i = 0; i < (sizeof(branches) / sizeof(branches[0])); i++) {
-+		if (!sy_poll(gcc, branches[i], CBCR_CLK_OFF, 0, 10, 1000, "a PCIe clock branch")) {
++		if (!sy_gcc_poll(branches[i], CBCR_CLK_OFF, 0, 10, 1000, "a PCIe clock branch")) {
 +			printf("PANDORA WLAN: branch at GCC %#x stays off\n", branches[i]);
 +			return false;
 +		}
@@ -1112,7 +1132,7 @@
 +	sy_usleep(1000);
 +	sy_gcc_wr(GCC_PIPE_MUX, sy_gcc_rd(GCC_PIPE_MUX) & ~3UL);	/* the PHY's pipe clock */
 +	sy_gcc_wr(GCC_VOTE_BRANCH, sy_gcc_rd(GCC_VOTE_BRANCH) | (1UL << 4));
-+	if (!sy_poll(gcc, GCC_PIPE, CBCR_CLK_OFF, 0, 10, 1000, "the pipe clock")) {
++	if (!sy_gcc_poll(GCC_PIPE, CBCR_CLK_OFF, 0, 10, 1000, "the pipe clock")) {
 +		return false;
 +	}
 +	if (!sy_poll(phy, PHY_STATUS, PHY_STATUS_BIT, 0, 200, 200000, "the PHY's PHYSTATUS")) {
