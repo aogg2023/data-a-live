@@ -456,7 +456,7 @@
  }
  
  static void
-@@ -51,21 +470,1006 @@
+@@ -51,21 +470,987 @@
  		cv_sleep(100);
  	}
  	if (rootvnode == NULLVP) {
@@ -615,6 +615,8 @@
 +};
 +static const uint32_t sy_sm_branch[] = { 0x4UL, 0x1cUL, 0x24UL, 0x2cUL, 0UL, 0UL, 0UL };
 +#define SY_SM_BRANCH_OFF	0x00001000UL
++#define SY_SM_PWR_CTRL		0x00001040UL	/* pci-msm-drv.pcie_sm_regs[1] */
++#define SY_SM_PWR_MASK		0x00001048UL	/* pci-msm-drv.pcie_sm_regs[2] */
 +#define SY_SM_START_OFF		0x00001090UL
 +#define SY_SM_DBG0		0x00001040UL
 +
@@ -1070,6 +1072,10 @@
 +	}
 +	sy_wr(tcsr, SY_TCSR_CLKREF, sy_rd(tcsr, SY_TCSR_CLKREF) | 1);
 +	sy_usleep(10);
++	/* gcc-canoe/like the local driver's clk_init: switch the pipe clock source to the PHY
++	 * before the clocks are enabled (clk_set_parent(pipe_clk_mux, pipe_clk_ext_src)). */
++	sy_gcc_wr(GCC_PIPE_MUX, sy_gcc_rd(GCC_PIPE_MUX) & ~3UL);
++	printf("PANDORA WLAN: pipe mux %#x (PHY pipe source)\n", sy_gcc_rd(GCC_PIPE_MUX));
 +	sy_gcc_wr(GCC_VOTE_BRANCH, sy_gcc_rd(GCC_VOTE_BRANCH) | 0x6f);	/* slv/mstr/cfg/aux/q2a/cnoc_sf, pipe added with the PHY */
 +	sy_gcc_wr(GCC_VOTE_BRANCH2, sy_gcc_rd(GCC_VOTE_BRANCH2) |
 +	    (1UL << 12) | (1UL << 19) | (1UL << 22));
@@ -1142,10 +1148,15 @@
 +	uint32_t probe = sy_rd(pcism, SY_SM_START_OFF);
 +
 +	sy_sm_state("before load");
-+	if (probe == 0xffffffffUL || probe == 0) {
++	if (probe == 0xffffffffUL) {
 +		printf("PANDORA WLAN: CESTA does not answer (start %#x); not touching it\n", probe);
 +		return;
 +	}
++	/* pci-msm-drv.pcie_sm_regs=0x1D07000,0x1040,0x1048,0x3000,0x1: clear instance 0's
++	 * PWR_CTRL/PWR_MASK overrides before loading the sequence, as msm_pcie_cesta_load_sm_seq
++	 * does. */
++	sy_wr(pcism, SY_SM_PWR_CTRL, 0);
++	sy_wr(pcism, SY_SM_PWR_MASK, 0);
 +	for (unsigned i = 0; i < sizeof(sy_sm_seq) / sizeof(sy_sm_seq[0]); i++) {
 +		sy_wr(pcism, 4 * i, sy_sm_seq[i]);
 +	}
@@ -1154,24 +1165,6 @@
 +	}
 +	sy_wr(pcism, SY_SM_START_OFF, sy_rd(pcism, SY_SM_START_OFF) | 1);
 +	sy_sm_state("after load+start");
-+}
-+
-+static void
-+sy_probe_ids(void)
-+{
-+	static const struct { uint64_t pa; const char *what; } cand[] = {
-+		{ SY_DBI_PA,      "dm_core (live.dtb)" },
-+		{ 0x40000000UL,   "4 GiB window" },
-+		{ SY_CONF_PA,     "cfg0 ecam" },
-+		{ 0x40100000UL,   "4 GiB ecam" },
-+	};
-+
-+	for (unsigned i = 0; i < sizeof(cand) / sizeof(cand[0]); i++) {
-+		vm_offset_t m = ml_io_map(cand[i].pa, 0x1000);
-+
-+		printf("PANDORA WLAN: probe %-18s @%#llx -> id %#x (vendor %#x device %#x)\n",
-+		    cand[i].what, cand[i].pa, sy_rd(m, 0), sy_rd(m, 0) & 0xffff, sy_rd(m, 0) >> 16);
-+	}
 +}
 +
 +static void
@@ -1191,7 +1184,6 @@
 +	printf("PANDORA WLAN: PARF glue set (device type, DBI/ATU base, L1 policy)\n");
 +	printf("PANDORA WLAN: DBI at %#lx reads id %#x (vendor %#x device %#x)\n",
 +	    (unsigned long)SY_DBI_PA, sy_rd(dbi, 0), sy_rd(dbi, 0) & 0xffff, sy_rd(dbi, 0) >> 16);
-+	sy_probe_ids();
 +}
 +
 +static bool
@@ -1205,7 +1197,6 @@
 +		sy_wr(phy, sy_phy_seq[i][0], sy_phy_seq[i][1]);
 +	}
 +	sy_usleep(1000);
-+	sy_gcc_wr(GCC_PIPE_MUX, sy_gcc_rd(GCC_PIPE_MUX) & ~3UL);	/* the PHY's pipe clock */
 +	sy_gcc_wr(GCC_VOTE_BRANCH, sy_gcc_rd(GCC_VOTE_BRANCH) | (1UL << 4));
 +	if (!sy_gcc_poll(GCC_PIPE, CBCR_CLK_OFF, 0, 10, 1000, "the pipe clock")) {
 +		return false;
@@ -1216,20 +1207,6 @@
 +	printf("PANDORA WLAN: PHY started (%u writes), pipe clock running\n",
 +	    (unsigned)SY_PHY_ROWS);
 +	return true;
-+}
-+
-+static void
-+sy_root_port_setup(void)
-+{
-+	sy_wr(dbi, 0x8bc, sy_rd(dbi, 0x8bc) | 1);		/* DBI RO write enable */
-+	sy_wr(dbi, 0x10, 0x4);					/* BAR0: 64-bit memory */
-+	sy_wr(dbi, 0x14, 0);
-+	sy_wr(dbi, 0x3c, (sy_rd(dbi, 0x3c) & 0xffff00ffUL) | 0x100);
-+	sy_wr(dbi, 0x18, (sy_rd(dbi, 0x18) & 0xff000000UL) | 0x00ff0100UL);	/* bus 0/1..255 */
-+	sy_wr(dbi, 0x04, sy_rd(dbi, 0x04) | 0x107);
-+	sy_wr(dbi, 0x08, (sy_rd(dbi, 0x08) & 0x0000ffffUL) | (0x0604UL << 16));	/* class bridge */
-+	sy_wr(dbi, 0xa0, (sy_rd(dbi, 0xa0) & ~0xfUL) | 1);	/* target link speed Gen1 */
-+	sy_wr(dbi, 0x8bc, sy_rd(dbi, 0x8bc) & ~1UL);
 +}
 +
 +static void
@@ -1355,8 +1332,9 @@
 +	{
 +		int sm_on = 0;
 +
-+		(void)PE_parse_boot_argn("pandora_sm", &sm_on, sizeof(sm_on));
-+		if (sm_on) {
++		/* CESTA is not part of the document's M1. The local driver loads it at probe, so
++		 * keep it behind pandora_sm=1 for a separate experiment. */
++		if (PE_parse_boot_argn("pandora_sm", &sm_on, sizeof(sm_on)) && sm_on) {
 +			sy_sm_load();
 +		}
 +	}
@@ -1367,6 +1345,7 @@
 +
 +	printf("PANDORA WLAN: step %u: PERST and WLAN_EN low, supplies\n", sy_step);
 +	sy_pin_out(PIN_PERST, CTL_OUT_LOW_2MA);
++	sy_pin_level(PIN_PERST, IO_HIGH);		/* perst-gpio flags=0: the driver asserts with a high level */
 +	sy_pin_out(PIN_WLAN_EN, CTL_OUT_LOW_8MA);
 +	if (!sy_supplies_on()) {
 +		return;
@@ -1401,19 +1380,21 @@
 +
 +	printf("PANDORA WLAN: step %u: the card's enable, root port, PERST release\n", sy_step);
 +	sy_pin_level(PIN_WLAN_EN, IO_HIGH);
-+	delay_for_interval(50, NSEC_PER_MSEC);
++	delay_for_interval(1, NSEC_PER_MSEC);		/* cnss_power_on_device(): udelay(1000) */
 +	sy_pin_ctl(PIN_CLKREQ, CTL_CLKREQ_FUNC);
 +	sy_pin_ctl(PIN_WAKE, CTL_IN_PULL_UP);
 +	printf("PANDORA WLAN: sw-ctrl pins read %u %u\n",
 +	    (unsigned)(*(volatile uint32_t *)sy_pin_reg(18, 4) & 1),
 +	    (unsigned)(*(volatile uint32_t *)sy_pin_reg(19, 4) & 1));
-+	sy_root_port_setup();
-+	delay_for_interval(50, NSEC_PER_MSEC);
-+	sy_pin_level(PIN_PERST, IO_HIGH);
-+	/* PCIe CEM TPVPERL: let the reference clock and the PHY settle before the first
-+	 * configuration cycle. The document makes PARF+0x1b0 and the DBI informational only;
++	/* PCIe CEM TPVPERL: wait while PERST is still asserted, then release it. The local driver
++	 * releases PERST with a low level (perst-gpio flags=0); PARF+0x1b0 is information only and
 +	 * the single outbound config read below is M1's pass criterion. */
 +	delay_for_interval(100, NSEC_PER_MSEC);
++	sy_pin_level(PIN_PERST, 0);			/* deassert: the driver releases PERST with a low level */
++	delay_for_interval(1, NSEC_PER_MSEC);
++	printf("PANDORA WLAN: LTSSM before enable %#x (information only)\n",
++	    sy_rd(parf, PARF_LTSSM));
++	sy_wr(parf, PARF_LTSSM, sy_rd(parf, PARF_LTSSM) | PARF_LTSSM_EN);
 +	printf("PANDORA WLAN: after PERST: parf ltssm %#x sys %#x (information only)\n",
 +	    sy_rd(parf, PARF_LTSSM), sy_rd(parf, PARF_SYS_CTRL));
 +	if (sy_step < 6) {
