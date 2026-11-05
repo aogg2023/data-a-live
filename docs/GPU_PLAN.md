@@ -404,3 +404,18 @@ GMU 的寄存器地址都按"GPU 基地址 `0x3d00000` 加偏移"换算，所以
 - 用 fwpack E 复测，确认典型使用下的 miss 收敛到个位数；
 - 若要把首次开机就做到零现编：把"日常操作"的变体全部收进包（继续迭代），或启用插件自带的 `primelist` 预热；
 - 本节的部署参数：`songyuan_wlan=6 pandora_sm=1`，fwpack 用 `-FwPack` 重新 pin（见各次测试记录）。
+
+## 2026-11-05 晚：触摸/UI 残余卡顿（ioslog_80）
+
+- 触摸驱动本身**没有报错**：`SONGYUAN TOUCH: N frames` 递增正常，`0 restarts, 0 errors`；接触点事件（`1 contact(s) …`）按毫秒级连续上报；v1/v2 包都收（v2 占多数）。触摸采集、SPI DMA、中断路径目前看是干净的。
+- 卡顿来自**渲染/合成侧**而不是触摸：同一日志里 GPU 侧 `PANDORA GPU WATCH` 显示 backboardd 的 alloc/map/submit/fence 持续增长（60 s 时 submit 217 / fence 220；65 s 时 466；70 s 时 594），`PANDORA GPU IRQ` 每 10 s 有 141→592 次 fence 中断，`found done without the interrupt` 少量（1–4/次）。
+- DCVS 日志：`busy 0%` 到 `busy 13%` 波动，频率多数时间停在 222 MHz，偶发升到 1200 MHz——与"管线现编时短暂卡顿"的形态一致。
+- **需要单独确认的一条遗留**：`[5.429] PANDORA GPU WATCH: SMMU fault fsr 00000400 far 000052a618dbd9cc fsynr0 00040d10`。目前只在启动早期出现一次，之后没有重复；需要确认是 GPU 启动探测的一次性 fault 还是真实 RBBM/固件路径问题（下一步在 GPU 日志里加 fault 计数器）。
+- 与之前分析的管线缓存修复对照：命中已经起来（fwpack C/D 起 `hit 90+`），剩余卡顿量级与"新变体现编（max 114–141 ms）"一致；下一步要区分三类：①缓存未命中现编；②fence/提交等待；③SMMU 异常路径。
+
+### 下一步（触摸卡顿相关）
+
+1. 在插件侧把每次 `pipeline compile` 的耗时/次数按进程累计打出来（与 kernel 的 T0..T8 命中统计对齐），确认"偶发卡顿"是否都对应一次现编；
+2. 用 `pandora-metal` 的 fence 等待统计（已有 `waits slept`、`found done without the interrupt`）判断是否 swap 等待 GPU；
+3. 对 `PANDORA GPU WATCH: SMMU fault` 加计数与首次现场（fsr/far/fsynr0 已有），确认是否与掉帧时间点重合；
+4. 若确认是"新变体现编"，继续按今天的 m2vpack 迭代把日常操作变体收进包（fwpack E 已 1266 文件，待复测）。
