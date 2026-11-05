@@ -225,7 +225,7 @@ new file mode 100644
 index 0000000000000000000000000000000000000000..0000000000000000000000000000000000000000
 --- /dev/null
 +++ b/bsd/dev/qcomusb/include/QcomXnuUsbDebug.h
-@@ -0,0 +1,143 @@
+@@ -0,0 +1,144 @@
 +/* SPDX-License-Identifier: MIT */
 +#ifndef QCOM_XNU_USB_DEBUG_H
 +#define QCOM_XNU_USB_DEBUG_H
@@ -314,6 +314,7 @@ index 0000000000000000000000000000000000000000..00000000000000000000000000000000
 +    uint32_t domain_result, domain_stage, domain_bank, domain_slot, domain_asid;
 +    uint64_t tables_pa, dma_iova, domain_last_address, domain_last_expected, domain_last_readback;
 +    uint32_t diag_enabled, diag_checkpoint;
++    uint32_t usb3ctl_before, usb3ctl_after;   /* Data A Live: GUSB3PIPECTL around the HS-only force */
 +    uint64_t buffer_capacity, buffer_pending, buffer_high_water, buffer_accepted;
 +    uint64_t buffer_overflow, buffer_contended, buffer_replayed, transport_pending;
 +    uint64_t rx_overflow, control_replies;
@@ -993,7 +994,7 @@ new file mode 100644
 index 0000000000000000000000000000000000000000..0000000000000000000000000000000000000000
 --- /dev/null
 +++ b/bsd/dev/qcomusb/kernel/QcomXnuUsbDebug.c
-@@ -0,0 +1,1551 @@
+@@ -0,0 +1,1564 @@
 +/* SPDX-License-Identifier: MIT
 + * Native XNU backend for the freestanding DWC3 core. No EFI state,
 + * Android, pstore, partition, filesystem, allocation or scheduler dependency.
@@ -1959,6 +1960,19 @@ index 0000000000000000000000000000000000000000..00000000000000000000000000000000
 +        (void)backlog_write(banner, sizeof(banner) - 1);
 +    }
 +    diag_checkpoint(QCOM_USB_DEBUG_DIAG_CORE_START);
++    /* Data A Live: the bootloader hands the controller over with a SuperSpeed link
++     * (DSTS.CONNECTSPD = SS, the PC's USB3 root hub), but this gadget is USB2 high
++     * speed only: hold the USB3 PIPE suspended and in reset so the host falls back
++     * to USB2. Read back for the status line. */
++    {
++        uint32_t pipectl = 0, wanted;
++        if (physical_read(0, QUSB_DWC3_BASE + 0xc2c0u, &pipectl)) {
++            wanted = pipectl | (1u << 17) | (1u << 31);   /* GUSB3PIPECTL SUSPHY | PHYSOFTRST */
++            (void)physical_write(0, QUSB_DWC3_BASE + 0xc2c0u, wanted);
++            native.status.usb3ctl_before = pipectl;
++            (void)physical_read(0, QUSB_DWC3_BASE + 0xc2c0u, &native.status.usb3ctl_after);
++        }
++    }
 +    ret = dwc3_start(native.core);
 +    if (ret || native.status.io_failed) {
 +        fail(QCOM_USB_DEBUG_CORE_START_FAILED, ret);
@@ -6085,9 +6099,9 @@ index 0000000000000000000000000000000000000000..00000000000000000000000000000000
 +	struct qcom_usb_debug_status s;
 +	qcom_usb_debug_get_status(&s);
 +	printf("PANDORA USB: serial %s: phase %u error %u core %d qcom %u restore %u dma mode %u lease %u at %#llx "
-+	    "width %u hwparams0 %#x; domain result %u stage %u bank %u slot %u; vbus %u/%#x phy %u/%u; polls %u, "
++	    "width %u hwparams0 %#x usb3ctl %#x->%#x; domain result %u stage %u bank %u slot %u; vbus %u/%#x phy %u/%u; polls %u, "
 +	    "dropped %llu, io failed %u\n", when, s.phase, s.error, s.core_result, s.qcom_result, s.restore_result,
-+	    s.dma_mode, s.dma_lease_active, s.dma_pa, s.dma_address_width, s.hwparams0, s.domain_result,
++	    s.dma_mode, s.dma_lease_active, s.dma_pa, s.dma_address_width, s.hwparams0, s.usb3ctl_before, s.usb3ctl_after, s.domain_result,
 +	    s.domain_stage, s.domain_bank, s.domain_slot, s.vbus_owned, s.vbus_saved, s.phy_owned, s.phy_applied,
 +	    s.poll_calls, s.dropped, s.io_failed);
 +}
@@ -6207,22 +6221,3 @@ index 0000000000000000000000000000000000000000..00000000000000000000000000000000
 +	}
 +}
 +#endif /* PANDORA */
-diff --git a/bsd/dev/pandora_cachevol.c b/bsd/dev/pandora_cachevol.c
---- a/bsd/dev/pandora_cachevol.c
-+++ b/bsd/dev/pandora_cachevol.c
-@@ -545,6 +545,7 @@
- extern kern_return_t thread_terminate(thread_t);
- extern kern_return_t kernel_thread_start_priority(thread_continue_t, void *, integer_t, thread_t *);
- void pandora_wlan_init(void);
-+extern void pandora_usb_init(void);
- 
- /* ---- windows (live DT /soc/pcie@1c00000 reg, reg-names) ---- */
- #define SY_PARF_PA	0x01c00000UL	/* "parf", 0x3000 */
-@@ -1524,6 +1525,7 @@
- {
- 	thread_t thread;
- 	pandora_wlan_init();	/* M1: PCIe RC0 bring-up, boot-arg songyuan_wlan */
-+	pandora_usb_init();	/* DWC3 CDC ACM console, boot-arg pandora_usb (bsd/dev/pandora_usb.c) */
- 	if (kernel_thread_start(pandora_cachevol_thread, NULL, &thread) == KERN_SUCCESS) {
- 		thread_deallocate(thread);
- 	}
