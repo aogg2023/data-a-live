@@ -456,7 +456,7 @@
  }
  
  static void
-@@ -51,21 +470,987 @@
+@@ -51,21 +470,1060 @@
  		cv_sleep(100);
  	}
  	if (rootvnode == NULLVP) {
@@ -564,6 +564,21 @@
 +#define SY_TCSR_SIZE	0x00001000UL
 +#define SY_TCSR_CLKREF	0x00000044UL	/* node start 0x1fd5044, tcsr_pcie_0_clkref_en reg 0 */
 +
++/* ---- CRM (CESTA Resource Manager): vendor crm-v2.c, pcie_crm_desc_v3 ---------------- */
++#define SY_CRM_PA	0x01d01000UL	/* /soc/crm@1d01000 reg[0] "base", 0x2000 */
++#define SY_CRM_SIZE	0x00002000UL
++#define SY_CRM_CHN_BUSY	0x00000370UL	/* CHN_BUSY: one completion bit per channel */
++#define SY_CRM_CHN_UPDATE	0x00000374UL	/* CHN_UPDATE: write BIT(ch) to switch */
++#define SY_CRM_PWR_ST0	0x00000000UL	/* PERF_OL PWR_ST0..4 = 0, 4, 8, c, 10 */
++#define SY_CRM_PWR_ST0_PT	0x000000b0UL	/* BW_PT PWR_ST0..4 = b0, b4, b8, bc, c0 */
++#define SY_CRM_PWR_CHN	0x00000014UL	/* PWR_ST_CHN_DISTANCE */
++#define SY_CRM_RES_DIST	0x0000002cUL	/* DRV_RESOURCE_DISTANCE */
++#define SY_CRM_DRV_DIST	0x00001000UL	/* DRV_DISTANCE (stride per drv id) */
++#define SY_CRM_NUM_PWR	5UL	/* power states per channel (phone's CRM IPC log) */
++#define SY_CRM_PERF_OL_RES	2UL	/* PERF_OL VCD resources (same log) */
++#define SY_CRM_BW_PT_RES	16UL	/* BW_PT nodes (same log) */
++#define SY_CRM_D0_PERF_LVL	4UL	/* bw_gen_max 3 + PERF_LVL_L1SS 1 */
++
 +/* ---- GCC (gcc-canoe.c) ---- */
 +#define GCC_GDSC_PCIE	0x0006b004UL	/* gcc_pcie_0_gdsc.gdscr */
 +#define GCC_GDSC_PHY	0x0006c000UL	/* gcc_pcie_0_phy_gdsc.gdscr */
@@ -648,7 +663,7 @@
 +
 +
 +
-+static vm_offset_t parf, phy, dbi, iatu, conf, pcism, gcc_low, gcc, tlmm_low, tlmm, tcsr, rsc, cmddb;
++static vm_offset_t parf, phy, dbi, iatu, conf, pcism, gcc_low, gcc, tlmm_low, tlmm, tcsr, rsc, cmddb, crm;
 +#define SY_PHY_ROWS (sizeof(sy_phy_seq) / sizeof(sy_phy_seq[0]))
 +#define SY_SUPPLY_N (sizeof(sy_supplies) / sizeof(sy_supplies[0]))
 +static unsigned sy_step;
@@ -1274,6 +1289,53 @@
 +	return true;
 +}
 +
++/* CRM D0: the power state vote the local driver's CESTA path sends before it resets
++ * the controller (pci-msm msm_pcie_enable_cesta -> crm_write_perf_ol + crm_write_pwr_states).
++ * Register offsets are pcie_crm_desc_v3's; the counts are from the phone's own CRM IPC log
++ * (5 power states, 2 PERF_OL VCDs, 16 BW_PT nodes). Without the vote the core never leaves
++ * reset: PARF answers while DBI and the config window stay all ones. */
++static bool
++sy_crm_d0(void)
++{
++	uint32_t update, ch, mask, busy = ~0U;
++	unsigned res, pwr, tries;
++
++	update = sy_rd(crm, SY_CRM_CHN_UPDATE);
++	if (!update)
++		ch = 0;
++	else if (update & 1)
++		ch = 1;
++	else if (update & 2)
++		ch = 0;
++	else {
++		printf("PANDORA WLAN: CRM: both channels busy (%#x)\n", update);
++		return false;
++	}
++	/* PERF_OL: resource 0 is this RC's VCD; states 0 and 1 carry D0's perf level,
++	 * the rest stay zero as the vendor's cache is zero filled. */
++	for (res = 0; res < SY_CRM_PERF_OL_RES; res++)
++		for (pwr = 0; pwr < SY_CRM_NUM_PWR; pwr++)
++			sy_wr(crm, SY_CRM_PWR_ST0 + pwr * 4 + ch * SY_CRM_PWR_CHN +
++			    res * SY_CRM_RES_DIST,
++			    (res == 0 && pwr < 2) ? SY_CRM_D0_PERF_LVL : 0);
++	/* BW_PT: no bandwidth votes are cached for D0; the vendor flushes zeros. */
++	for (res = 0; res < SY_CRM_BW_PT_RES; res++)
++		for (pwr = 0; pwr < SY_CRM_NUM_PWR; pwr++)
++			sy_wr(crm, SY_CRM_PWR_ST0_PT + pwr * 4 + ch * SY_CRM_PWR_CHN +
++			    res * SY_CRM_RES_DIST, 0);
++	sy_wr(crm, SY_CRM_CHN_UPDATE, 1U << ch);
++	mask = 1U << ch;
++	for (tries = 0; tries < 100; tries++) {
++		busy = sy_rd(crm, SY_CRM_CHN_BUSY) & mask;
++		if (busy == mask)
++			break;
++		sy_usleep(100);
++	}
++	printf("PANDORA WLAN: CRM D0: chn_update %#x channel %u: switch %s after %u tries (busy %#x)\n",
++	    update, ch, busy == mask ? "complete" : "timeout", tries + 1, busy);
++	return busy == mask;
++}
++
 +/* ---- the run ------------------------------------------------------------------- */
 +
 +static void
@@ -1314,6 +1376,7 @@
 +	iatu = ml_io_map(SY_IATU_PA, SY_IATU_SIZE);
 +	conf = ml_io_map(SY_CONF_PA, SY_CONF_SIZE);
 +	pcism = ml_io_map(SY_SM_PA, SY_SM_SIZE);
++	crm = ml_io_map(SY_CRM_PA, SY_CRM_SIZE);
 +	gcc_low = ml_io_map(SY_GCC_LOW_PA, SY_GCC_LOW_SIZE);
 +	gcc = ml_io_map(SY_GCC_PA, SY_GCC_SIZE);
 +	tlmm_low = ml_io_map(SY_TLMM_LOW_PA, SY_TLMM_LOW_SIZE);
@@ -1321,7 +1384,7 @@
 +	tcsr = ml_io_map(SY_TCSR_PA, SY_TCSR_SIZE);
 +	rsc = ml_io_map(SY_RSC_PA, SY_RSC_SIZE);
 +	cmddb = ml_io_map_wcomb(SY_CMDDB_PA, SY_CMDDB_SIZE);
-+	if (!parf || !phy || !dbi || !iatu || !conf || !gcc_low || !gcc || !tlmm_low ||
++	if (!parf || !phy || !dbi || !iatu || !conf || !crm || !gcc_low || !gcc || !tlmm_low ||
 +	    !tlmm || !tcsr || !rsc || !cmddb) {
 +		printf("PANDORA WLAN: a window cannot be mapped\n");
 +		return;
@@ -1354,6 +1417,16 @@
 +	printf("PANDORA WLAN: step %u: clocks\n", sy_step);
 +	if (!sy_clocks_on()) {
 +		return;
++	}
++	{
++		int crm_on = 1;	/* pandora_crm=0 skips the vote for a comparison boot */
++
++		(void)PE_parse_boot_argn("pandora_crm", &crm_on, sizeof(crm_on));
++		if (crm_on) {
++			printf("PANDORA WLAN: step %u: CRM D0 (power state vote)\n", sy_step);
++			if (!sy_crm_d0())
++				printf("PANDORA WLAN: CRM D0 did not complete; the controller may stay off\n");
++		}
 +	}
 +	printf("PANDORA WLAN: step %u: resets and PARF\n", sy_step);
 +	sy_gcc_wr(GCC_BCR_PCIE, sy_gcc_rd(GCC_BCR_PCIE) | 1);
