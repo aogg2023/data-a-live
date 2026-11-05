@@ -456,7 +456,7 @@
  }
  
  static void
-@@ -51,21 +470,1143 @@
+@@ -51,21 +470,1117 @@
  		cv_sleep(100);
  	}
  	if (rootvnode == NULLVP) {
@@ -1513,39 +1513,13 @@
 +	sy_wr(parf, PARF_LTSSM, sy_rd(parf, PARF_LTSSM) | PARF_LTSSM_EN);
 +	printf("PANDORA WLAN: after PERST: parf ltssm %#x sys %#x (information only)\n",
 +	    sy_rd(parf, PARF_LTSSM), sy_rd(parf, PARF_SYS_CTRL));
-+	/* Second round: poll the link only after the PHY; a real DBI answer is required
-+	 * (0xffffffff has bit29 set and used to be mistaken for LINK_ACTIVE). */
-+	sy_link_up = 0;
-+	{
-+		unsigned i, last = 0xffffffffu;
-+
-+		for (i = 0; i < 100; i++) {
-+			/* Local DT qcom,pcie-sm-debug: 0x1040..0x109c are this SoC's state
-+			 * registers; the sm8550-class PARF 0x1b0 layout is not assumed here. */
-+			uint32_t smdbg = sy_rd(pcism, 0x1090);
-+			uint32_t ltssm = sy_rd(parf, PARF_LTSSM);	/* side note only */
-+			uint32_t state = smdbg & 0x3fu;
-+			uint32_t d80 = sy_rd(dbi, 0x80);
-+			uint32_t d0 = sy_rd(dbi, 0);
-+
-+			if (state != last) {
-+				printf("PANDORA WLAN: link wait %u ms: sm-debug %#x state %#x (parf %#x) dbi0 %#x dbi80 %#x\n",
-+				    i * 10, smdbg, state, ltssm, d0, d80);
-+				last = state;
-+			}
-+			if ((i % 10) == 0 && d80 != 0xffffffffUL && d0 != 0xffffffffUL &&
-+			    (d80 & (1UL << 29))) {
-+				printf("PANDORA WLAN: link active after %u ms (dbi0 %#x dbi80 %#x)\n",
-+				    i * 10, d0, d80);
-+				sy_link_up = 1;
-+				break;
-+			}
-+			delay_for_interval(10, NSEC_PER_MSEC);
-+		}
-+		printf("PANDORA WLAN: link wait done: active %u, parf ltssm %#x dbi0 %#x dbi80 %#x\n",
-+		    sy_link_up, sy_rd(parf, PARF_LTSSM), sy_rd(dbi, 0), sy_rd(dbi, 0x80));
-+		sy_sm_state("after link wait");
-+	}
++	/* Plan SS6 (L218-220): sm-debug, PARF LTSSM and DBI values are logged only and
++	 * never gate anything; the single outbound config read is the only pass test. */
++	delay_for_interval(100, NSEC_PER_MSEC);
++	printf("PANDORA WLAN: link setup done: parf %#x sm-debug %#x dbi0 %#x dbi80 %#x (log only)\n",
++	    sy_rd(parf, PARF_LTSSM), sy_rd(pcism, 0x1090), sy_rd(dbi, 0), sy_rd(dbi, 0x80));
++	sy_sm_state("after link setup");
++	sy_link_up = 1;	/* one attempt is allowed by the plan; pass = 17cb:110e */
 +	if (sy_step < 6) {
 +		return;
 +	}
