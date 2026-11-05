@@ -27,12 +27,14 @@
   */
  #include <sys/param.h>
  #include <sys/systm.h>
-@@ -15,16 +29,314 @@
+@@ -15,16 +29,316 @@
  #include <sys/vnode.h>
  #include <sys/vnode_internal.h>
  #include <sys/mount_internal.h>
-+#include <sys/uio.h>
-+#include <kern/vfs_context.h>
++#include <sys/fcntl.h>
++#include <sys/kauth.h>
++#include <sys/stat.h>
++#include <sys/uio_internal.h>
 +#include <vm/vm_kern.h>
  #include <kern/clock.h>
  #include <kern/thread.h>
@@ -342,7 +344,7 @@
  static int cv_chan;
  
  static void
-@@ -34,6 +346,111 @@
+@@ -34,6 +348,113 @@
  	clock_interval_to_deadline(ms, NSEC_PER_MSEC, &deadline);
  	(void)assert_wait_deadline(&cv_chan, THREAD_UNINT, deadline);
  	thread_block(THREAD_CONTINUE_NULL);
@@ -402,7 +404,8 @@
 +
 +			if (buf != NULL &&
 +			    vn_rdwr(UIO_READ, vp, (caddr_t)buf, (int)n, 0, UIO_SYSSPACE, 0,
-+			    ctx, &resid) == 0 && resid == 0) {
++			    vfs_context_ucred(ctx), &resid, vfs_context_proc(ctx)) == 0 &&
++			    resid == 0) {
 +				cv_saved[cv_saved_n].path = cv_prefs[i];
 +				cv_saved[cv_saved_n].data = buf;
 +				cv_saved[cv_saved_n].size = n;
@@ -440,7 +443,8 @@
 +			continue;
 +		}
 +		(void)vn_rdwr(UIO_WRITE, vp, (caddr_t)cv_saved[i].data,
-+		    (int)cv_saved[i].size, 0, UIO_SYSSPACE, 0, ctx, &resid);
++		    (int)cv_saved[i].size, 0, UIO_SYSSPACE, IO_SYNC,
++		    vfs_context_ucred(ctx), &resid, vfs_context_proc(ctx));
 +		VATTR_INIT(&va);
 +		VATTR_SET(&va, va_data_size, (off_t)cv_saved[i].size);
 +		VATTR_SET(&va, va_uid, cv_saved[i].uid);
@@ -454,7 +458,7 @@
  }
  
  static void
-@@ -51,21 +468,896 @@
+@@ -51,21 +472,896 @@
  		cv_sleep(100);
  	}
  	if (rootvnode == NULLVP) {
