@@ -1268,3 +1268,30 @@ extern "C" size_t native_bridge_metal_pandora_work(char *out,size_t size) {
 }
 ''')
 print('added the work counts to the report')
+
+# 5. The pipeline cache pack (NativeAdrenoMetal.m2vpack beside the bundle) is imported on the client path as
+#    well: without NativeAdrenoMetal.publish the discovery uses clientDevice for every process (backboardd
+#    included), and that loop opened the device without reading the pack; only the publish path had it.
+edit('NativeAdrenoMetalPlugin.mm',
+"""    for (unsigned i = 0; i < 2 && !device; ++i) {
+        if (!candidates[i][0]) continue;
+        strlcat(candidates[i], "m2v", sizeof candidates[i]);
+        mkdir(candidates[i], 0700);
+        if (access(candidates[i], W_OK) != 0) continue;
+        ++usable;
+""",
+"""    for (unsigned i = 0; i < 2 && !device; ++i) {
+        if (!candidates[i][0]) continue;
+        strlcat(candidates[i], "m2v", sizeof candidates[i]);
+        mkdir(candidates[i], 0700);
+        if (access(candidates[i], W_OK) != 0) continue;
+        // data-a-live: the image's pipeline cache pack (SHEXP001) into this process's cache directory before
+        // the runtime opens the device; the publish path imports it, the client path did not.
+        if (char pack[1024]; requestedPath("NativeAdrenoMetal.m2vpack", pack, sizeof pack)) {
+            const int imported = cacheexport::importPack(pack, candidates[i]);
+            if (imported > 0) NSLog(@"pandora-metal: imported %d pipeline cache files from %s", imported, pack);
+            else if (imported < 0) NSLog(@"pandora-metal: the pipeline cache pack %s was refused", pack);
+        }
+        ++usable;
+""")
+print('client path imports the pipeline cache pack')
