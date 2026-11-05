@@ -1382,33 +1382,33 @@
 +{
 +	printf("PANDORA WLAN: step %u: mapping windows\n", sy_step);
 +	parf = ml_io_map(SY_PARF_PA, SY_PARF_SIZE);
-+	printf("PANDORA WLAN: map "+ "parf= %#lx\n", (unsigned long)parf);
++	printf("PANDORA WLAN: map parf= %#lx\n", (unsigned long)parf);
 +	phy = ml_io_map(SY_PHY_PA, SY_PHY_SIZE);
-+	printf("PANDORA WLAN: map "+ "phy= %#lx\n", (unsigned long)phy);
++	printf("PANDORA WLAN: map phy= %#lx\n", (unsigned long)phy);
 +	dbi = ml_io_map(SY_DBI_PA, SY_DBI_SIZE);
-+	printf("PANDORA WLAN: map "+ "dbi= %#lx\n", (unsigned long)dbi);
++	printf("PANDORA WLAN: map dbi= %#lx\n", (unsigned long)dbi);
 +	iatu = ml_io_map(SY_IATU_PA, SY_IATU_SIZE);
-+	printf("PANDORA WLAN: map "+ "iatu= %#lx\n", (unsigned long)iatu);
++	printf("PANDORA WLAN: map iatu= %#lx\n", (unsigned long)iatu);
 +	conf = ml_io_map(SY_CONF_PA, SY_CONF_SIZE);
-+	printf("PANDORA WLAN: map "+ "conf= %#lx\n", (unsigned long)conf);
++	printf("PANDORA WLAN: map conf= %#lx\n", (unsigned long)conf);
 +	pcism = ml_io_map(SY_SM_PA, SY_SM_SIZE);
-+	printf("PANDORA WLAN: map "+ "pcism= %#lx\n", (unsigned long)pcism);
++	printf("PANDORA WLAN: map pcism= %#lx\n", (unsigned long)pcism);
 +	crm = ml_io_map(SY_CRM_PA, SY_CRM_SIZE);
-+	printf("PANDORA WLAN: map "+ "crm= %#lx\n", (unsigned long)crm);
++	printf("PANDORA WLAN: map crm= %#lx\n", (unsigned long)crm);
 +	gcc_low = ml_io_map(SY_GCC_LOW_PA, SY_GCC_LOW_SIZE);
-+	printf("PANDORA WLAN: map "+ "gcc_low= %#lx\n", (unsigned long)gcc_low);
++	printf("PANDORA WLAN: map gcc_low= %#lx\n", (unsigned long)gcc_low);
 +	gcc = ml_io_map(SY_GCC_PA, SY_GCC_SIZE);
-+	printf("PANDORA WLAN: map "+ "gcc= %#lx\n", (unsigned long)gcc);
++	printf("PANDORA WLAN: map gcc= %#lx\n", (unsigned long)gcc);
 +	tlmm_low = ml_io_map(SY_TLMM_LOW_PA, SY_TLMM_LOW_SIZE);
-+	printf("PANDORA WLAN: map "+ "tlmm_low= %#lx\n", (unsigned long)tlmm_low);
++	printf("PANDORA WLAN: map tlmm_low= %#lx\n", (unsigned long)tlmm_low);
 +	tlmm = ml_io_map(SY_TLMM_PA, SY_TLMM_SIZE);
-+	printf("PANDORA WLAN: map "+ "tlmm= %#lx\n", (unsigned long)tlmm);
++	printf("PANDORA WLAN: map tlmm= %#lx\n", (unsigned long)tlmm);
 +	tcsr = ml_io_map(SY_TCSR_PA, SY_TCSR_SIZE);
-+	printf("PANDORA WLAN: map "+ "tcsr= %#lx\n", (unsigned long)tcsr);
++	printf("PANDORA WLAN: map tcsr= %#lx\n", (unsigned long)tcsr);
 +	rsc = ml_io_map(SY_RSC_PA, SY_RSC_SIZE);
-+	printf("PANDORA WLAN: map "+ "rsc= %#lx\n", (unsigned long)rsc);
++	printf("PANDORA WLAN: map rsc= %#lx\n", (unsigned long)rsc);
 +	cmddb = ml_io_map_wcomb(SY_CMDDB_PA, SY_CMDDB_SIZE);
-+	printf("PANDORA WLAN: map "+ "cmddb= %#lx\n", (unsigned long)cmddb);
++	printf("PANDORA WLAN: map cmddb= %#lx\n", (unsigned long)cmddb);
 +	if (!parf || !phy || !dbi || !iatu || !conf || !crm || !gcc_low || !gcc || !tlmm_low ||
 +	    !tlmm || !tcsr || !rsc || !cmddb) {
 +		printf("PANDORA WLAN: a window cannot be mapped\n");
