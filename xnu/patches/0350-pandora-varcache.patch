@@ -456,7 +456,7 @@
  }
  
  static void
-@@ -51,21 +470,1120 @@
+@@ -51,21 +470,1121 @@
  		cv_sleep(100);
  	}
  	if (rootvnode == NULLVP) {
@@ -947,12 +947,13 @@
 +	sy_wr(sy_rsc, SY_TCS_OFF, sy_rd(sy_rsc, SY_TCS_OFF) | bit);	/* DRV_IRQ_ENABLE |= ours */
 +	sy_wr(sy_rsc, b + L->control, SY_RPMH_AMC);
 +	sy_wr(sy_rsc, b + L->control, SY_RPMH_AMC | SY_RPMH_TRIGGER);
-+	for (unsigned us = 0; us < 200000 && !done; us++) {
++	for (unsigned us = 0; us < 10000 && !done; us++) {
++		/* K90 mhi_pcie_power.c polls only DRV_IRQ_STATUS. The per-command
++		 * status offsets are not validated on this layout: a three-command
++		 * LDO vote never matched and the wait used to spin until the WDT. */
 +		bool all = (sy_rd(sy_rsc, SY_TCS_OFF + 4) & bit) != 0;	/* DRV_IRQ_STATUS */
-+		for (unsigned c = 0; c < ncmd; c++) {
++		for (unsigned c = 0; c < ncmd; c++)
 +			cs[c] = sy_rd(sy_rsc, b + L->cmd_status + c * L->cmd_stride);
-+			all = all && cs[c] != 0xffffffffu && (cs[c] & SY_RPMH_DONE) == SY_RPMH_DONE;
-+		}
 +		done = all && sy_rd(sy_rsc, b + L->status) != 0;
 +		if (!done) {
 +			delay(1);
