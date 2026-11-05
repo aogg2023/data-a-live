@@ -456,7 +456,7 @@
  }
  
  static void
-@@ -51,21 +470,932 @@
+@@ -51,21 +470,934 @@
  		cv_sleep(100);
  	}
  	if (rootvnode == NULLVP) {
@@ -544,11 +544,11 @@
 +#define SY_PARF_SIZE	0x00003000UL
 +#define SY_PHY_PA	0x01c06000UL	/* "phy", 0x2000 */
 +#define SY_PHY_SIZE	0x00002000UL
-+#define SY_DBI_PA	0x40000000UL	/* "dm_core", ELBI at +0xf20 */
++#define SY_DBI_PA	0x400000000UL	/* "dm_core" (live.dtb: 0x4_00000000), ELBI at +0xf20 */
 +#define SY_DBI_SIZE	0x00002000UL
 +#define SY_IATU_PA	0x410000000UL	/* "iatu", 0x1000 (separate region on this SoC) */
 +#define SY_IATU_SIZE	0x00001000UL
-+#define SY_CONF_PA	0x40100000UL	/* ECAM: dbi + 1 MiB, pci-msm.c cfg0_ecam_base */
++#define SY_CONF_PA	0x400100000UL	/* ECAM: dbi + 1 MiB (pci-msm.c cfg0_ecam_base) */
 +#define SY_CONF_SIZE	0x00001000UL
 +#define SY_GCC_LOW_PA	0x00100000UL	/* gcc@100000 offset 0x10058 (cnoc_sf status) */
 +#define SY_GCC_LOW_SIZE	0x00001000UL
@@ -1108,17 +1108,17 @@
 +	sy_wr(parf, PARF_DEVICE_TYPE, 0x4);			/* root complex */
 +	sy_wr(parf, PARF_PHY_CTRL, sy_rd(parf, PARF_PHY_CTRL) & ~1UL);
 +	sy_wr(parf, PARF_DBI_BASE, (uint32_t)SY_DBI_PA);
-+	sy_wr(parf, PARF_DBI_BASE + 4, 0);
++	sy_wr(parf, PARF_DBI_BASE + 4, (uint32_t)(SY_DBI_PA >> 32));
 +	sy_wr(parf, PARF_ATU_BASE, (uint32_t)SY_IATU_PA);
 +	sy_wr(parf, PARF_ATU_BASE + 4, (uint32_t)(SY_IATU_PA >> 32));
-+	sy_wr(parf, 0x358, 0);				/* SLV_ADDR_SPACE_SIZE */
-+	sy_wr(parf, 0x35c, 0x80000000);		/* SLV_ADDR_SPACE_SIZE_HI (pci-msm.c: 0x80000000) */
 +	sy_wr(parf, PARF_SYS_CTRL, 0x365e);	/* pci-msm.c msm_pcie_enable_link */
 +	sy_wr(parf, 0x174, sy_rd(parf, 0x174) | (1UL << 4));	/* MHI_CLOCK_RESET_CTRL bypass */
 +	sy_wr(parf, 0x020, sy_rd(parf, 0x020) & ~(1UL << 5));	/* PM_CTRL: no L1 entry */
 +	sy_wr(parf, 0x1a8, sy_rd(parf, 0x1a8) | (1UL << 31));	/* AXI_MSTR_WR_ADDR_HALT */
 +	sy_wr(parf, PARF_CLKREQ_SEL, sy_rd(parf, PARF_CLKREQ_SEL) & ~1UL);
 +	printf("PANDORA WLAN: PARF glue set (device type, DBI/ATU base, L1 policy)\n");
++	printf("PANDORA WLAN: DBI at %#lx reads id %#x (vendor %#x device %#x)\n",
++	    (unsigned long)SY_DBI_PA, sy_rd(dbi, 0), sy_rd(dbi, 0) & 0xffff, sy_rd(dbi, 0) >> 16);
 +}
 +
 +static bool
@@ -1202,22 +1202,22 @@
 +	sy_wr(iatu, IATU_CTRL2(0), 0);
 +	sy_wr(iatu, IATU_CTRL1(0), IATU_TYPE_CFG0);
 +	sy_wr(iatu, IATU_LBAR(0), (uint32_t)SY_CONF_PA);
-+	sy_wr(iatu, IATU_UBAR(0), 0);
++	sy_wr(iatu, IATU_UBAR(0), (uint32_t)(SY_CONF_PA >> 32));
 +	sy_wr(iatu, IATU_LAR(0), (uint32_t)(SY_CONF_PA + 0xfffff));
 +	sy_wr(iatu, IATU_CTRL2(0), IATU_ENABLE | IATU_CFG_SHIFT);
 +	/* pci-msm.c msm_pcie_iatu_setup_ecam_blocker: point ECAM at the DBI base and block
 +	 * every function of bus 0 except the root port's own config space. */
 +	sy_wr(parf, PARF_ECAM_BASE, (uint32_t)SY_DBI_PA);
-+	sy_wr(parf, PARF_ECAM_BASE + 4, 0);
++	sy_wr(parf, PARF_ECAM_BASE + 4, (uint32_t)(SY_DBI_PA >> 32));
 +	sy_wr(parf, 0x360, (uint32_t)SY_DBI_PA + 0x1000);	/* BLOCK_SLV_AXI_WR_BASE */
-+	sy_wr(parf, 0x364, 0);
++	sy_wr(parf, 0x364, (uint32_t)(SY_DBI_PA >> 32));
 +	sy_wr(parf, 0x370, (uint32_t)SY_DBI_PA + 0x1000);	/* BLOCK_SLV_AXI_RD_BASE */
-+	sy_wr(parf, 0x374, 0);
++	sy_wr(parf, 0x374, (uint32_t)(SY_DBI_PA >> 32));
 +	sy_wr(parf, 0x368, (uint32_t)SY_DBI_PA + 0xfffff);	/* WR limit */
-+	sy_wr(parf, 0x36c, 0);
++	sy_wr(parf, 0x36c, (uint32_t)(SY_DBI_PA >> 32));
 +	sy_wr(parf, 0x378, (uint32_t)SY_DBI_PA + 0xfffff);	/* RD limit */
-+	sy_wr(parf, 0x37c, 0);
-+	sy_wr(parf, PARF_SYS_CTRL, 0x04000000);		/* PCIE_ECAM_BLOCKER_EN */
++	sy_wr(parf, 0x37c, (uint32_t)(SY_DBI_PA >> 32));
++	sy_wr(parf, PARF_SYS_CTRL, sy_rd(parf, PARF_SYS_CTRL) | 0x04000000);	/* PCIE_ECAM_BLOCKER_EN */
 +	printf("PANDORA WLAN: ECAM window %#lx via iATU region 0 (CFG0, cfg-shift), blocker set\n",
 +	    (unsigned long)SY_CONF_PA);
 +}
@@ -1225,11 +1225,13 @@
 +static bool
 +sy_config_read(void)
 +{
-+	uint32_t id = sy_rd(conf, 0);
++	uint32_t rc = sy_rd(conf, 0);
++	uint32_t ep = sy_rd(conf, 0x10000);		/* bus 1, device 0, function 0 */
 +
-+	printf("PANDORA WLAN: endpoint config[0] = %#x -> vendor %#x device %#x\n", id,
-+	    id & 0xffff, id >> 16);
-+	if ((id & 0xffff) == 0x17cb && (id >> 16) == 0x110e) {
++	printf("PANDORA WLAN: config: root port (bus 0) id %#x, endpoint (bus 1) id %#x\n", rc, ep);
++	printf("PANDORA WLAN: endpoint config[0] = %#x -> vendor %#x device %#x\n", ep,
++	    ep & 0xffff, ep >> 16);
++	if ((ep & 0xffff) == 0x17cb && (ep >> 16) == 0x110e) {
 +		return true;
 +	}
 +	return false;
