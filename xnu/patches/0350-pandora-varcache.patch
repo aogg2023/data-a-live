@@ -456,7 +456,7 @@
  }
  
  static void
-@@ -51,21 +470,1060 @@
+@@ -51,21 +470,1100 @@
  		cv_sleep(100);
  	}
  	if (rootvnode == NULLVP) {
@@ -1197,8 +1197,8 @@
 +	sy_wr(parf, 0x1a8, sy_rd(parf, 0x1a8) | (1UL << 31));	/* AXI_MSTR_WR_ADDR_HALT */
 +	sy_wr(parf, PARF_CLKREQ_SEL, sy_rd(parf, PARF_CLKREQ_SEL) & ~1UL);
 +	printf("PANDORA WLAN: PARF glue set (device type, DBI/ATU base, L1 policy)\n");
-+	printf("PANDORA WLAN: DBI at %#lx reads id %#x (vendor %#x device %#x)\n",
-+	    (unsigned long)SY_DBI_PA, sy_rd(dbi, 0), sy_rd(dbi, 0) & 0xffff, sy_rd(dbi, 0) >> 16);
++	printf("PANDORA WLAN: DBI read #1 (before the PHY) at %#lx reads %#x\n",
++	    (unsigned long)SY_DBI_PA, sy_rd(dbi, 0));
 +}
 +
 +static bool
@@ -1222,6 +1222,17 @@
 +	printf("PANDORA WLAN: PHY started (%u writes), pipe clock running\n",
 +	    (unsigned)SY_PHY_ROWS);
 +	return true;
++}
++
++static void
++sy_diag_regs(const char *when)
++{
++	printf("PANDORA WLAN: %s: parf dev-type %#x sys %#x l1 %#x slv_lo %#x slv_hi %#x atu_lo %#x atu_hi %#x int_mask %#x int2 %#x\n",
++	    when, sy_rd(parf, PARF_DEVICE_TYPE), sy_rd(parf, PARF_SYS_CTRL),
++	    sy_rd(parf, 0x020), sy_rd(parf, 0x358), sy_rd(parf, 0x35c),
++	    sy_rd(parf, 0x634), sy_rd(parf, 0x638), sy_rd(parf, 0x22c), sy_rd(parf, 0x50c));
++	printf("PANDORA WLAN: %s: gcc aux-halt %#x rchng-halt %#x pipe-halt %#x; dbi %#x\n",
++	    when, sy_gcc_rd(GCC_AUX), sy_gcc_rd(0x6b074), sy_gcc_rd(GCC_PIPE), sy_rd(dbi, 0));
 +}
 +
 +static void
@@ -1456,6 +1467,7 @@
 +	delay_for_interval(1, NSEC_PER_MSEC);		/* cnss_power_on_device(): udelay(1000) */
 +	sy_pin_ctl(PIN_CLKREQ, CTL_CLKREQ_FUNC);
 +	sy_pin_ctl(PIN_WAKE, CTL_IN_PULL_UP);
++	sy_diag_regs("after the PHY, before PERST");
 +	printf("PANDORA WLAN: sw-ctrl pins read %u %u\n",
 +	    (unsigned)(*(volatile uint32_t *)sy_pin_reg(18, 4) & 1),
 +	    (unsigned)(*(volatile uint32_t *)sy_pin_reg(19, 4) & 1));
@@ -1470,6 +1482,34 @@
 +	sy_wr(parf, PARF_LTSSM, sy_rd(parf, PARF_LTSSM) | PARF_LTSSM_EN);
 +	printf("PANDORA WLAN: after PERST: parf ltssm %#x sys %#x (information only)\n",
 +	    sy_rd(parf, PARF_LTSSM), sy_rd(parf, PARF_SYS_CTRL));
++	/* First diagnostic round: only reads. Wait for the link, exactly like the working
++	 * SM8750 XNU implementation: poll PARF_LTSSM every 10 ms, DBI status every 100 ms. */
++	{
++		unsigned i, last = 0xffffffffu, link = 0;
++
++		for (i = 0; i < 100; i++) {
++			uint32_t ltssm = sy_rd(parf, PARF_LTSSM);
++			uint32_t state = ltssm & 0x3fu;
++
++			if (state != last) {
++				printf("PANDORA WLAN: link wait %u ms: parf ltssm %#x state %#x dbi80 %#x\n",
++				    i * 10, ltssm, state, sy_rd(dbi, 0x80));
++				last = state;
++			}
++			if ((i % 10) == 0) {
++				link = sy_rd(dbi, 0x80) & (1UL << 29);
++				if (link) {
++					printf("PANDORA WLAN: link active after %u ms (dbi80 %#x)\n",
++					    i * 10, sy_rd(dbi, 0x80));
++					break;
++				}
++			}
++			delay_for_interval(10, NSEC_PER_MSEC);
++		}
++		printf("PANDORA WLAN: link wait done: active %u, parf ltssm %#x dbi0 %#x dbi80 %#x\n",
++		    link ? 1u : 0u, sy_rd(parf, PARF_LTSSM), sy_rd(dbi, 0), sy_rd(dbi, 0x80));
++		sy_diag_regs("after link wait");
++	}
 +	if (sy_step < 6) {
 +		return;
 +	}
