@@ -394,7 +394,7 @@
 +{
 +	vfs_context_t ctx = vfs_context_kernel();
 +	vnode_t vp = NULLVP;
-+	vnode_attr va;
++	struct vnode_attr va;
 +	int error, resid = 0;
 +
 +	error = vnode_lookup(path, 0, &vp, ctx);
@@ -434,7 +434,7 @@
 +{
 +	vfs_context_t ctx = vfs_context_kernel();
 +	vnode_t vp = NULLVP;
-+	vnode_attr va;
++	struct vnode_attr va;
 +	uint8_t head[24] = { 0 };
 +
 +	if (vnode_lookup("/private/var/mobile/Library/Preferences/com.apple.purplebuddy.plist", 0,
