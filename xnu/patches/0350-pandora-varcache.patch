@@ -456,7 +456,7 @@
  }
  
  static void
-@@ -51,21 +470,1149 @@
+@@ -51,21 +470,1143 @@
  		cv_sleep(100);
  	}
  	if (rootvnode == NULLVP) {
@@ -913,6 +913,9 @@
 +	 * sets 0/1/2 belong to touch, adreno8_rpmh and PCIe. The PCIe vote must use set 2
 +	 * (TCS2) and interrupt bit 2; scanning for a "free" set steals another driver's
 +	 * TCS and can wedge the RSC (observed as a reset at the first S1J vote). */
++	/* Locally verified on this phone (ioslog_86): PCIe voted all nine rails on
++	 * TCS2 with irq=0x4 and done=1; this is this device's own measurement, not a
++	 * copy of another board's set ownership. */
 +	t = 2;
 +	b = SY_TCS_OFF + t * SY_TCS_STRIDE;
 +	bit = 1u << t;
@@ -1200,8 +1203,11 @@
 +	sy_wr(parf, PARF_DBI_BASE + 4, (uint32_t)(SY_DBI_PA >> 32));
 +	sy_wr(parf, PARF_ATU_BASE, (uint32_t)SY_IATU_PA);
 +	sy_wr(parf, PARF_ATU_BASE + 4, (uint32_t)(SY_IATU_PA >> 32));
-+	sy_wr(parf, 0x358, 0);		/* SLV_ADDR_SPACE_SIZE (vendor: 0) */
-+	sy_wr(parf, 0x35c, 0x80000000UL);	/* SLV_ADDR_SPACE_SIZE_HI: no DBI/ATU mirroring */
++	/* SLV_ADDR_SPACE_SIZE: left as the bootloader programmed it (locally measured
++	 * 0x358=0x01000000, 0x35c=0). The K90 value (0/0x80000000) assumes a 1 GiB DBI
++	 * base; this SoC keeps DBI at 0x400000000 and writing it stalled the next DBI
++	 * read (ioslog_86 ticket-spinlock timeout). Revisit only with a value derived
++	 * from this SoC's 16 GiB base, not another board's constant. */
 +	sy_wr(parf, PARF_SYS_CTRL, 0x365e);	/* pci-msm.c msm_pcie_enable_link */
 +	sy_wr(parf, 0x174, sy_rd(parf, 0x174) | (1UL << 4));	/* MHI_CLOCK_RESET_CTRL bypass */
 +	sy_wr(parf, 0x020, sy_rd(parf, 0x020) & ~(1UL << 5));	/* PM_CTRL: no L1 entry */
@@ -1493,21 +1499,6 @@
 +	sy_pin_ctl(PIN_CLKREQ, CTL_CLKREQ_FUNC);
 +	sy_pin_ctl(PIN_WAKE, CTL_IN_PULL_UP);
 +	sy_diag_regs("after the PHY, before PERST");
-+	/* K90 mhi_pcie_power.c root_port_setup(): the RC's own header lives in DBI.
-+	 * Only touch it when DBI answers; writing a dead core's window would hang the NoC. */
-+	if (sy_rd(dbi, 0) != 0xffffffffUL) {
-+		sy_wr(dbi, 0x8bc, sy_rd(dbi, 0x8bc) | 1);	/* DBI_RO_WR_EN */
-+		sy_wr(dbi, 0x10, 0x4); sy_wr(dbi, 0x14, 0);	/* BAR0: 64-bit memory */
-+		sy_wr(dbi, 0x3c, (sy_rd(dbi, 0x3c) & 0xffff00ffUL) | 0x100);
-+		sy_wr(dbi, 0x18, (sy_rd(dbi, 0x18) & 0xff000000UL) | 0x00ff0100);
-+		sy_wr(dbi, 0x04, sy_rd(dbi, 0x04) | 0x107);
-+		sy_wr(dbi, 0x08, (sy_rd(dbi, 0x08) & 0x0000ffffUL) | (0x0604UL << 16));
-+		sy_wr(dbi, 0xa0, (sy_rd(dbi, 0xa0) & ~0xfUL) | 1);	/* Link speed: Gen1 */
-+		sy_wr(dbi, 0x8bc, sy_rd(dbi, 0x8bc) & ~1UL);
-+		printf("PANDORA WLAN: root port header set (DBI answered, id %#x)\n", sy_rd(dbi, 0));
-+	} else {
-+		printf("PANDORA WLAN: DBI still 0xffffffff; root port header skipped\n");
-+	}
 +	printf("PANDORA WLAN: sw-ctrl pins read %u %u\n",
 +	    (unsigned)(*(volatile uint32_t *)sy_pin_reg(18, 4) & 1),
 +	    (unsigned)(*(volatile uint32_t *)sy_pin_reg(19, 4) & 1));
@@ -1529,14 +1520,17 @@
 +		unsigned i, last = 0xffffffffu;
 +
 +		for (i = 0; i < 100; i++) {
-+			uint32_t ltssm = sy_rd(parf, PARF_LTSSM);
-+			uint32_t state = ltssm & 0x3fu;
++			/* Local DT qcom,pcie-sm-debug: 0x1040..0x109c are this SoC's state
++			 * registers; the sm8550-class PARF 0x1b0 layout is not assumed here. */
++			uint32_t smdbg = sy_rd(pcism, 0x1090);
++			uint32_t ltssm = sy_rd(parf, PARF_LTSSM);	/* side note only */
++			uint32_t state = smdbg & 0x3fu;
 +			uint32_t d80 = sy_rd(dbi, 0x80);
 +			uint32_t d0 = sy_rd(dbi, 0);
 +
 +			if (state != last) {
-+				printf("PANDORA WLAN: link wait %u ms: parf ltssm %#x state %#x dbi0 %#x dbi80 %#x\n",
-+				    i * 10, ltssm, state, d0, d80);
++				printf("PANDORA WLAN: link wait %u ms: sm-debug %#x state %#x (parf %#x) dbi0 %#x dbi80 %#x\n",
++				    i * 10, smdbg, state, ltssm, d0, d80);
 +				last = state;
 +			}
 +			if ((i % 10) == 0 && d80 != 0xffffffffUL && d0 != 0xffffffffUL &&
