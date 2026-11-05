@@ -456,7 +456,7 @@
  }
  
  static void
-@@ -51,21 +470,1129 @@
+@@ -51,21 +470,1120 @@
  		cv_sleep(100);
  	}
  	if (rootvnode == NULLVP) {
@@ -861,7 +861,7 @@
 +	static const uint32_t offs[3] = {0, 4, 8};
 +	unsigned t = 0;
 +	unsigned ncmd = ldo ? 3u : 2u;
-+	int chosen = -1, rc = 0;
++	int rc = 0;
 +	bool done = false;
 +
 +	if (!sy_rsc) {
@@ -882,7 +882,7 @@
 +	    SY_RSC_PA, id, major, minor, sy_rd(sy_rsc, 4), config, ntcs, ncpt);
 +	/* Linux uses the 3.0 layout for every major >= 3 (PAND:751-756). */
 +	L = major >= 3 ? &sy_rpmh_v3 : (major == 2 ? &sy_rpmh_v2 : NULL);
-+	if (!L || ntcs < SY_TCS_ACTIVE || ntcs > 16 || ncpt < 3 || ncpt > 16) {
++	if (!L || ntcs < 3 || ntcs > 16 || ncpt < 3 || ncpt > 16) {
 +		printf("PANDORA WLAN: RPMh: RSC v%u.%u layout/geometry not known (tcs %u, "
 +		    "ncpt %u); not voting\n", major, minor, ntcs, ncpt);
 +		rc = ENODEV;
@@ -900,35 +900,25 @@
 +	if ((rc = sy_rpmh_lookup(res, &address))) {
 +		goto out;
 +	}
-+	for (t = 0; t < SY_TCS_ACTIVE; t++) {
-+		b = SY_TCS_OFF + t * SY_TCS_STRIDE;
-+		uint32_t st = sy_rd(sy_rsc, b + L->status), ctl = sy_rd(sy_rsc, b + L->control);
-+		uint32_t en = sy_rd(sy_rsc, b + L->enable), wt = sy_rd(sy_rsc, b + L->wait);
-+		printf("PANDORA WLAN: RPMh: ACTIVE TCS%u idle=%#x control=%#x enable=%#x wait=%#x\n",
-+		    t, st, ctl, en, wt);
-+		if (chosen < 0 && st != 0 && st != 0xffffffffu && ctl == 0 && en == 0 && wt == 0 &&
-+		    !(sy_rd(sy_rsc, SY_TCS_OFF + 4) & (1u << t))) {
-+			chosen = (int)t;
-+		}
-+	}
-+	if (chosen < 0) {
-+		printf("PANDORA WLAN: RPMh: no free ACTIVE TCS; not voting\n");
++	/* K90/SM8750 mhi_pcie_power.c and the vendor rpmh-rsc ownership: DRV2's ACTIVE
++	 * sets 0/1/2 belong to touch, adreno8_rpmh and PCIe. The PCIe vote must use set 2
++	 * (TCS2) and interrupt bit 2; scanning for a "free" set steals another driver's
++	 * TCS and can wedge the RSC (observed as a reset at the first S1J vote). */
++	t = 2;
++	b = SY_TCS_OFF + t * SY_TCS_STRIDE;
++	bit = 1u << t;
++	printf("PANDORA WLAN: RPMh: TCS%u idle=%#x control=%#x enable=%#x wait=%#x (PCIe's set)\n",
++	    t, sy_rd(sy_rsc, b + L->status), sy_rd(sy_rsc, b + L->control),
++	    sy_rd(sy_rsc, b + L->enable), sy_rd(sy_rsc, b + L->wait));
++	if (sy_rd(sy_rsc, b + L->control) != 0 || sy_rd(sy_rsc, b + L->enable) != 0 ||
++	    sy_rd(sy_rsc, b + L->wait) != 0) {
++		printf("PANDORA WLAN: RPMh: TCS%u is not idle; not voting\n", t);
 +		rc = EBUSY;
 +		goto out;
 +	}
-+	{
-+		unsigned tc = (unsigned)chosen;
-+		t = tc;
-+		b = SY_TCS_OFF + tc * SY_TCS_STRIDE;
-+		bit = 1u << tc;
-+	}
 +	irq_en = sy_rd(sy_rsc, SY_TCS_OFF);
-+	if (!sy_rpmh_sync(SY_TCS_OFF, irq_en & ~bit)) {
-+		printf("PANDORA WLAN: RPMh: IRQ enable readback failed (want %#x, got %#x)\n",
-+		    irq_en & ~bit, sy_rd(sy_rsc, SY_TCS_OFF));
-+		rc = EIO;
-+		goto out;
-+	}
++	sy_wr(sy_rsc, b + L->control, 0);
++	sy_wr(sy_rsc, SY_TCS_OFF + 8, bit);	/* DRV_IRQ_CLEAR: our set only */
 +	for (unsigned c = 0; c < ncmd; c++) {
 +		uint32_t cmd = b + c * L->cmd_stride;
 +		word[c] = address + offs[c];
@@ -945,22 +935,23 @@
 +		}
 +	}
 +	if (!sy_rpmh_sync(b + L->wait, (1u << ncmd) - 1u) ||
-+	    !sy_rpmh_sync(b + L->enable, (1u << ncmd) - 1u) ||
-+	    !sy_rpmh_sync(b + L->control, 0) || !sy_rpmh_sync(b + L->control, SY_RPMH_AMC)) {
-+		printf("PANDORA WLAN: RPMh: TCS%u arm failed: wait=%#x enable=%#x control=%#x "
-+		    "(want 7, 7, %#x), irq-enable=%#x, commands %#x/%#x/%#x = %u/%u/%u\n",
++	    !sy_rpmh_sync(b + L->enable, (1u << ncmd) - 1u)) {
++		printf("PANDORA WLAN: RPMh: TCS%u arm failed: wait=%#x enable=%#x "
++		    "(want %#x, %#x), commands %#x/%#x/%#x = %u/%u/%u\n",
 +		    t, sy_rd(sy_rsc, b + L->wait), sy_rd(sy_rsc, b + L->enable),
-+		    sy_rd(sy_rsc, b + L->control), SY_RPMH_AMC, sy_rd(sy_rsc, SY_TCS_OFF),
++		    (1u << ncmd) - 1u, (1u << ncmd) - 1u,
 +		    word[0], word[1], word[2], vals[0], vals[1], vals[2]);
 +		rc = EIO;
 +		goto restore;
 +	}
++	sy_wr(sy_rsc, SY_TCS_OFF, sy_rd(sy_rsc, SY_TCS_OFF) | bit);	/* DRV_IRQ_ENABLE |= ours */
++	sy_wr(sy_rsc, b + L->control, SY_RPMH_AMC);
 +	sy_wr(sy_rsc, b + L->control, SY_RPMH_AMC | SY_RPMH_TRIGGER);
-+	for (unsigned us = 0; us < 100000 && !done; us++) {
-+		bool all = true;
++	for (unsigned us = 0; us < 200000 && !done; us++) {
++		bool all = (sy_rd(sy_rsc, SY_TCS_OFF + 4) & bit) != 0;	/* DRV_IRQ_STATUS */
 +		for (unsigned c = 0; c < ncmd; c++) {
 +			cs[c] = sy_rd(sy_rsc, b + L->cmd_status + c * L->cmd_stride);
-+			all &= cs[c] != 0xffffffffu && (cs[c] & SY_RPMH_DONE) == SY_RPMH_DONE;
++			all = all && cs[c] != 0xffffffffu && (cs[c] & SY_RPMH_DONE) == SY_RPMH_DONE;
 +		}
 +		done = all && sy_rd(sy_rsc, b + L->status) != 0;
 +		if (!done) {
@@ -979,13 +970,13 @@
 +		rc = ETIMEDOUT;
 +	}
 +restore:
-+	/* Proven or not, return the TCS to idle and put the interrupt mask back. */
++	/* Proven or not, return TCS2 to idle and put our interrupt bit back. */
 +	(void)sy_rpmh_sync(b + L->control, SY_RPMH_AMC);
 +	(void)sy_rpmh_sync(b + L->control, 0);
 +	(void)sy_rpmh_sync(b + L->enable, 0);
 +	(void)sy_rpmh_sync(b + L->wait, 0);
-+	sy_wr(sy_rsc, SY_TCS_OFF + 8, bit);	/* W1C: only our TCS's bit */
-+	(void)sy_rpmh_sync(SY_TCS_OFF, irq_en);
++	sy_wr(sy_rsc, SY_TCS_OFF + 8, bit);	/* W1C: our set only */
++	sy_wr(sy_rsc, SY_TCS_OFF, sy_rd(sy_rsc, SY_TCS_OFF) & ~bit);	/* only our bit back */
 +out:
 +	return rc;
 +}
