@@ -456,7 +456,7 @@
  }
  
  static void
-@@ -51,21 +470,967 @@
+@@ -51,21 +470,1015 @@
  		cv_sleep(100);
  	}
  	if (rootvnode == NULLVP) {
@@ -549,6 +549,8 @@
 +#define SY_IATU_PA	0x410000000UL	/* "iatu", 0x1000 (separate region on this SoC) */
 +#define SY_IATU_SIZE	0x00001000UL
 +#define SY_CONF_PA	0x400100000UL	/* ECAM: dbi + 1 MiB (pci-msm.c cfg0_ecam_base) */
++#define SY_SM_PA	0x01d07000UL	/* "pcie_sm", 0x7000: the CESTA state machine */
++#define SY_SM_SIZE	0x00007000UL
 +#define SY_CONF_SIZE	0x00020000UL	/* bus 0..1 config space (bus 1 is the WLAN endpoint) */
 +#define SY_GCC_LOW_PA	0x00100000UL	/* gcc@100000 offset 0x10058 (cnoc_sf status) */
 +#define SY_GCC_LOW_SIZE	0x00001000UL
@@ -605,6 +607,17 @@
 +#define PHY_STATUS	0x00000414UL	/* qcom,phy-status-offset, bit qcom,phy-status-bit=7 */
 +#define PHY_STATUS_BIT	0x00000080UL
 +
++/* ---- CESTA state machine (live.dtb qcom,pcie-sm-seq / -branch-seq) ---- */
++static const uint32_t sy_sm_seq[] = {
++	0x1c018081UL, 0x70074002UL, 0x50028000UL, 0x28007003UL, 0x80804002UL,
++	0x70021c01UL, 0x18002802UL, 0x70005000UL, 0x10004000UL, 0x80814002UL,
++	0x18001c01UL, 0x1c018080UL, 0x00001000UL,
++};
++static const uint32_t sy_sm_branch[] = { 0x4UL, 0x1cUL, 0x24UL, 0x2cUL, 0UL, 0UL, 0UL };
++#define SY_SM_BRANCH_OFF	0x00001000UL
++#define SY_SM_START_OFF		0x00001090UL
++#define SY_SM_DBG0		0x00001040UL
++
 +/* ---- iATU (pci-msm.c msm_pcie_iatu_config_shift) ---- */
 +#define IATU_REGION(n)	(0x200UL * (n))
 +#define IATU_CTRL1(n)	(IATU_REGION(n) + 0x00UL)
@@ -633,7 +646,7 @@
 +
 +
 +
-+static vm_offset_t parf, phy, dbi, iatu, conf, gcc_low, gcc, tlmm_low, tlmm, tcsr, rsc, cmddb;
++static vm_offset_t parf, phy, dbi, iatu, conf, pcism, gcc_low, gcc, tlmm_low, tlmm, tcsr, rsc, cmddb;
 +#define SY_PHY_ROWS (sizeof(sy_phy_seq) / sizeof(sy_phy_seq[0]))
 +#define SY_SUPPLY_N (sizeof(sy_supplies) / sizeof(sy_supplies[0]))
 +static unsigned sy_step;
@@ -1114,6 +1127,36 @@
 +/* ---- PARF, PHY, root port, link ------------------------------------------------ */
 +
 +static void
++sy_sm_state(const char *when)
++{
++	printf("PANDORA WLAN: CESTA %s: start %#x state %#x %#x %#x %#x %#x %#x\n", when,
++	    sy_rd(pcism, SY_SM_START_OFF), sy_rd(pcism, SY_SM_DBG0),
++	    sy_rd(pcism, SY_SM_DBG0 + 8), sy_rd(pcism, SY_SM_DBG0 + 0x10),
++	    sy_rd(pcism, SY_SM_DBG0 + 0x18), sy_rd(pcism, SY_SM_DBG0 + 0x40),
++	    sy_rd(pcism, SY_SM_DBG0 + 0x50));
++}
++
++static void
++sy_sm_load(void)
++{
++	uint32_t probe = sy_rd(pcism, SY_SM_START_OFF);
++
++	sy_sm_state("before load");
++	if (probe == 0xffffffffUL || probe == 0) {
++		printf("PANDORA WLAN: CESTA does not answer (start %#x); not touching it\n", probe);
++		return;
++	}
++	for (unsigned i = 0; i < sizeof(sy_sm_seq) / sizeof(sy_sm_seq[0]); i++) {
++		sy_wr(pcism, 4 * i, sy_sm_seq[i]);
++	}
++	for (unsigned i = 0; i < sizeof(sy_sm_branch) / sizeof(sy_sm_branch[0]); i++) {
++		sy_wr(pcism, SY_SM_BRANCH_OFF + 4 * i, sy_sm_branch[i]);
++	}
++	sy_wr(pcism, SY_SM_START_OFF, sy_rd(pcism, SY_SM_START_OFF) | 1);
++	sy_sm_state("after load+start");
++}
++
++static void
 +sy_probe_ids(void)
 +{
 +	static const struct { uint64_t pa; const char *what; } cand[] = {
@@ -1199,6 +1242,9 @@
 +	    sy_rd(dbi, 0x78));
 +	printf("PANDORA WLAN: link state %s: gcc aux %#x pipe %#x ref %#x\n", when,
 +	    sy_gcc_rd(GCC_AUX), sy_gcc_rd(GCC_PIPE), sy_rd(tcsr, SY_TCSR_CLKREF));
++	printf("PANDORA WLAN: link state %s: elbi ctrl %#x stts %#x\n", when,
++	    sy_rd(dbi, 0xf24), sy_rd(dbi, 0xf28));
++	sy_sm_state("after the timeout");
 +}
 +
 +static bool
@@ -1308,6 +1354,7 @@
 +	dbi = ml_io_map(SY_DBI_PA, SY_DBI_SIZE);
 +	iatu = ml_io_map(SY_IATU_PA, SY_IATU_SIZE);
 +	conf = ml_io_map(SY_CONF_PA, SY_CONF_SIZE);
++	pcism = ml_io_map(SY_SM_PA, SY_SM_SIZE);
 +	gcc_low = ml_io_map(SY_GCC_LOW_PA, SY_GCC_LOW_SIZE);
 +	gcc = ml_io_map(SY_GCC_PA, SY_GCC_SIZE);
 +	tlmm_low = ml_io_map(SY_TLMM_LOW_PA, SY_TLMM_LOW_SIZE);
@@ -1323,6 +1370,7 @@
 +	sy_rsc = rsc;	/* the RPMh block reuses these two mappings */
 +	sy_cmddb = cmddb;
 +	printf("PANDORA WLAN: windows mapped\n");
++	sy_sm_load();
 +	sy_dump_state();
 +	if (sy_step < 2) {
 +		return;
