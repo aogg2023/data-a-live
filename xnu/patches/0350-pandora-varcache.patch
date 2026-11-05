@@ -456,7 +456,7 @@
  }
  
  static void
-@@ -51,21 +470,934 @@
+@@ -51,21 +470,957 @@
  		cv_sleep(100);
  	}
  	if (rootvnode == NULLVP) {
@@ -1050,6 +1050,7 @@
 +	sy_gcc_wr(GCC_VOTE_BRANCH, sy_gcc_rd(GCC_VOTE_BRANCH) | 0x6f);	/* slv/mstr/cfg/aux/q2a/cnoc_sf, pipe added with the PHY */
 +	sy_gcc_wr(GCC_VOTE_BRANCH2, sy_gcc_rd(GCC_VOTE_BRANCH2) |
 +	    (1UL << 12) | (1UL << 19) | (1UL << 22));
++	sy_gcc_wr(0x52018, sy_gcc_rd(0x52018) | (1UL << 31));	/* gcc_pcie_0_phy_aux_clk */
 +	for (unsigned i = 0; i < (sizeof(branches) / sizeof(branches[0])); i++) {
 +		if (!sy_gcc_poll(branches[i], CBCR_CLK_OFF, 0, 10, 1000, "a PCIe clock branch")) {
 +			printf("PANDORA WLAN: branch at GCC %#x stays off\n", branches[i]);
@@ -1103,6 +1104,24 @@
 +/* ---- PARF, PHY, root port, link ------------------------------------------------ */
 +
 +static void
++sy_probe_ids(void)
++{
++	static const struct { uint64_t pa; const char *what; } cand[] = {
++		{ SY_DBI_PA,      "dm_core (live.dtb)" },
++		{ 0x40000000UL,   "4 GiB window" },
++		{ SY_CONF_PA,     "cfg0 ecam" },
++		{ 0x40100000UL,   "4 GiB ecam" },
++	};
++
++	for (unsigned i = 0; i < sizeof(cand) / sizeof(cand[0]); i++) {
++		vm_offset_t m = ml_io_map(cand[i].pa, 0x1000);
++
++		printf("PANDORA WLAN: probe %-18s @%#llx -> id %#x (vendor %#x device %#x)\n",
++		    cand[i].what, cand[i].pa, sy_rd(m, 0), sy_rd(m, 0) & 0xffff, sy_rd(m, 0) >> 16);
++	}
++}
++
++static void
 +sy_parf_setup(void)
 +{
 +	sy_wr(parf, PARF_DEVICE_TYPE, 0x4);			/* root complex */
@@ -1119,6 +1138,7 @@
 +	printf("PANDORA WLAN: PARF glue set (device type, DBI/ATU base, L1 policy)\n");
 +	printf("PANDORA WLAN: DBI at %#lx reads id %#x (vendor %#x device %#x)\n",
 +	    (unsigned long)SY_DBI_PA, sy_rd(dbi, 0), sy_rd(dbi, 0) & 0xffff, sy_rd(dbi, 0) >> 16);
++	sy_probe_ids();
 +}
 +
 +static bool
@@ -1315,6 +1335,9 @@
 +	sy_usleep(1000);
 +	sy_gcc_wr(GCC_BCR_PHY, sy_gcc_rd(GCC_BCR_PHY) & ~1UL);
 +	sy_gcc_wr(GCC_BCR_PCIE, sy_gcc_rd(GCC_BCR_PCIE) & ~1UL);
++	printf("PANDORA WLAN: resets released: core bcr %#x phy bcr %#x noc bcr %#x phy gdsc %#x\n",
++	    sy_gcc_rd(GCC_BCR_PCIE), sy_gcc_rd(GCC_BCR_PHY), sy_gcc_rd(0x6c020),
++	    sy_gcc_rd(GCC_GDSC_PHY));
 +	sy_usleep(1000);
 +	sy_parf_setup();
 +	if (sy_step < 4) {
