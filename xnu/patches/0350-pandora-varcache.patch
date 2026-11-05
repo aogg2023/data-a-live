@@ -456,7 +456,7 @@
  }
  
  static void
-@@ -51,21 +470,1100 @@
+@@ -51,21 +470,1129 @@
  		cv_sleep(100);
  	}
  	if (rootvnode == NULLVP) {
@@ -592,6 +592,7 @@
 +#define GCC_VOTE_BRANCH	0x00052008UL	/* slv_axi mstr_axi cfg_ahb aux q2a cnoc_sf + pipe */
 +#define GCC_VOTE_BRANCH2 0x00052000UL	/* aggre_noc ddrss_sf phy_rchng */
 +#define GCC_AUX_RCG	0x0006b094UL	/* gcc_pcie_0_aux_clk_src */
++#define GCC_RCHNG_RCG	0x0006b078UL	/* gcc_pcie_0_phy_rchng_clk_src (gcc-canoe) */
 +#define GCC_RCHNG_RCG	0x0006b078UL	/* gcc_pcie_0_phy_rchng_clk_src */
 +#define GCC_PIPE_MUX	0x0006b090UL	/* gcc_pcie_0_pipe_clk_src */
 +#define GCC_SLV_AXI	0x0006b020UL	/* branch halt registers */
@@ -667,6 +668,7 @@
 +#define SY_PHY_ROWS (sizeof(sy_phy_seq) / sizeof(sy_phy_seq[0]))
 +#define SY_SUPPLY_N (sizeof(sy_supplies) / sizeof(sy_supplies[0]))
 +static unsigned sy_step;
++static int sy_link_up;	/* set only when DBI answers and LINK_ACTIVE is real */
 +
 +static uint32_t
 +sy_gcc_rd(uint32_t off)
@@ -1085,6 +1087,10 @@
 +	if (!sy_rcg_set(GCC_AUX_RCG, 0x000, "aux at 19.2 MHz")) {
 +		return false;
 +	}
++	/* gcc-canoe gcc_pcie_0_phy_rchng_clk_src: 100 MHz = P_GCC_GPLL0_OUT_EVEN(6) /3 */
++	if (!sy_rcg_set(GCC_RCHNG_RCG, 0x602, "rchng at 100 MHz")) {
++		printf("PANDORA WLAN: the rchng RCG did not lock\n");
++	}
 +	sy_wr(tcsr, SY_TCSR_CLKREF, sy_rd(tcsr, SY_TCSR_CLKREF) | 1);
 +	sy_usleep(10);
 +	/* gcc-canoe/like the local driver's clk_init: switch the pipe clock source to the PHY
@@ -1191,6 +1197,8 @@
 +	sy_wr(parf, PARF_DBI_BASE + 4, (uint32_t)(SY_DBI_PA >> 32));
 +	sy_wr(parf, PARF_ATU_BASE, (uint32_t)SY_IATU_PA);
 +	sy_wr(parf, PARF_ATU_BASE + 4, (uint32_t)(SY_IATU_PA >> 32));
++	sy_wr(parf, 0x358, 0);		/* SLV_ADDR_SPACE_SIZE (vendor: 0) */
++	sy_wr(parf, 0x35c, 0x80000000UL);	/* SLV_ADDR_SPACE_SIZE_HI: no DBI/ATU mirroring */
 +	sy_wr(parf, PARF_SYS_CTRL, 0x365e);	/* pci-msm.c msm_pcie_enable_link */
 +	sy_wr(parf, 0x174, sy_rd(parf, 0x174) | (1UL << 4));	/* MHI_CLOCK_RESET_CTRL bypass */
 +	sy_wr(parf, 0x020, sy_rd(parf, 0x020) & ~(1UL << 5));	/* PM_CTRL: no L1 entry */
@@ -1468,6 +1476,21 @@
 +	sy_pin_ctl(PIN_CLKREQ, CTL_CLKREQ_FUNC);
 +	sy_pin_ctl(PIN_WAKE, CTL_IN_PULL_UP);
 +	sy_diag_regs("after the PHY, before PERST");
++	/* K90 mhi_pcie_power.c root_port_setup(): the RC's own header lives in DBI.
++	 * Only touch it when DBI answers; writing a dead core's window would hang the NoC. */
++	if (sy_rd(dbi, 0) != 0xffffffffUL) {
++		sy_wr(dbi, 0x8bc, sy_rd(dbi, 0x8bc) | 1);	/* DBI_RO_WR_EN */
++		sy_wr(dbi, 0x10, 0x4); sy_wr(dbi, 0x14, 0);	/* BAR0: 64-bit memory */
++		sy_wr(dbi, 0x3c, (sy_rd(dbi, 0x3c) & 0xffff00ffUL) | 0x100);
++		sy_wr(dbi, 0x18, (sy_rd(dbi, 0x18) & 0xff000000UL) | 0x00ff0100);
++		sy_wr(dbi, 0x04, sy_rd(dbi, 0x04) | 0x107);
++		sy_wr(dbi, 0x08, (sy_rd(dbi, 0x08) & 0x0000ffffUL) | (0x0604UL << 16));
++		sy_wr(dbi, 0xa0, (sy_rd(dbi, 0xa0) & ~0xfUL) | 1);	/* Link speed: Gen1 */
++		sy_wr(dbi, 0x8bc, sy_rd(dbi, 0x8bc) & ~1UL);
++		printf("PANDORA WLAN: root port header set (DBI answered, id %#x)\n", sy_rd(dbi, 0));
++	} else {
++		printf("PANDORA WLAN: DBI still 0xffffffff; root port header skipped\n");
++	}
 +	printf("PANDORA WLAN: sw-ctrl pins read %u %u\n",
 +	    (unsigned)(*(volatile uint32_t *)sy_pin_reg(18, 4) & 1),
 +	    (unsigned)(*(volatile uint32_t *)sy_pin_reg(19, 4) & 1));
@@ -1482,39 +1505,45 @@
 +	sy_wr(parf, PARF_LTSSM, sy_rd(parf, PARF_LTSSM) | PARF_LTSSM_EN);
 +	printf("PANDORA WLAN: after PERST: parf ltssm %#x sys %#x (information only)\n",
 +	    sy_rd(parf, PARF_LTSSM), sy_rd(parf, PARF_SYS_CTRL));
-+	/* First diagnostic round: only reads. Wait for the link, exactly like the working
-+	 * SM8750 XNU implementation: poll PARF_LTSSM every 10 ms, DBI status every 100 ms. */
++	/* Second round: poll the link only after the PHY; a real DBI answer is required
++	 * (0xffffffff has bit29 set and used to be mistaken for LINK_ACTIVE). */
++	sy_link_up = 0;
 +	{
-+		unsigned i, last = 0xffffffffu, link = 0;
++		unsigned i, last = 0xffffffffu;
 +
 +		for (i = 0; i < 100; i++) {
 +			uint32_t ltssm = sy_rd(parf, PARF_LTSSM);
 +			uint32_t state = ltssm & 0x3fu;
++			uint32_t d80 = sy_rd(dbi, 0x80);
++			uint32_t d0 = sy_rd(dbi, 0);
 +
 +			if (state != last) {
-+				printf("PANDORA WLAN: link wait %u ms: parf ltssm %#x state %#x dbi80 %#x\n",
-+				    i * 10, ltssm, state, sy_rd(dbi, 0x80));
++				printf("PANDORA WLAN: link wait %u ms: parf ltssm %#x state %#x dbi0 %#x dbi80 %#x\n",
++				    i * 10, ltssm, state, d0, d80);
 +				last = state;
 +			}
-+			if ((i % 10) == 0) {
-+				link = sy_rd(dbi, 0x80) & (1UL << 29);
-+				if (link) {
-+					printf("PANDORA WLAN: link active after %u ms (dbi80 %#x)\n",
-+					    i * 10, sy_rd(dbi, 0x80));
-+					break;
-+				}
++			if ((i % 10) == 0 && d80 != 0xffffffffUL && d0 != 0xffffffffUL &&
++			    (d80 & (1UL << 29))) {
++				printf("PANDORA WLAN: link active after %u ms (dbi0 %#x dbi80 %#x)\n",
++				    i * 10, d0, d80);
++				sy_link_up = 1;
++				break;
 +			}
 +			delay_for_interval(10, NSEC_PER_MSEC);
 +		}
 +		printf("PANDORA WLAN: link wait done: active %u, parf ltssm %#x dbi0 %#x dbi80 %#x\n",
-+		    link ? 1u : 0u, sy_rd(parf, PARF_LTSSM), sy_rd(dbi, 0), sy_rd(dbi, 0x80));
-+		sy_diag_regs("after link wait");
++		    sy_link_up, sy_rd(parf, PARF_LTSSM), sy_rd(dbi, 0), sy_rd(dbi, 0x80));
++		sy_sm_state("after link wait");
 +	}
 +	if (sy_step < 6) {
 +		return;
 +	}
 +
 +	printf("PANDORA WLAN: step %u: ECAM and the endpoint (one outbound config read)\n", sy_step);
++	if (!sy_link_up) {
++		printf("PANDORA WLAN: the link is not up; skipping the config read (document rule)\n");
++		return;
++	}
 +	sy_iatu_ecam();
 +	if (sy_config_read()) {
 +		printf("PANDORA WLAN: M1 DONE: 17cb:110e answers on PCIe0\n");
