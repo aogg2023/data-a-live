@@ -35,7 +35,7 @@
 +#include <sys/kauth.h>
 +#include <sys/stat.h>
 +#include <sys/uio_internal.h>
-+#include <vm/vm_kern.h>
++#include <kern/kalloc.h>
  #include <kern/clock.h>
  #include <kern/thread.h>
  #include <kern/sched_prim.h>
@@ -386,7 +386,7 @@
 +
 +	for (unsigned i = 0; i < sizeof(cv_prefs) / sizeof(cv_prefs[0]); i++) {
 +		vnode_t vp = NULLVP;
-+		vnode_attr va;
++		struct vnode_attr va;
 +
 +		if (vnode_lookup(cv_prefs[i], 0, &vp, ctx) != 0) {
 +			continue;	/* first boot: nothing to keep, the pack seeds it */
@@ -399,7 +399,7 @@
 +		if (vnode_getattr(vp, &va, ctx) == 0 && va.va_data_size > 0 &&
 +		    va.va_data_size <= 16384 && cv_saved_n < CV_SAVED_MAX) {
 +			size_t n = (size_t)va.va_data_size;
-+			uint8_t *buf = kmem_alloc(n, KM_SLEEP);
++			uint8_t *buf = kalloc(n);
 +			int resid = 0;
 +
 +			if (buf != NULL &&
@@ -418,7 +418,7 @@
 +				continue;
 +			}
 +			if (buf != NULL) {
-+				kmem_free(kernel_map, (vm_offset_t)buf, n);
++				kfree(buf, n);
 +			}
 +		}
 +		vnode_put(vp);
@@ -436,7 +436,7 @@
 +
 +	for (unsigned i = 0; i < cv_saved_n; i++) {
 +		vnode_t vp = NULLVP;
-+		vnode_attr va;
++		struct vnode_attr va;
 +		int resid = 0;
 +
 +		if (vnode_lookup(cv_saved[i].path, 0, &vp, ctx) != 0) {
