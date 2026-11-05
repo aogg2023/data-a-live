@@ -456,7 +456,7 @@
  }
  
  static void
-@@ -51,21 +470,957 @@
+@@ -51,21 +470,967 @@
  		cv_sleep(100);
  	}
  	if (rootvnode == NULLVP) {
@@ -1003,15 +1003,25 @@
 +/* ---- power domains and clocks -------------------------------------------------- */
 +
 +static bool
-+sy_gdsc_on(uint32_t gdscr, const char *name)
++sy_gdsc_on(uint32_t gdscr, uint32_t vote_bit, const char *name)
 +{
-+	if (sy_gcc_rd(gdscr) & GDSC_PWR_ON) {
-+		printf("PANDORA WLAN: %s already on (%#x)\n", name, sy_gcc_rd(gdscr));
-+		return true;
++	/* gcc-canoe.c: both PCIe GDSCs are VOTABLE; 0x5214c BIT(0) collapses the root
++	 * complex's domain and BIT(2) the PHY's (1 = collapse). Clear the vote first, poll
++	 * the power-up bit, then fall back to the domain's own switch. Read PWR_ON back so
++	 * the log proves the domain is really powered. */
++	sy_gcc_wr(0x5214c, sy_gcc_rd(0x5214c) & ~vote_bit);
++	if (!sy_gcc_poll(gdscr + GCC_GDSC_CFG, GDSC_PWR_UP_DONE, GDSC_PWR_UP_DONE, 50, 2000,
++	    name)) {
++		sy_gcc_wr(gdscr, sy_gcc_rd(gdscr) & ~GDSC_SW_COLLAPSE);
++		if (!sy_gcc_poll(gdscr + GCC_GDSC_CFG, GDSC_PWR_UP_DONE, GDSC_PWR_UP_DONE, 50,
++		    2000, name)) {
++			return false;
++		}
 +	}
-+	sy_gcc_wr(gdscr, sy_gcc_rd(gdscr) & ~GDSC_SW_COLLAPSE);
-+	return sy_gcc_poll(gdscr + GCC_GDSC_CFG, GDSC_PWR_UP_DONE, GDSC_PWR_UP_DONE, 50, 2000,
-+	    name);
++	printf("PANDORA WLAN: %s on: gdscr %#x cfg %#x collapse %#x power_on %u\n", name,
++	    sy_gcc_rd(gdscr), sy_gcc_rd(gdscr + 4), sy_gcc_rd(0x5214c),
++	    (sy_gcc_rd(gdscr) & GDSC_PWR_ON) ? 1u : 0u);
++	return true;
 +}
 +
 +static bool
@@ -1037,8 +1047,8 @@
 +		GCC_SLV_AXI, GCC_MSTR_AXI, GCC_CFG_AHB, GCC_AUX, GCC_Q2A, GCC_CNOC_SF
 +	};
 +
-+	if (!sy_gdsc_on(GCC_GDSC_PCIE, "root complex 0's power domain") ||
-+	    !sy_gdsc_on(GCC_GDSC_PHY, "the PHY's power domain")) {
++	if (!sy_gdsc_on(GCC_GDSC_PCIE, 1UL << 0, "root complex 0's power domain") ||
++	    !sy_gdsc_on(GCC_GDSC_PHY, 1UL << 2, "the PHY's power domain")) {
 +		return false;
 +	}
 +	/* aux: bi_tcxo (parent 0 in gcc_parent_map_6), no divider -> 19.2 MHz */
