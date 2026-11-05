@@ -456,7 +456,7 @@
  }
  
  static void
-@@ -51,21 +470,916 @@
+@@ -51,21 +470,917 @@
  		cv_sleep(100);
  	}
  	if (rootvnode == NULLVP) {
@@ -658,6 +658,25 @@
 +	*(volatile uint32_t *)(gcc + (off - 0x50000UL)) = val;
 +}
 +
++
++static uint32_t
++sy_rd(vm_offset_t base, uint32_t off)
++{
++	return *(volatile uint32_t *)(base + off);
++}
++
++static void
++sy_wr(vm_offset_t base, uint32_t off, uint32_t val)
++{
++	*(volatile uint32_t *)(base + off) = val;
++}
++
++static void
++sy_usleep(unsigned us)
++{
++	delay_for_interval(us, NSEC_PER_USEC);
++}
++
 +static bool
 +sy_gcc_poll(uint32_t off, uint32_t mask, uint32_t value, unsigned step_us,
 +    unsigned limit_us, const char *what)
@@ -676,24 +695,6 @@
 +		sy_usleep(step_us);
 +		waited += step_us;
 +	}
-+}
-+
-+static uint32_t
-+sy_rd(vm_offset_t base, uint32_t off)
-+{
-+	return *(volatile uint32_t *)(base + off);
-+}
-+
-+static void
-+sy_wr(vm_offset_t base, uint32_t off, uint32_t val)
-+{
-+	*(volatile uint32_t *)(base + off) = val;
-+}
-+
-+static void
-+sy_usleep(unsigned us)
-+{
-+	delay_for_interval(us, NSEC_PER_USEC);
 +}
 +
 +static bool
