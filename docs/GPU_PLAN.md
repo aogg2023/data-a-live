@@ -289,3 +289,78 @@ GMU 的寄存器地址都按"GPU 基地址 `0x3d00000` 加偏移"换算，所以
 - [metal2vulkan](https://github.com/steelbrain/metal2vulkan)
 - [UniXNU](https://github.com/UniXNU/UniXNU)（本地 `unixnu_review/src`）
 - ios-fuxi（本地 `ref/ios-fuxi`，最新 origin/main 95e34e5）
+
+## 2026-11-05 桌面卡顿根因：管线缓存落在"每次启动会被清空"的 temp 目录
+
+这一节只记实测事实和结论，全部有日志行号或盘上文件为证。**本轮不改代码**，先记录。
+
+### 现象
+
+- 开机 GPU 正常（PANDORA GPU 走完 15 级初始化、DCVS 在跑），但**进桌面后触摸操作会卡**。
+- 日志显示渲染路径本身没掉链子：扫描 597 帧、CPU 拷屏 0 次、SMMU 错误 0；50 ms 内间隔的帧平均 8.87 ms；
+- 但上屏等待里 600 次有 412 次在等 GPU；划屏那 10 秒 GPU 62% 时间停在 222 MHz，只有 19% 冲到 1200 MHz。
+- 触摸不是瓶颈（1000 帧 249 帧有手指、0 错误；boot id `58 83` 正确）。
+- `[13.512] |backboardd| pandora-metal refused: no pipeline library on this GPU: default.pipelinelib` —— 苹果的
+  `default.pipelinelib` 是 AGX 机器码，Adreno 打不开，QuartzCore 回退到从 AIR 现编。
+
+### 盘上证据（直接读 pinned 缓存卷 ioscache.img，挂 /private/var）
+
+- m2v 管线缓存**确实存在**，但全部在**临时目录**：
+  `/private/var/tmp/com.apple.backboardd/m2v/v1/<key>/…`（现在有 2 个 key 目录，共 132 + 363 个缓存文件）；
+- **不存在**任何"持久"候选目录：
+  `/private/var/mobile/Library/Caches/com.apple.backboardd`、`.../m2v`、`/private/var/root/Library/Caches/com.apple.backboardd` 全部缺失；
+- `/private/var/tmp` 是 launchd 的 dirs_cleaner **每次启动要清空**的目录（启动日志有它每次对 `/private/var/tmp`
+  做 `renamex_np(..., RENAME_SWAP)` 的记录；本端口是 HFS+，该调用返回 errno 45）；
+- 缓存卷本身**不缺空间**（2048 MiB 中 1435 MiB 空闲）。
+- 因此每次启动都是 `V cache hit0 miss180~182 wr180~182`（日志 T0–T3 四轮），约 180 条 UI 管线每次开机重编一遍。
+
+### 根因
+
+**m2v 的管线缓存没有跨启动持久化**：插件按"用户 Library/Caches → 用户 cache → 用户 temp → /tmp → /var/tmp"
+的顺序找可写缓存目录（源码 `NativeAdrenoMetalPlugin.mm`，候选 4/0/1/2/3），但持久候选在当前镜像里**没建成或不可写**
+（盘上不存在），最终落到 `/private/var/tmp` 下的用户 temp 目录；该目录每次启动被清空。
+所以每次开机 QuartzCore 都要把约 180 条管线从 AIR 现编一遍：
+
+- 单条管线编译 **30–90 ms**（盘上 `m2v/pipelines.log` 每行 `R … us=…` 就是逐条管线创建耗时）；
+- 编的时候 CPU 占用高、GPU 队列空 → GPU 掉回 222 MHz 空转；
+- 一次划屏触发新管线（第二次枚举到 31 条），一条就能堵住若干帧 → 这就是触摸时感到的卡。
+
+**不是 GPU 算不过来，也不是触摸/显示路径的问题。**
+
+### 解决办法（按性价比）
+
+1. **S1 让 m2v 用上持久缓存目录（首选，改动最小）**
+   - 在缓存卷上预创建 `/private/var/mobile/Library/Caches/com.apple.backboardd/m2v`（以及 root 变体），
+     属主/权限让 backboardd（uid 501）可写；
+   - 验证插件确实选中它：插件用 marker `0x6810+候选号` 记录"哪个目录开的设备"（候选 4 → `0x6814`）；
+   - 若 backboardd 沙箱拒绝写 `Library/Caches`，需在沙箱/entitlement 里放行该路径，或换一个它可写且不会被
+     dirs_cleaner 清掉的持久路径；
+   - 预期：第二次启动 `V cache hit` 接近 miss 数，不再现编 → 卡顿消失。
+
+2. **S2 把编好的管线打成镜像包（文档 §11 的方案）**
+   - 插件源码已有整套机制：`NativeAdrenoMetal.cacheexport` 把缓存目录经内核 UFS log（method `0x7100`，
+     128 MiB 上限）导出；主机脚本 `scripts/add-gpu-plugin-data.py` 合并成 `SHEXP001` 压缩包；
+     `NativeAdrenoMetal.m2vpack` 在打开设备前把镜像里的包导入缓存目录；
+   - 注意：**当前手机部署的插件二进制里没有 `SHEXP001`/importPack 的实现**（抽出来 strings 核对过），
+     这条需要先升级插件才能用；
+   - 包与 Turnip/插件版本绑定，换版本必须重新生成（否则 key 不匹配、仍 miss）。
+
+3. **S3 启动后预热**
+   - 插件已有 `NativeAdrenoMetal.primelist` 与 `prime::run(..., 90, ...)`（打开设备 90 秒后把 OS 的 Metal 库先编一遍）；
+   - 必须与 S1/S2 配合，否则每次开机预热都是重编，反而更慢。
+
+4. **S4 短期缓解（不改架构）**
+   - 开机后先等预热完成再操作，或先划几下把管线"焐热"；只是遮症状。
+
+### 验证步骤（只读，不改代码）
+
+1. 下次重启后数 `/private/var/tmp/com.apple.backboardd/m2v/v1/` 下的 key 目录个数（现在 2 个）：
+   若变成 3 个，说明缓存 key 里含"每次启动都会变"的身份（如 GPU registry/UUID），除 S1 外还要修 key 稳定性；
+2. 看插件选了哪个候选目录（marker `0x6810+候选号`，候选 4 即 `0x6814`），确认持久候选为什么失败；
+3. 完成 S1 后再连续启动两次，对比 `V cache` 行的 hit/miss：第二次应 hit>0、miss 很小。
+
+### 注意事项
+
+- 不要把缓存放回会被 dirs_cleaner 清理的 `/private/var/tmp`；
+- 不要为省事把 `default.pipelinelib` 的 AGX 二进制硬塞给 Adreno；它只能走"AIR 现编 + 持久缓存/pack"这条路；
+- 管线缓存 key 必须排除每次启动都会变的量（registryID/UUID/路径），否则即使目录持久也永远 miss。
