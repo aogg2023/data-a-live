@@ -456,7 +456,7 @@
  }
  
  static void
-@@ -51,21 +470,1140 @@
+@@ -51,21 +470,1157 @@
  		cv_sleep(100);
  	}
  	if (rootvnode == NULLVP) {
@@ -1521,10 +1521,12 @@
 +		uint32_t gen3 = sy_rd(dbi, 0x80Cu);
 +		uint32_t lnk2;
 +
-+		sy_wr(dbi, 0x80Cu, (gen3 & 0xFFFFE0FFUL) | (3UL << 8));	/* target speed Gen3 */
++		/* Initial training is Gen1 (vendor msm_pcie_enable_link.c writes 0x100 right
++		 * after PERST release); the DT target-link-speed=3 speed change comes later. */
++		sy_wr(dbi, 0x80Cu, (gen3 & 0xFFFFE0FFUL) | (1UL << 8));	/* speed field: Gen1 */
 +		sy_wr(dbi, 0x8BCu, sy_rd(dbi, 0x8BCu) | 1);		/* DBI_RO_WR_EN */
 +		lnk2 = sy_rd(dbi, 0xA0u);
-+		sy_wr(dbi, 0xA0u, (lnk2 & ~0xFUL) | 3);			/* Link Control 2: Gen3 */
++		sy_wr(dbi, 0xA0u, (lnk2 & ~0xFUL) | 1);			/* Link Control 2: Gen1 */
 +		sy_wr(dbi, 0x8BCu, sy_rd(dbi, 0x8BCu) & ~1UL);
 +		printf("PANDORA WLAN: link speed config: 0x80C %#x 0xA0 %#x (vendor order)\n",
 +		    sy_rd(dbi, 0x80Cu), sy_rd(dbi, 0xA0u));
@@ -1537,8 +1539,23 @@
 +	printf("PANDORA WLAN: after PERST: parf ltssm %#x sys %#x (information only)\n",
 +	    sy_rd(parf, PARF_LTSSM), sy_rd(parf, PARF_SYS_CTRL));
 +	/* Plan SS6 (L218-220): sm-debug, PARF LTSSM and DBI values are logged only and
-+	 * never gate anything; the single outbound config read is the only pass test. */
-+	delay_for_interval(100, NSEC_PER_MSEC);
++	 * never gate anything; the single outbound config read is the only pass test.
++	 * Vendor msm_pcie_confirm_linkup() and K90 poll DBI+0x80 bit29 (LINK_ACTIVE):
++	 * log it here for up to ~1 s, purely as evidence. */
++	{
++		unsigned i, up = 0;
++		uint32_t st = 0;
++
++		for (i = 0; i < 100; i++) {
++			st = sy_rd(dbi, 0x80u);
++			if (st != 0xffffffffUL && (st & (1UL << 29))) {
++				up = 1;
++				break;
++			}
++			delay_for_interval(10, NSEC_PER_MSEC);
++		}
++		printf("PANDORA WLAN: link poll: after %u ms dbi80 %#x active %u\n", i * 10, st, up);
++	}
 +	printf("PANDORA WLAN: link setup done: parf %#x sm-debug %#x dbi0 %#x dbi80 %#x (log only)\n",
 +	    sy_rd(parf, PARF_LTSSM), sy_rd(pcism, 0x1090), sy_rd(dbi, 0), sy_rd(dbi, 0x80));
 +	sy_sm_state("after link setup");
