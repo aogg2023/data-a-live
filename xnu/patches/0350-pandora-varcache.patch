@@ -456,7 +456,7 @@
  }
  
  static void
-@@ -51,21 +470,1206 @@
+@@ -51,21 +470,1324 @@
  		cv_sleep(100);
  	}
  	if (rootvnode == NULLVP) {
@@ -1016,6 +1016,106 @@
 +	{ "L3K_E1", "vdd-wlan-ant-share (L3K, pmr735d L3)", 1200, 1200000, 1200000, true },
 +};
 +
++/* RPMh clock/single-command vote: cmd-db entry for a non-VRM resource (e.g. "rf_clk"). */
++static int
++sy_rpmh_lookup_clock(const char *res, uint32_t *address)
++{
++	uint32_t key[2] = {0, 0};
++	unsigned matches = 0;
++
++	for (unsigned i = 0; i < 8 && res[i]; i++)
++		key[i / 4] |= (uint32_t)(uint8_t)res[i] << (8u * (i % 4));
++	for (unsigned i = 0; i < 8; i++) {
++		uint32_t h = 8u + 16u * i;
++		unsigned slave = sy_cmddb16(h);
++		if (!slave)
++			break;
++		uint32_t entries = SY_CMDDB_HEADER + sy_cmddb16(h + 2);
++		unsigned count = sy_cmddb16(h + 6);
++		if ((entries & 3u) || entries + count * SY_CMDDB_ENTRY > SY_CMDDB_SIZE) {
++			printf("PANDORA WLAN: cmd-db slave header %u malformed\n", i);
++			return EINVAL;
++		}
++		for (unsigned j = 0; j < count; j++) {
++			uint32_t e = entries + SY_CMDDB_ENTRY * j;
++			if (sy_rd(sy_cmddb, e) != key[0] || sy_rd(sy_cmddb, e + 4) != key[1])
++				continue;
++			uint32_t addr = sy_rd(sy_cmddb, e + 16);
++			printf("PANDORA WLAN: cmd-db %s addr=%#x slave=%u\n", res, addr, slave);
++			if (slave == 4 && !(addr & 15u)) {
++				*address = addr;
++				matches++;
++			}
++		}
++	}
++	if (matches != 1) {
++		printf("PANDORA WLAN: cmd-db %s: %u matches; not voting\n", res, matches);
++		return ENODEV;
++	}
++	return 0;
++}
++
++/* One ACTIVE TCS command on the PCIe set (TCS2); the clock level is the data word. */
++static int
++sy_rpmh_vote1(const char *res, uint32_t data)
++{
++	const struct sy_rpmh_layout *L = &sy_rpmh_v3;
++	uint32_t id, address = 0, b, bit;
++	unsigned major;
++	bool done = false;
++	int rc;
++
++	if (!sy_rsc || !sy_cmddb) {
++		sy_rsc = ml_io_map(SY_RSC_PA, SY_RSC_SIZE);
++		sy_cmddb = ml_io_map(SY_CMDDB_PA, SY_CMDDB_SIZE);
++		if (!sy_rsc || !sy_cmddb) {
++			printf("PANDORA WLAN: RPMh: RSC/cmd-db mapping failed\n");
++			return ENOMEM;
++		}
++	}
++	id = sy_rd(sy_rsc, 0);
++	major = (id >> 16) & 0xffu;
++	if (major < 3) {
++		printf("PANDORA WLAN: RPMh: RSC v%u: no 3.0 layout for %s\n", major, res);
++		return ENODEV;
++	}
++	rc = sy_rpmh_lookup_clock(res, &address);
++	if (rc)
++		return rc;
++	b = SY_TCS_OFF + 2 * SY_TCS_STRIDE;
++	bit = 1u << 2;
++	if (sy_rd(sy_rsc, b + L->control) != 0 || sy_rd(sy_rsc, b + L->enable) != 0 ||
++	    sy_rd(sy_rsc, b + L->wait) != 0) {
++		printf("PANDORA WLAN: RPMh: TCS2 busy; %s not voted\n", res);
++		return EBUSY;
++	}
++	sy_wr(sy_rsc, b + L->control, 0);
++	sy_wr(sy_rsc, SY_TCS_OFF + 8, bit);
++	if (!sy_rpmh_sync(b + L->msgid, SY_RPMH_WRITE) ||
++	    !sy_rpmh_sync(b + L->addr, address) ||
++	    !sy_rpmh_sync(b + L->data, data)) {
++		printf("PANDORA WLAN: RPMh: %s command write failed\n", res);
++		return EIO;
++	}
++	if (!sy_rpmh_sync(b + L->wait, 1) || !sy_rpmh_sync(b + L->enable, 1)) {
++		printf("PANDORA WLAN: RPMh: %s arm failed\n", res);
++		return EIO;
++	}
++	sy_wr(sy_rsc, SY_TCS_OFF, sy_rd(sy_rsc, SY_TCS_OFF) | bit);
++	sy_wr(sy_rsc, b + L->control, SY_RPMH_AMC);
++	sy_wr(sy_rsc, b + L->control, SY_RPMH_AMC | SY_RPMH_TRIGGER);
++	for (unsigned us = 0; us < 10000 && !done; us++) {
++		done = ((sy_rd(sy_rsc, SY_TCS_OFF + 4) & bit) != 0) &&
++		    sy_rd(sy_rsc, b + L->status) != 0;
++		if (!done)
++			delay(1);
++	}
++	printf("PANDORA WLAN: RPMh: %s addr %#x data %u on TCS2 done=%d irq=%#x status=%#x\n",
++	    res, address, data, done, sy_rd(sy_rsc, SY_TCS_OFF + 4),
++	    sy_rd(sy_rsc, b + L->status));
++	return done ? 0 : ETIMEDOUT;
++}
++
 +static bool
 +sy_supplies_on(void)
 +{
@@ -1036,6 +1136,24 @@
 +			return false;
 +		}
 +		printf("PANDORA WLAN: %s on at %u mV\n", s->name, s->mv);
++	}
++	/* cnss-peach node: clocks = <&rsc_clk 6> "rf_clk" and wcal-pbs-supply; both are
++	 * RPMh resources the vendor cnss driver enables, and both were missing here. */
++	{
++		int rfclk = 1, wcal = 1;
++
++		(void)PE_parse_boot_argn("songyuan_rfclk", &rfclk, sizeof(rfclk));
++		(void)PE_parse_boot_argn("songyuan_wcal", &wcal, sizeof(wcal));
++		if (rfclk) {
++			printf("PANDORA WLAN: voting rf_clk (RPMh clock, cnss rf_clk)\n");
++			if (sy_rpmh_vote1("rf_clk", 1) != 0)
++				printf("PANDORA WLAN: the rf_clk vote failed\n");
++		}
++		if (wcal) {
++			printf("PANDORA WLAN: voting WCAL_PBS (wan calibration rail)\n");
++			if (sy_rpmh_vote1("WCAL_PBS", 1) != 0)
++				printf("PANDORA WLAN: the WCAL_PBS vote failed\n");
++		}
 +	}
 +	return true;
 +}
