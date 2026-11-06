@@ -456,7 +456,7 @@
  }
  
  static void
-@@ -51,21 +470,1396 @@
+@@ -51,21 +470,1397 @@
  		cv_sleep(100);
  	}
  	if (rootvnode == NULLVP) {
@@ -549,6 +549,7 @@
 +#define SY_IATU_PA	0x410000000UL	/* "iatu", 0x1000 (separate region on this SoC) */
 +#define SY_IATU_SIZE	0x00001000UL
 +#define SY_CONF_PA	0x400100000UL	/* ECAM: dbi + 1 MiB (pci-msm.c cfg0_ecam_base) */
++#define SY_EP_CONF	0x00010000UL	/* bus 1 dev 0 fn 0 inside the CFG0 window */
 +#define SY_MEM_PA	0x400200000UL	/* host side of iATU region 1 (M2: BAR0) */
 +#define SY_MEM_SIZE	0x00200000UL	/* BAR0 is 2 MiB (kernel_26 sizing) */
 +#define SY_BAR0_PA	0x40400000UL	/* Android golden BAR0 */
@@ -1425,28 +1426,28 @@
 +static uint64_t
 +sy_bar0_size(uint32_t *type, bool *is64)
 +{
-+	uint32_t cmd = sy_rd(conf, 0x04);
-+	uint32_t lo = sy_rd(conf, 0x10);
-+	uint32_t hi = sy_rd(conf, 0x14);
++	uint32_t cmd = sy_rd(conf, SY_EP_CONF + 0x04);
++	uint32_t lo = sy_rd(conf, SY_EP_CONF + 0x10);
++	uint32_t hi = sy_rd(conf, SY_EP_CONF + 0x14);
 +	uint64_t mask;
 +
 +	*type = lo & 0xfUL;
 +	*is64 = (lo & 0x6UL) == 0x4UL;	/* PCI BAR encoding: bits[2:1]=10 -> 64-bit mem */
-+	sy_wr(conf, 0x04, cmd & ~0x6UL);	/* memory decode + bus master off while sizing */
++	sy_wr(conf, SY_EP_CONF + 0x04, cmd & ~0x6UL);	/* memory decode + bus master off while sizing */
 +	sy_usleep(1000);
-+	sy_wr(conf, 0x10, 0xffffffffUL);
++	sy_wr(conf, SY_EP_CONF + 0x10, 0xffffffffUL);
 +	if (*is64)
-+		sy_wr(conf, 0x14, 0xffffffffUL);
-+	mask = (uint64_t)sy_rd(conf, 0x10);
++		sy_wr(conf, SY_EP_CONF + 0x14, 0xffffffffUL);
++	mask = (uint64_t)sy_rd(conf, SY_EP_CONF + 0x10);
 +	if (*is64) {
-+		mask |= (uint64_t)sy_rd(conf, 0x14) << 32;
++		mask |= (uint64_t)sy_rd(conf, SY_EP_CONF + 0x14) << 32;
 +	} else {
 +		mask &= 0xffffffffULL;		/* 32-bit BAR: the high word is not part of it */
 +	}
-+	sy_wr(conf, 0x10, lo);
++	sy_wr(conf, SY_EP_CONF + 0x10, lo);
 +	if (*is64)
-+		sy_wr(conf, 0x14, hi);
-+	sy_wr(conf, 0x04, cmd);
++		sy_wr(conf, SY_EP_CONF + 0x14, hi);
++	sy_wr(conf, SY_EP_CONF + 0x04, cmd);
 +	if (!mask || mask == 0xffffffffffffffffULL || mask == 0xffffffffUL) {
 +		return 0;
 +	}
@@ -1471,23 +1472,23 @@
 +		uint64_t bar_size = sy_bar0_size(&bar_type, &bar64);
 +
 +		printf("PANDORA WLAN: M1 endpoint found; BAR0 raw %#x/%#x type %#x 64bit %u size %#llx\n",
-+		    sy_rd(conf, 0x10), sy_rd(conf, 0x14), bar_type, bar64 ? 1u : 0u,
++		    sy_rd(conf, SY_EP_CONF + 0x10), sy_rd(conf, SY_EP_CONF + 0x14), bar_type, bar64 ? 1u : 0u,
 +		    (unsigned long long)bar_size);
 +	}
 +	/* M2: assign BAR0 0x40400000 / BAR2 0x40300000 (Android golden addresses) and reach
 +	 * BAR0 through iATU region 1, then dump the first MHI/BHI words read-only. */
 +	{
 +	/* saved so the endpoint's original command register can be restored afterwards */
-+	uint32_t pci_cmd = sy_rd(conf, 0x04);
-+	sy_wr(conf, 0x10, (uint32_t)SY_BAR0_PA | 0x4UL);	/* 64-bit mem BAR, address part */
-+	sy_wr(conf, 0x14, (uint32_t)(SY_BAR0_PA >> 32));
-+	sy_wr(conf, 0x04, sy_rd(conf, 0x04) | 0x2UL);	/* memory space decode on */
++	uint32_t pci_cmd = sy_rd(conf, SY_EP_CONF + 0x04);
++	sy_wr(conf, SY_EP_CONF + 0x10, (uint32_t)SY_BAR0_PA | 0x4UL);	/* 64-bit mem BAR, address part */
++	sy_wr(conf, SY_EP_CONF + 0x14, (uint32_t)(SY_BAR0_PA >> 32));
++	sy_wr(conf, SY_EP_CONF + 0x04, sy_rd(conf, SY_EP_CONF + 0x04) | 0x2UL);	/* memory space decode on */
 +	sy_usleep(1000);
-+	sy_wr(conf, 0x18, (uint32_t)SY_BAR2_PA | 0x4UL);	/* BAR2: 64-bit mem, 32 KiB */
-+	sy_wr(conf, 0x1c, (uint32_t)(SY_BAR2_PA >> 32));
++	sy_wr(conf, SY_EP_CONF + 0x18, (uint32_t)SY_BAR2_PA | 0x4UL);	/* BAR2: 64-bit mem, 32 KiB */
++	sy_wr(conf, SY_EP_CONF + 0x1c, (uint32_t)(SY_BAR2_PA >> 32));
 +	printf("PANDORA WLAN: BAR0 assigned: config10 %#x/%#x, BAR2: config18 %#x/%#x, cmd %#x status %#x\n",
-+	    sy_rd(conf, 0x10), sy_rd(conf, 0x14), sy_rd(conf, 0x18), sy_rd(conf, 0x1c),
-+	    (sy_rd(conf, 0x04) >> 16) & 0xffffUL);	/* status is the upper half of 0x04 */
++	    sy_rd(conf, SY_EP_CONF + 0x10), sy_rd(conf, SY_EP_CONF + 0x14), sy_rd(conf, SY_EP_CONF + 0x18), sy_rd(conf, SY_EP_CONF + 0x1c),
++	    (sy_rd(conf, SY_EP_CONF + 0x04) >> 16) & 0xffffUL);	/* status is the upper half of 0x04 */
 +	sy_wr(iatu, IATU_CTRL2(1), 0);
 +	sy_wr(iatu, IATU_CTRL1(1), IATU_TYPE_MEM);
 +	sy_wr(iatu, IATU_LBAR(1), (uint32_t)SY_MEM_PA);
@@ -1518,7 +1519,7 @@
 +		printf("PANDORA WLAN: BAR0 words 0x100-0x11c: %#x %#x %#x %#x %#x %#x %#x %#x\n",
 +		    w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7]);
 +	}
-+	sy_wr(conf, 0x04, pci_cmd);	/* restore the endpoint's command register */
++	sy_wr(conf, SY_EP_CONF + 0x04, pci_cmd);	/* restore the endpoint's command register */
 +	}
 +	return true;
 +}
