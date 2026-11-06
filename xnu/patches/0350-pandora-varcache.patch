@@ -1145,11 +1145,11 @@
 +
 +		(void)PE_parse_boot_argn("songyuan_rfclk", &rfclk, sizeof(rfclk));
 +		if (rfclk) {
-+			/* clk-rpmh.c canoe table: [RPMH_RF_CLK1] = clk_rpmh_c1a_e0_div1; the DT
-+			 * consumer name is "rf_clk" but the cmd-db resource is "c1a_e0" and the
-+			 * enable word lives at +CLK_RPMH_VRM_EN_OFFSET(4) with data 1. */
++			/* clk-rpmh.c canoe table: [RPMH_RF_CLK1] = clk_rpmh_c1a_e0_div1, defined as
++			 * DEFINE_CLK_RPMH_VRM(c1a_e0, _div1, "C1A_E0", 1) - the cmd-db resource name is
++			 * UPPERCASE "C1A_E0"; the DT consumer name is "rf_clk". Enable word at +4, data 1. */
 +			printf("PANDORA WLAN: voting rf_clk (RPMh VRM clock c1a_e0 +4, data 1)\n");
-+			if (sy_rpmh_vote1("c1a_e0", 4, 1) != 0)
++			if (sy_rpmh_vote1("C1A_E0", 4, 1) != 0)
 +				printf("PANDORA WLAN: the rf_clk vote failed\n");
 +		}
 +		(void)wcal;
