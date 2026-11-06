@@ -456,7 +456,7 @@
  }
  
  static void
-@@ -51,21 +470,1382 @@
+@@ -51,21 +470,1384 @@
  		cv_sleep(100);
  	}
  	if (rootvnode == NULLVP) {
@@ -551,7 +551,7 @@
 +#define SY_CONF_PA	0x400100000UL	/* ECAM: dbi + 1 MiB (pci-msm.c cfg0_ecam_base) */
 +#define SY_MEM_PA	0x400200000UL	/* host side of iATU region 1 (M2: BAR0) */
 +#define SY_MEM_SIZE	0x00200000UL	/* BAR0 is 2 MiB (kernel_26 sizing) */
-+#define SY_BAR0_PA	0x400400000UL	/* PCI address assigned to endpoint BAR0 */
++#define SY_BAR0_PA	0x40400000UL	/* Android golden: 0000:01:00.0 BAR0 = 0x40400000..0x405FFFFF (2 MiB) */
 +#define SY_SM_PA	0x01d07000UL	/* "pcie_sm", 0x7000: the CESTA state machine */
 +#define SY_SM_SIZE	0x00007000UL
 +#define SY_CONF_SIZE	0x00020000UL	/* bus 0..1 config space (bus 1 is the WLAN endpoint) */
@@ -1472,10 +1472,12 @@
 +	}
 +	/* M2: assign BAR0 0x400400000 (2 MiB aligned) and reach it through iATU region 1,
 +	 * then dump the first MHI/BHI words read-only. */
-+	sy_wr(conf, 0x10, (uint32_t)SY_BAR0_PA);
++	sy_wr(conf, 0x10, (uint32_t)SY_BAR0_PA | 0x4UL);	/* 64-bit mem BAR, address part */
 +	sy_wr(conf, 0x14, (uint32_t)(SY_BAR0_PA >> 32));
 +	sy_wr(conf, 0x04, sy_rd(conf, 0x04) | 0x2UL);	/* memory space decode on */
 +	sy_usleep(1000);
++	printf("PANDORA WLAN: BAR0 assigned: config10 %#x config14 %#x cmd %#x status %#x\n",
++	    sy_rd(conf, 0x10), sy_rd(conf, 0x14), sy_rd(conf, 0x04), sy_rd(conf, 0x06));
 +	sy_wr(iatu, IATU_CTRL2(1), 0);
 +	sy_wr(iatu, IATU_CTRL1(1), IATU_TYPE_MEM);
 +	sy_wr(iatu, IATU_LBAR(1), (uint32_t)SY_MEM_PA);
