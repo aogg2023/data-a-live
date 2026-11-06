@@ -456,7 +456,7 @@
  }
  
  static void
-@@ -51,21 +470,1408 @@
+@@ -51,21 +470,1428 @@
  		cv_sleep(100);
  	}
  	if (rootvnode == NULLVP) {
@@ -1495,11 +1495,27 @@
 +	sy_wr(conf, SY_EP_CONF + 0x14, (uint32_t)(SY_BAR0_PA >> 32));
 +	sy_wr(conf, SY_EP_CONF + 0x04, sy_rd(conf, SY_EP_CONF + 0x04) | 0x2UL);	/* memory space decode on */
 +	sy_usleep(1000);
++	{
++		uint32_t cmd_before = sy_rd(conf, SY_EP_CONF + 0x04) & 0xffffUL;
++		unsigned w;
++
++		for (w = 0; w < 20 && !(sy_rd(conf, SY_EP_CONF + 0x04) & 0x2UL); w++)
++			sy_usleep(1000);
++		if (!(sy_rd(conf, SY_EP_CONF + 0x04) & 0x2UL)) {
++			*(volatile uint16_t *)(conf + SY_EP_CONF + 0x04) =
++			    (uint16_t)(cmd_before | 0x2UL);	/* try a 16-bit command write */
++			sy_usleep(1000);
++		}
++		printf("PANDORA WLAN: cmd before %#x, after %#x (poll %u)\n", cmd_before,
++		    sy_rd(conf, SY_EP_CONF + 0x04) & 0xffffUL, w);
++	}
 +	sy_wr(conf, SY_EP_CONF + 0x18, (uint32_t)SY_BAR2_PA | 0x4UL);	/* BAR2: 64-bit mem, 32 KiB */
 +	sy_wr(conf, SY_EP_CONF + 0x1c, (uint32_t)(SY_BAR2_PA >> 32));
 +	printf("PANDORA WLAN: BAR0 assigned: config10 %#x/%#x, BAR2: config18 %#x/%#x, cmd %#x status %#x\n",
-+	    sy_rd(conf, SY_EP_CONF + 0x10), sy_rd(conf, SY_EP_CONF + 0x14), sy_rd(conf, SY_EP_CONF + 0x18), sy_rd(conf, SY_EP_CONF + 0x1c),
-+	    (sy_rd(conf, SY_EP_CONF + 0x04) >> 16) & 0xffffUL);	/* status is the upper half of 0x04 */
++	    sy_rd(conf, SY_EP_CONF + 0x10), sy_rd(conf, SY_EP_CONF + 0x14),
++	    sy_rd(conf, SY_EP_CONF + 0x18), sy_rd(conf, SY_EP_CONF + 0x1c),
++	    sy_rd(conf, SY_EP_CONF + 0x04) & 0xffffUL,
++	    (sy_rd(conf, SY_EP_CONF + 0x04) >> 16) & 0xffffUL);
 +	sy_wr(iatu, IATU_CTRL2(1), 0);
 +	sy_wr(iatu, IATU_CTRL1(1), IATU_TYPE_MEM);
 +	sy_wr(iatu, IATU_LBAR(1), (uint32_t)SY_MEM_PA);
@@ -1512,6 +1528,10 @@
 +	    sy_rd(iatu, IATU_CTRL1(1)), sy_rd(iatu, IATU_CTRL2(1)), sy_rd(iatu, IATU_LBAR(1)),
 +	    sy_rd(iatu, IATU_UBAR(1)), sy_rd(iatu, IATU_LAR(1)), sy_rd(iatu, IATU_LTAR(1)),
 +	    sy_rd(iatu, IATU_LTAR_HI(1)));
++	if (!(sy_rd(conf, SY_EP_CONF + 0x04) & 0x2UL)) {
++		printf("PANDORA WLAN: endpoint memory decode is still off; skipping the BAR0 read\n");
++		return true;
++	}
 +	{
 +		vm_offset_t mem = ml_io_map(SY_MEM_PA, SY_MEM_SIZE);
 +		uint32_t w[8];
