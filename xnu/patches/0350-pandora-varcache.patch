@@ -456,7 +456,7 @@
  }
  
  static void
-@@ -51,21 +470,1194 @@
+@@ -51,21 +470,1206 @@
  		cv_sleep(100);
  	}
  	if (rootvnode == NULLVP) {
@@ -1566,6 +1566,13 @@
 +	} else {
 +		printf("PANDORA WLAN: DBI not readable; link speed config skipped\n");
 +	}
++	/* Read-only sampling before LTSSM_EN: what the pins and resets really hold. */
++	printf("PANDORA WLAN: pre-EN: perst cfg %#x io %#x; gcc link-down %#x core-bcr %#x phy-bcr %#x; parf phy-ctrl %#x; phy status %#x 1400 %#x 1444 %#x\n",
++	    *(volatile uint32_t *)sy_pin_reg(PIN_PERST, 0),
++	    *(volatile uint32_t *)sy_pin_reg(PIN_PERST, 4),
++	    sy_gcc_rd(0x6c014), sy_gcc_rd(0x6b000), sy_gcc_rd(0x6c01c),
++	    sy_rd(parf, PARF_PHY_CTRL), sy_rd(phy, PHY_STATUS),
++	    sy_rd(phy, 0x1400), sy_rd(phy, 0x1444));
 +	printf("PANDORA WLAN: LTSSM before enable %#x (information only)\n",
 +	    sy_rd(parf, PARF_LTSSM));
 +	sy_wr(parf, PARF_LTSSM, sy_rd(parf, PARF_LTSSM) | PARF_LTSSM_EN);	/* vendor enable_link L896-899 */
@@ -1588,15 +1595,20 @@
 +				up = 1;
 +				break;
 +			}
++			if ((i % 10) == 0)
++				printf("PANDORA WLAN: sample %u ms: elbi %#x dbi80 %#x ltssm %#x\n",
++				    i * 10, elbi, st, sy_rd(parf, PARF_LTSSM));
 +			delay_for_interval(10, NSEC_PER_MSEC);
 +		}
++		sy_link_up = up;
 +		printf("PANDORA WLAN: link poll: after %u ms dbi80 %#x elbi %#x active %u\n",
 +		    i * 10, st, sy_rd(dbi, 0xF28u), up);
 +	}
 +	printf("PANDORA WLAN: link setup done: parf %#x sm-debug %#x dbi0 %#x dbi80 %#x (log only)\n",
 +	    sy_rd(parf, PARF_LTSSM), sy_rd(pcism, 0x1090), sy_rd(dbi, 0), sy_rd(dbi, 0x80));
 +	sy_sm_state("after link setup");
-+	sy_link_up = 1;	/* one attempt is allowed by the plan; pass = 17cb:110e */
++	/* sy_link_up was set from the LINK_ACTIVE/ELBI poll above; the config read stays
++	 * gated by it (upstream: do not enumerate before the endpoint is ready). */
 +	if (sy_step < 6) {
 +		return;
 +	}
