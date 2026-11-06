@@ -456,7 +456,7 @@
  }
  
  static void
-@@ -51,21 +470,1115 @@
+@@ -51,21 +470,1119 @@
  		cv_sleep(100);
  	}
  	if (rootvnode == NULLVP) {
@@ -617,6 +617,7 @@
 +#define PARF_ATU_BASE	0x00000634UL
 +#define PARF_CLKREQ_SEL	0x00002c48UL	/* qcom,pcie-clkreq-offset */
 +#define PARF_ECAM_BASE	0x00000380UL
++#define PARF_SLV_SPACE_SIZE	0x00000358UL	/* SLV_ADDR_SPACE_SIZE / _HI at +4 */
 +#define PARF_ECAM_BLOCKER 0x04000000UL
 +#define DBI_LINKCTRLSTATUS 0x00000080UL
 +#define LINK_ACTIVE	0x20000000UL
@@ -1203,19 +1204,22 @@
 +	sy_wr(parf, PARF_DBI_BASE + 4, (uint32_t)(SY_DBI_PA >> 32));
 +	sy_wr(parf, PARF_ATU_BASE, (uint32_t)SY_IATU_PA);
 +	sy_wr(parf, PARF_ATU_BASE + 4, (uint32_t)(SY_IATU_PA >> 32));
-+	/* SLV_ADDR_SPACE_SIZE: left as the bootloader programmed it (locally measured
-+	 * 0x358=0x01000000, 0x35c=0). The K90 value (0/0x80000000) assumes a 1 GiB DBI
-+	 * base; this SoC keeps DBI at 0x400000000 and writing it stalled the next DBI
-+	 * read (ioslog_86 ticket-spinlock timeout). Revisit only with a value derived
-+	 * from this SoC's 16 GiB base, not another board's constant. */
++	/* Upstream pcie-qcom (2.7.0+ IP) qcom_pcie_avoid_dbi_atu_mirroring(): write U64_MAX to
++	 * PARF_SLV_ADDR_SPACE_SIZE/_HI so the PARF stops mirroring DBI and ATU every 16 MiB;
++	 * the DBI/ATU base registers written above then place both blocks at their DT addresses.
++	 * (The old 0 / 0x80000000 values are the legacy pci-msm programming; the new IP needs
++	 * U64_MAX.)
++	 * https://lore.kernel.org/all/8877e1f7-bbb6-49e9-a30c-0ae8e40bf5dd@quicinc.com/T/#t */
++	sy_wr(parf, PARF_SLV_SPACE_SIZE, 0xffffffffUL);
++	sy_wr(parf, PARF_SLV_SPACE_SIZE + 4, 0xffffffffUL);
 +	sy_wr(parf, PARF_SYS_CTRL, 0x365e);	/* pci-msm.c msm_pcie_enable_link */
 +	sy_wr(parf, 0x174, sy_rd(parf, 0x174) | (1UL << 4));	/* MHI_CLOCK_RESET_CTRL bypass */
 +	sy_wr(parf, 0x020, sy_rd(parf, 0x020) & ~(1UL << 5));	/* PM_CTRL: no L1 entry */
 +	sy_wr(parf, 0x1a8, sy_rd(parf, 0x1a8) | (1UL << 31));	/* AXI_MSTR_WR_ADDR_HALT */
 +	sy_wr(parf, PARF_CLKREQ_SEL, sy_rd(parf, PARF_CLKREQ_SEL) & ~1UL);
-+	printf("PANDORA WLAN: PARF glue set (device type, DBI/ATU base, L1 policy)\n");
-+	printf("PANDORA WLAN: DBI read #1 (before the PHY) at %#lx reads %#x\n",
-+	    (unsigned long)SY_DBI_PA, sy_rd(dbi, 0));
++	printf("PANDORA WLAN: PARF glue set (device type, DBI/ATU base, SLV window, L1 policy)\n");
++	/* The DBI read is deferred to after the PHY: the vendor driver never accesses DBI
++	 * before pcie_phy_init() and the pipe clock are up. */
 +}
 +
 +static bool
