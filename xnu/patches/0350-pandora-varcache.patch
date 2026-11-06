@@ -456,7 +456,7 @@
  }
  
  static void
-@@ -51,21 +470,1339 @@
+@@ -51,21 +470,1382 @@
  		cv_sleep(100);
  	}
  	if (rootvnode == NULLVP) {
@@ -549,6 +549,9 @@
 +#define SY_IATU_PA	0x410000000UL	/* "iatu", 0x1000 (separate region on this SoC) */
 +#define SY_IATU_SIZE	0x00001000UL
 +#define SY_CONF_PA	0x400100000UL	/* ECAM: dbi + 1 MiB (pci-msm.c cfg0_ecam_base) */
++#define SY_MEM_PA	0x400200000UL	/* host side of iATU region 1 (M2: BAR0) */
++#define SY_MEM_SIZE	0x00200000UL	/* BAR0 is 2 MiB (kernel_26 sizing) */
++#define SY_BAR0_PA	0x400400000UL	/* PCI address assigned to endpoint BAR0 */
 +#define SY_SM_PA	0x01d07000UL	/* "pcie_sm", 0x7000: the CESTA state machine */
 +#define SY_SM_SIZE	0x00007000UL
 +#define SY_CONF_SIZE	0x00020000UL	/* bus 0..1 config space (bus 1 is the WLAN endpoint) */
@@ -648,6 +651,10 @@
 +#define IATU_ENABLE	0x80000000UL
 +#define IATU_CFG_SHIFT	0x10000000UL
 +#define IATU_TYPE_CFG0	0x04UL
++#define IATU_CTRL2(n)	(IATU_REGION(n) + 0x04UL)
++#define IATU_LTAR(n)	(IATU_REGION(n) + 0x14UL)
++#define IATU_LTAR_HI(n)	(IATU_REGION(n) + 0x18UL)
++#define IATU_TYPE_MEM	0x00UL
 +
 +/* ---- TLMM (port-proven layout: CTL pull[1:0] func[5:2] drive[8:6] OE[9]) ---- */
 +#define PIN_CTL(n)	(SY_TLMM_PA + 0x1000UL * (n))
@@ -1462,6 +1469,42 @@
 +		printf("PANDORA WLAN: M1 endpoint found; BAR0 raw %#x/%#x type %#x 64bit %u size %#llx\n",
 +		    sy_rd(conf, 0x10), sy_rd(conf, 0x14), bar_type, bar64 ? 1u : 0u,
 +		    (unsigned long long)bar_size);
++	}
++	/* M2: assign BAR0 0x400400000 (2 MiB aligned) and reach it through iATU region 1,
++	 * then dump the first MHI/BHI words read-only. */
++	sy_wr(conf, 0x10, (uint32_t)SY_BAR0_PA);
++	sy_wr(conf, 0x14, (uint32_t)(SY_BAR0_PA >> 32));
++	sy_wr(conf, 0x04, sy_rd(conf, 0x04) | 0x2UL);	/* memory space decode on */
++	sy_usleep(1000);
++	sy_wr(iatu, IATU_CTRL2(1), 0);
++	sy_wr(iatu, IATU_CTRL1(1), IATU_TYPE_MEM);
++	sy_wr(iatu, IATU_LBAR(1), (uint32_t)SY_MEM_PA);
++	sy_wr(iatu, IATU_UBAR(1), (uint32_t)(SY_MEM_PA >> 32));
++	sy_wr(iatu, IATU_LAR(1), (uint32_t)(SY_MEM_PA + SY_MEM_SIZE - 1));
++	sy_wr(iatu, IATU_LTAR(1), (uint32_t)SY_BAR0_PA);
++	sy_wr(iatu, IATU_LTAR_HI(1), (uint32_t)(SY_BAR0_PA >> 32));
++	sy_wr(iatu, IATU_CTRL2(1), 0x80000000UL);
++	printf("PANDORA WLAN: iATU1 readback: ctrl1 %#x ctrl2 %#x lbar %#x ubar %#x lar %#x ltar %#x/%#x\n",
++	    sy_rd(iatu, IATU_CTRL1(1)), sy_rd(iatu, IATU_CTRL2(1)), sy_rd(iatu, IATU_LBAR(1)),
++	    sy_rd(iatu, IATU_UBAR(1)), sy_rd(iatu, IATU_LAR(1)), sy_rd(iatu, IATU_LTAR(1)),
++	    sy_rd(iatu, IATU_LTAR_HI(1)));
++	{
++		vm_offset_t mem = ml_io_map(SY_MEM_PA, SY_MEM_SIZE);
++		uint32_t w[8];
++		unsigned k;
++
++		if (!mem) {
++			printf("PANDORA WLAN: BAR0 window mapping failed\n");
++			return true;
++		}
++		for (k = 0; k < 8; k++)
++			w[k] = sy_rd(mem, k * 4);
++		printf("PANDORA WLAN: BAR0 %#llx words 0x00-0x1c: %#x %#x %#x %#x %#x %#x %#x %#x\n",
++		    (unsigned long long)SY_BAR0_PA, w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7]);
++		for (k = 0; k < 8; k++)
++			w[k] = sy_rd(mem, 0x100 + k * 4);
++		printf("PANDORA WLAN: BAR0 words 0x100-0x11c: %#x %#x %#x %#x %#x %#x %#x %#x\n",
++		    w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7]);
 +	}
 +	return true;
 +}
