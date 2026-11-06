@@ -456,7 +456,7 @@
  }
  
  static void
-@@ -51,21 +470,1201 @@
+@@ -51,21 +470,1194 @@
  		cv_sleep(100);
  	}
  	if (rootvnode == NULLVP) {
@@ -1549,24 +1549,17 @@
 +		sy_wr(dbi, 0x80Cu, (gen3 & 0xFFFFE0FFUL) | (1UL << 8));	/* speed field: Gen1 */
 +		sy_wr(dbi, 0x8BCu, sy_rd(dbi, 0x8BCu) | 1);		/* DBI_RO_WR_EN */
 +		lnk2 = sy_rd(dbi, 0xA0u);
-+		/* msm_pcie_link_train(): LNKCTL2 gets the DT target speed (Gen3), while the
-+		 * GEN3_GEN2_CTRL speed field above is Gen1 for the initial training. */
-+		sy_wr(dbi, 0xA0u, (lnk2 & ~0xFUL) | 3);
++		/* WCN7850 (17cb:110e) known issue: Gen3 equalization programming makes the link
++		 * fail to train (LKML: X1E80100 Surface Pro 11; forcing max-link-speed=<1> makes
++		 * the same card train and probe). Train Gen1 only here; the DT
++		 * target-link-speed speed change belongs after the link is up. */
++		sy_wr(dbi, 0xA0u, (lnk2 & ~0xFUL) | 1);			/* Link Control 2: Gen1 only */
 +		{
 +			uint32_t dcs = sy_rd(dbi, 0x78u);
-+			uint32_t spd = sy_rd(dbi, 0x7Cu) & 0xFUL;
-+			uint32_t gi;
 +
 +			sy_wr(dbi, 0x78u, (dcs & ~0x7000UL) | (5UL << 12));	/* TLP read size 0x5 */
-+			/* msm_pcie_config_controller_phy(): EQ settings for Gen3+ */
-+			for (gi = 3; gi <= spd; gi++) {
-+				uint32_t gr = sy_rd(dbi, 0x890u);
-+				sy_wr(dbi, 0x890u, (gr & ~0x03000000UL) | ((gi - 3) << 24));
-+				sy_wr(dbi, 0x890u, sy_rd(dbi, 0x890u) & ~1UL);	/* ZRXDC_NONCOMPL off */
-+				sy_wr(dbi, 0x8A8u, sy_rd(dbi, 0x8A8u) & ~0x00FFFF00UL);	/* pset_req_vec=0 */
-+				sy_wr(dbi, 0x8ACu, sy_rd(dbi, 0x8ACu) & ~0x1FUL);	/* fmdc min phase=0 */
-+			}
 +		}
++		/* Gen3 EQ / preset programming is deliberately skipped. */
 +		sy_wr(dbi, 0x8BCu, sy_rd(dbi, 0x8BCu) & ~1UL);
 +		printf("PANDORA WLAN: link speed config: 0x80C %#x 0xA0 %#x (vendor order)\n",
 +		    sy_rd(dbi, 0x80Cu), sy_rd(dbi, 0xA0u));
