@@ -456,7 +456,7 @@
  }
  
  static void
-@@ -51,21 +470,1192 @@
+@@ -51,21 +470,1201 @@
  		cv_sleep(100);
  	}
  	if (rootvnode == NULLVP) {
@@ -588,6 +588,7 @@
 +#define GDSC_PWR_UP_DONE 0x00010000UL
 +#define GCC_BCR_PCIE	0x0006b000UL	/* pcie_0 core reset (vendor gcc-canoe BCR page) */
 +#define GCC_BCR_PHY	0x0006c01cUL	/* pcie_0 phy reset */
++#define GCC_BCR_PHY_NOCSR	0x0006c028UL	/* gcc-canoe: PCIE_0_PHY_NOCSR_COM_PHY_BCR */
 +#define GCC_VOTE_RSCC	0x00052010UL	/* pcie_rscc cfg_ahb / xo votes */
 +#define GCC_VOTE_BRANCH	0x00052008UL	/* slv_axi mstr_axi cfg_ahb aux q2a cnoc_sf + pipe */
 +#define GCC_VOTE_BRANCH2 0x00052000UL	/* aggre_noc ddrss_sf phy_rchng */
@@ -1233,15 +1234,23 @@
 +		sy_wr(phy, sy_phy_seq[i][0], sy_phy_seq[i][1]);
 +	}
 +	sy_usleep(1000);
++	/* pci-msm.c pcie_phy_init order: the pipe clock is selected and enabled only
++	 * after the PHY sequence, then the pipe interface gets an assert/deassert reset
++	 * (1 ms) before PHYSTATUS is awaited. gcc-canoe has no dedicated pipe reset, so
++	 * the pipe side of that reset uses PCIE_0_PHY_NOCSR_COM_PHY_BCR (0x6c028); the
++	 * live DT has no "pcie_0_phy_pipe_reset" property either. */
++	sy_gcc_wr(GCC_PIPE_MUX, sy_gcc_rd(GCC_PIPE_MUX) & ~3UL);
 +	sy_gcc_wr(GCC_VOTE_BRANCH, sy_gcc_rd(GCC_VOTE_BRANCH) | (1UL << 4));
-+	if (!sy_gcc_poll(GCC_PIPE, CBCR_CLK_OFF, 0, 10, 1000, "the pipe clock")) {
-+		return false;
-+	}
++	sy_gcc_wr(GCC_BCR_PHY_NOCSR, sy_gcc_rd(GCC_BCR_PHY_NOCSR) | 1);
++	sy_usleep(1000);
++	sy_gcc_wr(GCC_BCR_PHY_NOCSR, sy_gcc_rd(GCC_BCR_PHY_NOCSR) & ~1UL);
++	printf("PANDORA WLAN: pipe source %#x, pipe reset bcr %#x, pipe branch %#x\n",
++	    sy_gcc_rd(GCC_PIPE_MUX), sy_gcc_rd(GCC_BCR_PHY_NOCSR), sy_gcc_rd(GCC_PIPE));
 +	if (!sy_poll(phy, PHY_STATUS, PHY_STATUS_BIT, 0, 200, 200000, "the PHY's PHYSTATUS")) {
 +		return false;
 +	}
-+	printf("PANDORA WLAN: PHY started (%u writes), pipe clock running\n",
-+	    (unsigned)SY_PHY_ROWS);
++	printf("PANDORA WLAN: PHY started (%u writes), pipe branch %#x\n",
++	    (unsigned)SY_PHY_ROWS, sy_gcc_rd(GCC_PIPE));
 +	return true;
 +}
 +
