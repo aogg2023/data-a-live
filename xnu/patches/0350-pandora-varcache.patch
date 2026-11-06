@@ -456,7 +456,7 @@
  }
  
  static void
-@@ -51,21 +470,1323 @@
+@@ -51,21 +470,1339 @@
  		cv_sleep(100);
  	}
  	if (rootvnode == NULLVP) {
@@ -1411,26 +1411,35 @@
 +	    sy_rd(iatu, IATU_UBAR(0)), sy_rd(iatu, IATU_LAR(0)));
 +}
 +
-+/* Size a 32-bit BAR the way the PCI core does: disable decode, write all ones, read the
-+ * mask, restore. One config cycle each way, no loop. */
++/* Size BAR0 the way the PCI core does: disable decode, write all ones to the whole
++ * (64-bit) BAR, read the mask, restore. M1 kernel_25 showed the old 32-bit-only path
++ * returning size 0xffffffff00200000; the endpoint's BAR0 is a 64-bit memory BAR. */
 +static uint64_t
-+sy_bar0_size(void)
++sy_bar0_size(uint32_t *type, bool *is64)
 +{
 +	uint32_t cmd = sy_rd(conf, 0x04);
-+	uint32_t bar = sy_rd(conf, 0x10);
-+	uint32_t mask;
++	uint32_t lo = sy_rd(conf, 0x10);
++	uint32_t hi = sy_rd(conf, 0x14);
++	uint64_t mask;
 +
-+	sy_wr(conf, 0x04, cmd & ~0x2UL);		/* memory space decode off while sizing */
++	*type = lo & 0xfUL;
++	*is64 = (lo & 0x6UL) == 0x4UL;	/* PCI BAR encoding: bits[2:1]=10 -> 64-bit mem */
++	sy_wr(conf, 0x04, cmd & ~0x6UL);	/* memory decode + bus master off while sizing */
 +	sy_usleep(1000);
 +	sy_wr(conf, 0x10, 0xffffffffUL);
-+	mask = sy_rd(conf, 0x10);
-+	sy_wr(conf, 0x10, bar);
++	if (*is64)
++		sy_wr(conf, 0x14, 0xffffffffUL);
++	mask = (uint64_t)sy_rd(conf, 0x10);
++	if (*is64)
++		mask |= (uint64_t)sy_rd(conf, 0x14) << 32;
++	sy_wr(conf, 0x10, lo);
++	if (*is64)
++		sy_wr(conf, 0x14, hi);
 +	sy_wr(conf, 0x04, cmd);
-+	if (mask == 0 || mask == 0xffffffffUL) {
++	if (!mask || mask == 0xffffffffffffffffULL || mask == 0xffffffffUL) {
 +		return 0;
 +	}
-+
-+	return ~(uint64_t)(mask & ~0xfUL) + 1;
++	return ~(mask & ~0xfULL) + 1ULL;
 +}
 +
 +static bool
@@ -1445,8 +1454,15 @@
 +	if ((ep & 0xffff) != 0x17cb || (ep >> 16) != 0x110e) {
 +		return false;
 +	}
-+	printf("PANDORA WLAN: M1 endpoint found; BAR0 raw %#x, size %#llx\n", sy_rd(conf, 0x10),
-+	    (unsigned long long)sy_bar0_size());
++	{
++		uint32_t bar_type = 0;
++		bool bar64 = false;
++		uint64_t bar_size = sy_bar0_size(&bar_type, &bar64);
++
++		printf("PANDORA WLAN: M1 endpoint found; BAR0 raw %#x/%#x type %#x 64bit %u size %#llx\n",
++		    sy_rd(conf, 0x10), sy_rd(conf, 0x14), bar_type, bar64 ? 1u : 0u,
++		    (unsigned long long)bar_size);
++	}
 +	return true;
 +}
 +
