@@ -550,7 +550,7 @@
 +#define SY_IATU_SIZE	0x00001000UL
 +#define SY_CONF_PA	0x400100000UL	/* ECAM: dbi + 1 MiB (pci-msm.c cfg0_ecam_base) */
 +#define SY_EP_CONF	0x00000000UL	/* pci-msm: cfg0 ECAM window serves bus 1 (the endpoint) */
-+#define SY_MEM_PA	0x400200000UL	/* host side of iATU region 1 (M2: BAR0) */
++#define SY_MEM_PA	0x40400000UL	/* host==pci inside DT ranges mem32 (cpu 0x40300000..0x43ffffff) */
 +#define SY_MEM_SIZE	0x00200000UL	/* BAR0 is 2 MiB (kernel_26 sizing) */
 +#define SY_BAR0_PA	0x40400000UL	/* Android golden BAR0 */
 +#define SY_BAR2_PA	0x40300000UL	/* Android golden BAR2 (32 KiB) */	/* Android golden: 0000:01:00.0 BAR0 = 0x40400000..0x405FFFFF (2 MiB) */
