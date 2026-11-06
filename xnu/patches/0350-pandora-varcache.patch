@@ -456,7 +456,7 @@
  }
  
  static void
-@@ -51,21 +470,1428 @@
+@@ -51,21 +470,1459 @@
  		cv_sleep(100);
  	}
  	if (rootvnode == NULLVP) {
@@ -1496,18 +1496,48 @@
 +	sy_wr(conf, SY_EP_CONF + 0x04, sy_rd(conf, SY_EP_CONF + 0x04) | 0x2UL);	/* memory space decode on */
 +	sy_usleep(1000);
 +	{
-+		uint32_t cmd_before = sy_rd(conf, SY_EP_CONF + 0x04) & 0xffffUL;
-+		unsigned w;
++		/* Standard PCI enable, which the Linux PCI core does for the vendor driver:
++		 * walk the capability list for the PM capability, put the endpoint in D0
++		 * (PMCSR state 0), then set Command = Memory Space | Bus Master (0x6). */
++		uint32_t status = (sy_rd(conf, SY_EP_CONF + 0x04) >> 16) & 0xffffUL;
++		uint32_t cap = 0, pm_cap = 0, pmcsr_off = 0, pmcsr0, pmcsr1, cmd0, cmd1;
++		unsigned i, sh;
 +
-+		for (w = 0; w < 20 && !(sy_rd(conf, SY_EP_CONF + 0x04) & 0x2UL); w++)
-+			sy_usleep(1000);
-+		if (!(sy_rd(conf, SY_EP_CONF + 0x04) & 0x2UL)) {
-+			*(volatile uint16_t *)(conf + SY_EP_CONF + 0x04) =
-+			    (uint16_t)(cmd_before | 0x2UL);	/* try a 16-bit command write */
-+			sy_usleep(1000);
++		cmd0 = sy_rd(conf, SY_EP_CONF + 0x04) & 0xffffUL;
++		if (status & 0x10UL) {
++			cap = sy_rd(conf, SY_EP_CONF + 0x34) & 0xffUL;
++			for (i = 0; i < 32 && cap >= 0x40 && cap < 0xff; i++) {
++				uint32_t hdr = sy_rd(conf, SY_EP_CONF + (cap & ~3UL));
++				sh = (cap & 3UL) * 8UL;
++				if (((hdr >> sh) & 0xffUL) == 0x01UL) {
++					pm_cap = cap;
++					break;
++				}
++				cap = (hdr >> (sh + 8UL)) & 0xffUL;
++			}
 +		}
-+		printf("PANDORA WLAN: cmd before %#x, after %#x (poll %u)\n", cmd_before,
-+		    sy_rd(conf, SY_EP_CONF + 0x04) & 0xffffUL, w);
++		pmcsr0 = 0xffffffffUL;
++		if (pm_cap) {
++			pmcsr_off = pm_cap + 4UL;
++			uint32_t v = sy_rd(conf, SY_EP_CONF + (pmcsr_off & ~3UL));
++			sh = (pmcsr_off & 3UL) * 8UL;
++			pmcsr0 = (v >> sh) & 0xffffUL;
++			if ((pmcsr0 & 3UL) != 0) {
++				*(volatile uint16_t *)(conf + SY_EP_CONF + pmcsr_off) =
++				    (uint16_t)(pmcsr0 & ~3UL);	/* D0 */
++				sy_usleep(1000);
++			}
++			uint32_t v2 = sy_rd(conf, SY_EP_CONF + (pmcsr_off & ~3UL));
++			pmcsr1 = (v2 >> sh) & 0xffffUL;
++		} else {
++			pmcsr1 = 0xffffffffUL;
++		}
++		*(volatile uint16_t *)(conf + SY_EP_CONF + 0x04) =
++		    (uint16_t)(cmd0 | 0x6UL);	/* memory + bus master */
++		sy_usleep(1000);
++		cmd1 = sy_rd(conf, SY_EP_CONF + 0x04) & 0xffffUL;
++		printf("PANDORA WLAN: PCI enable: pm cap %#x pmcsr %#x -> %#x; cmd %#x -> %#x\n",
++		    pm_cap, pmcsr0, pmcsr1, cmd0, cmd1);
 +	}
 +	sy_wr(conf, SY_EP_CONF + 0x18, (uint32_t)SY_BAR2_PA | 0x4UL);	/* BAR2: 64-bit mem, 32 KiB */
 +	sy_wr(conf, SY_EP_CONF + 0x1c, (uint32_t)(SY_BAR2_PA >> 32));
@@ -1529,7 +1559,8 @@
 +	    sy_rd(iatu, IATU_UBAR(1)), sy_rd(iatu, IATU_LAR(1)), sy_rd(iatu, IATU_LTAR(1)),
 +	    sy_rd(iatu, IATU_LTAR_HI(1)));
 +	if (!(sy_rd(conf, SY_EP_CONF + 0x04) & 0x2UL)) {
-+		printf("PANDORA WLAN: endpoint memory decode is still off; skipping the BAR0 read\n");
++		printf("PANDORA WLAN: endpoint memory decode is still off after the PCI enable; "
++		    "skipping the BAR0 read\n");
 +		return true;
 +	}
 +	{
