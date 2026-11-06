@@ -456,7 +456,7 @@
  }
  
  static void
-@@ -51,21 +470,1157 @@
+@@ -51,21 +470,1192 @@
  		cv_sleep(100);
  	}
  	if (rootvnode == NULLVP) {
@@ -1510,6 +1510,20 @@
 +	 * msm_pcie_config_perst.c drives raw 0 to assert and 1 - on to de-assert; v2m
 +	 * msm_pcie_enable_link.c waits perst_delay_us (1 ms default) after de-assert and
 +	 * only then writes PARF+0x1b0 |= 0x100 (LTSSM_EN, L896-899). */
++	/* Vendor msm_pcie_enable_link.c L6130-6160, before PERST is released:
++	 * root-port class code, PARF_CFG_BITS_3 (clear bit0, set bit8) and
++	 * LANE_SKEW_OFF bit5. */
++	if (sy_rd(dbi, 0) != 0xffffffffUL) {
++		uint32_t v;
++
++		sy_wr(dbi, 0x8BCu, sy_rd(dbi, 0x8BCu) | 1);		/* DBI_RO_WR_EN */
++		v = sy_rd(dbi, 0x08u);
++		sy_wr(dbi, 0x08u, (v & 0xFFUL) | (0x060400UL << 8));	/* class: PCI bridge */
++		sy_wr(dbi, 0x8BCu, sy_rd(dbi, 0x8BCu) & ~1UL);
++		sy_wr(parf, 0x2C4u, sy_rd(parf, 0x2C4u) & ~1UL);	/* fal10_veto override off */
++		sy_wr(parf, 0x2C4u, sy_rd(parf, 0x2C4u) | 0x100UL);	/* width upscaling support */
++		sy_wr(dbi, 0x714u, sy_rd(dbi, 0x714u) & ~0x20UL);	/* LANE_SKEW_OFF bit5 */
++	}
 +	delay_for_interval(100, NSEC_PER_MSEC);
 +	sy_pin_level(PIN_PERST, IO_HIGH);		/* vendor msm_pcie_config_perst: deassert = 1 - on (high) */
 +	delay_for_interval(1, NSEC_PER_MSEC);	/* vendor perst_delay_us 1000-1005, enabled after */
@@ -1526,7 +1540,24 @@
 +		sy_wr(dbi, 0x80Cu, (gen3 & 0xFFFFE0FFUL) | (1UL << 8));	/* speed field: Gen1 */
 +		sy_wr(dbi, 0x8BCu, sy_rd(dbi, 0x8BCu) | 1);		/* DBI_RO_WR_EN */
 +		lnk2 = sy_rd(dbi, 0xA0u);
-+		sy_wr(dbi, 0xA0u, (lnk2 & ~0xFUL) | 1);			/* Link Control 2: Gen1 */
++		/* msm_pcie_link_train(): LNKCTL2 gets the DT target speed (Gen3), while the
++		 * GEN3_GEN2_CTRL speed field above is Gen1 for the initial training. */
++		sy_wr(dbi, 0xA0u, (lnk2 & ~0xFUL) | 3);
++		{
++			uint32_t dcs = sy_rd(dbi, 0x78u);
++			uint32_t spd = sy_rd(dbi, 0x7Cu) & 0xFUL;
++			uint32_t gi;
++
++			sy_wr(dbi, 0x78u, (dcs & ~0x7000UL) | (5UL << 12));	/* TLP read size 0x5 */
++			/* msm_pcie_config_controller_phy(): EQ settings for Gen3+ */
++			for (gi = 3; gi <= spd; gi++) {
++				uint32_t gr = sy_rd(dbi, 0x890u);
++				sy_wr(dbi, 0x890u, (gr & ~0x03000000UL) | ((gi - 3) << 24));
++				sy_wr(dbi, 0x890u, sy_rd(dbi, 0x890u) & ~1UL);	/* ZRXDC_NONCOMPL off */
++				sy_wr(dbi, 0x8A8u, sy_rd(dbi, 0x8A8u) & ~0x00FFFF00UL);	/* pset_req_vec=0 */
++				sy_wr(dbi, 0x8ACu, sy_rd(dbi, 0x8ACu) & ~0x1FUL);	/* fmdc min phase=0 */
++			}
++		}
 +		sy_wr(dbi, 0x8BCu, sy_rd(dbi, 0x8BCu) & ~1UL);
 +		printf("PANDORA WLAN: link speed config: 0x80C %#x 0xA0 %#x (vendor order)\n",
 +		    sy_rd(dbi, 0x80Cu), sy_rd(dbi, 0xA0u));
@@ -1547,14 +1578,18 @@
 +		uint32_t st = 0;
 +
 +		for (i = 0; i < 100; i++) {
++			uint32_t elbi;
++
 +			st = sy_rd(dbi, 0x80u);
-+			if (st != 0xffffffffUL && (st & (1UL << 29))) {
++			elbi = sy_rd(dbi, 0xF28u);	/* ELBI_SYS_STTS, XMLH_LINK_UP=0x400 */
++			if ((elbi & 0x400UL) || (st != 0xffffffffUL && (st & (1UL << 29)))) {
 +				up = 1;
 +				break;
 +			}
 +			delay_for_interval(10, NSEC_PER_MSEC);
 +		}
-+		printf("PANDORA WLAN: link poll: after %u ms dbi80 %#x active %u\n", i * 10, st, up);
++		printf("PANDORA WLAN: link poll: after %u ms dbi80 %#x elbi %#x active %u\n",
++		    i * 10, st, sy_rd(dbi, 0xF28u), up);
 +	}
 +	printf("PANDORA WLAN: link setup done: parf %#x sm-debug %#x dbi0 %#x dbi80 %#x (log only)\n",
 +	    sy_rd(parf, PARF_LTSSM), sy_rd(pcism, 0x1090), sy_rd(dbi, 0), sy_rd(dbi, 0x80));
