@@ -456,7 +456,7 @@
  }
  
  static void
-@@ -51,21 +470,1119 @@
+@@ -51,21 +470,1140 @@
  		cv_sleep(100);
  	}
  	if (rootvnode == NULLVP) {
@@ -1280,6 +1280,9 @@
 +	sy_wr(parf, PARF_SYS_CTRL, sy_rd(parf, PARF_SYS_CTRL) | 0x04000000);	/* PCIE_ECAM_BLOCKER_EN */
 +	printf("PANDORA WLAN: ECAM window %#lx via iATU region 0 (CFG0, cfg-shift), blocker set\n",
 +	    (unsigned long)SY_CONF_PA);
++	printf("PANDORA WLAN: iATU0 readback: ctrl1 %#x ctrl2 %#x lbar %#x ubar %#x lar %#x\n",
++	    sy_rd(iatu, IATU_CTRL1(0)), sy_rd(iatu, IATU_CTRL2(0)), sy_rd(iatu, IATU_LBAR(0)),
++	    sy_rd(iatu, IATU_UBAR(0)), sy_rd(iatu, IATU_LAR(0)));
 +}
 +
 +/* Size a 32-bit BAR the way the PCI core does: disable decode, write all ones, read the
@@ -1510,6 +1513,24 @@
 +	delay_for_interval(100, NSEC_PER_MSEC);
 +	sy_pin_level(PIN_PERST, IO_HIGH);		/* vendor msm_pcie_config_perst: deassert = 1 - on (high) */
 +	delay_for_interval(1, NSEC_PER_MSEC);	/* vendor perst_delay_us 1000-1005, enabled after */
++	/* Vendor msm_pcie_enable_link.c (L673-792): after PERST release it programs the
++	 * GEN3/link-speed registers through DBI (dm_core+0x80C speed field, DBI_RO_WR_EN
++	 * around Link Control 2) and only then writes PARF+0x1b0 |= 0x100. DBI is readable
++	 * now, so reproduce that minimum before enabling LTSSM. */
++	if (sy_rd(dbi, 0) != 0xffffffffUL) {
++		uint32_t gen3 = sy_rd(dbi, 0x80Cu);
++		uint32_t lnk2;
++
++		sy_wr(dbi, 0x80Cu, (gen3 & 0xFFFFE0FFUL) | (3UL << 8));	/* target speed Gen3 */
++		sy_wr(dbi, 0x8BCu, sy_rd(dbi, 0x8BCu) | 1);		/* DBI_RO_WR_EN */
++		lnk2 = sy_rd(dbi, 0xA0u);
++		sy_wr(dbi, 0xA0u, (lnk2 & ~0xFUL) | 3);			/* Link Control 2: Gen3 */
++		sy_wr(dbi, 0x8BCu, sy_rd(dbi, 0x8BCu) & ~1UL);
++		printf("PANDORA WLAN: link speed config: 0x80C %#x 0xA0 %#x (vendor order)\n",
++		    sy_rd(dbi, 0x80Cu), sy_rd(dbi, 0xA0u));
++	} else {
++		printf("PANDORA WLAN: DBI not readable; link speed config skipped\n");
++	}
 +	printf("PANDORA WLAN: LTSSM before enable %#x (information only)\n",
 +	    sy_rd(parf, PARF_LTSSM));
 +	sy_wr(parf, PARF_LTSSM, sy_rd(parf, PARF_LTSSM) | PARF_LTSSM_EN);	/* vendor enable_link L896-899 */
