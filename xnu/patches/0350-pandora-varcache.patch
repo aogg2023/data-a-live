@@ -456,7 +456,7 @@
  }
  
  static void
-@@ -51,21 +470,1418 @@
+@@ -51,21 +470,1408 @@
  		cv_sleep(100);
  	}
  	if (rootvnode == NULLVP) {
@@ -549,7 +549,7 @@
 +#define SY_IATU_PA	0x410000000UL	/* "iatu", 0x1000 (separate region on this SoC) */
 +#define SY_IATU_SIZE	0x00001000UL
 +#define SY_CONF_PA	0x400100000UL	/* ECAM: dbi + 1 MiB (pci-msm.c cfg0_ecam_base) */
-+#define SY_EP_CONF	0x00010000UL	/* bus 1 dev 0 fn 0 inside the CFG0 window */
++#define SY_EP_CONF	0x00000000UL	/* pci-msm: cfg0 ECAM window serves bus 1 (the endpoint) */
 +#define SY_MEM_PA	0x400200000UL	/* host side of iATU region 1 (M2: BAR0) */
 +#define SY_MEM_SIZE	0x00200000UL	/* BAR0 is 2 MiB (kernel_26 sizing) */
 +#define SY_BAR0_PA	0x40400000UL	/* Android golden BAR0 */
@@ -1399,19 +1399,10 @@
 +	sy_wr(iatu, IATU_CTRL1(0), IATU_TYPE_CFG0);
 +	sy_wr(iatu, IATU_LBAR(0), (uint32_t)SY_CONF_PA);
 +	sy_wr(iatu, IATU_UBAR(0), (uint32_t)(SY_CONF_PA >> 32));
-+	sy_wr(iatu, IATU_LAR(0), (uint32_t)(SY_CONF_PA + 0x0ffff));	/* bus0 only */
++	sy_wr(iatu, IATU_LAR(0), (uint32_t)(SY_CONF_PA + 0xfffff));
 +	sy_wr(iatu, IATU_CTRL2(0), IATU_ENABLE | IATU_CFG_SHIFT);
-+	/* pci-msm.c msm_pcie_iatu_config_shift(): region 0 TYPE_CFG0 for the root complex,
-+	 * a second window TYPE_CFG1 targets the endpoint bus (BDF in the target register);
-+	 * CPU addresses inside it are devfn/register offsets. */
-+	sy_wr(iatu, IATU_CTRL2(2), 0);
-+	sy_wr(iatu, IATU_CTRL1(2), IATU_TYPE_CFG1);
-+	sy_wr(iatu, IATU_LBAR(2), (uint32_t)(SY_CONF_PA + SY_EP_CONF));
-+	sy_wr(iatu, IATU_UBAR(2), (uint32_t)((SY_CONF_PA + SY_EP_CONF) >> 32));
-+	sy_wr(iatu, IATU_LAR(2), (uint32_t)(SY_CONF_PA + SY_EP_CONF + 0xffff));
-+	sy_wr(iatu, IATU_LTAR(2), 0x01000000UL);	/* BDF(1,0) */
-+	sy_wr(iatu, IATU_LTAR_HI(2), 0);
-+	sy_wr(iatu, IATU_CTRL2(2), IATU_ENABLE | IATU_CFG_SHIFT);
++	/* pci-msm.c: the cfg0 window is the ECAM for bus 1 (endpoint); root port config is DBI. */
++	
 +	/* pci-msm.c msm_pcie_iatu_setup_ecam_blocker: point ECAM at the DBI base and block
 +	 * every function of bus 0 except the root port's own config space. */
 +	sy_wr(parf, PARF_ECAM_BASE, (uint32_t)SY_DBI_PA);
@@ -1425,9 +1416,8 @@
 +	sy_wr(parf, 0x378, (uint32_t)SY_DBI_PA + 0xfffff);	/* RD limit */
 +	sy_wr(parf, 0x37c, (uint32_t)(SY_DBI_PA >> 32));
 +	sy_wr(parf, PARF_SYS_CTRL, sy_rd(parf, PARF_SYS_CTRL) | 0x04000000);	/* PCIE_ECAM_BLOCKER_EN */
-+	printf("PANDORA WLAN: ECAM windows: bus0 %#lx via iATU0, bus1 %#lx via iATU2; ids via bus0 %#x, via bus1 %#x\n",
-+	    (unsigned long)SY_CONF_PA, (unsigned long)(SY_CONF_PA + SY_EP_CONF),
-+	    sy_rd(conf, 0), sy_rd(conf, SY_EP_CONF));
++	printf("PANDORA WLAN: ECAM bus1 window %#lx via iATU0 (CFG0); root port id (DBI) %#x, endpoint id %#x\n",
++	    (unsigned long)SY_CONF_PA, sy_rd(dbi, 0), sy_rd(conf, 0));
 +	printf("PANDORA WLAN: iATU0 readback: ctrl1 %#x ctrl2 %#x lbar %#x ubar %#x lar %#x\n",
 +	    sy_rd(iatu, IATU_CTRL1(0)), sy_rd(iatu, IATU_CTRL2(0)), sy_rd(iatu, IATU_LBAR(0)),
 +	    sy_rd(iatu, IATU_UBAR(0)), sy_rd(iatu, IATU_LAR(0)));
@@ -1470,8 +1460,8 @@
 +static bool
 +sy_config_read(void)
 +{
-+	uint32_t rc = sy_rd(conf, 0);
-+	uint32_t ep = sy_rd(conf, 0x10000);		/* bus 1, device 0, function 0 */
++	uint32_t rc = sy_rd(dbi, 0);		/* root port config lives at the DBI base */
++	uint32_t ep = sy_rd(conf, 0);		/* cfg0 ECAM window = bus 1 device 0 function 0 */
 +
 +	printf("PANDORA WLAN: config: root port (bus 0) id %#x, endpoint (bus 1) id %#x\n", rc, ep);
 +	printf("PANDORA WLAN: endpoint config[0] = %#x -> vendor %#x device %#x\n", ep,
