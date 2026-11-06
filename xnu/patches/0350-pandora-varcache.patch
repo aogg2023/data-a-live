@@ -456,7 +456,7 @@
  }
  
  static void
-@@ -51,21 +470,1117 @@
+@@ -51,21 +470,1115 @@
  		cv_sleep(100);
  	}
  	if (rootvnode == NULLVP) {
@@ -1346,11 +1346,8 @@
 +			sy_wr(crm, SY_CRM_PWR_ST0 + pwr * 4 + ch * SY_CRM_PWR_CHN +
 +			    res * SY_CRM_RES_DIST,
 +			    (res == 0 && pwr < 2) ? SY_CRM_D0_PERF_LVL : 0);
-+	/* BW_PT: no bandwidth votes are cached for D0; the vendor flushes zeros. */
-+	for (res = 0; res < SY_CRM_BW_PT_RES; res++)
-+		for (pwr = 0; pwr < SY_CRM_NUM_PWR; pwr++)
-+			sy_wr(crm, SY_CRM_PWR_ST0_PT + pwr * 4 + ch * SY_CRM_PWR_CHN +
-+			    res * SY_CRM_RES_DIST, 0);
++	/* Vendor crm-v2.c D0 only writes PERF_OL (two power states); BW_PT is not
++	 * touched for D0, so no zero flush is issued here either. */
 +	sy_wr(crm, SY_CRM_CHN_UPDATE, 1U << ch);
 +	mask = 1U << ch;
 +	for (tries = 0; tries < 100; tries++) {
@@ -1450,7 +1447,7 @@
 +
 +	printf("PANDORA WLAN: step %u: PERST and WLAN_EN low, supplies\n", sy_step);
 +	sy_pin_out(PIN_PERST, CTL_OUT_LOW_2MA);
-+	sy_pin_level(PIN_PERST, IO_HIGH);		/* perst-gpio flags=0: the driver asserts with a high level */
++	sy_pin_level(PIN_PERST, 0);			/* vendor msm_pcie_config_perst: assert = raw 0 (low) */
 +	sy_pin_out(PIN_WLAN_EN, CTL_OUT_LOW_8MA);
 +	if (!sy_supplies_on()) {
 +		return;
@@ -1502,15 +1499,16 @@
 +	printf("PANDORA WLAN: sw-ctrl pins read %u %u\n",
 +	    (unsigned)(*(volatile uint32_t *)sy_pin_reg(18, 4) & 1),
 +	    (unsigned)(*(volatile uint32_t *)sy_pin_reg(19, 4) & 1));
-+	/* PCIe CEM TPVPERL: wait while PERST is still asserted, then release it. The local driver
-+	 * releases PERST with a low level (perst-gpio flags=0); PARF+0x1b0 is information only and
-+	 * the single outbound config read below is M1's pass criterion. */
++	/* PCIe CEM TPVPERL: wait while PERST is still asserted, then release it. Vendor
++	 * msm_pcie_config_perst.c drives raw 0 to assert and 1 - on to de-assert; v2m
++	 * msm_pcie_enable_link.c waits perst_delay_us (1 ms default) after de-assert and
++	 * only then writes PARF+0x1b0 |= 0x100 (LTSSM_EN, L896-899). */
 +	delay_for_interval(100, NSEC_PER_MSEC);
-+	sy_pin_level(PIN_PERST, 0);			/* deassert: the driver releases PERST with a low level */
-+	delay_for_interval(1, NSEC_PER_MSEC);
++	sy_pin_level(PIN_PERST, IO_HIGH);		/* vendor msm_pcie_config_perst: deassert = 1 - on (high) */
++	delay_for_interval(1, NSEC_PER_MSEC);	/* vendor perst_delay_us 1000-1005, enabled after */
 +	printf("PANDORA WLAN: LTSSM before enable %#x (information only)\n",
 +	    sy_rd(parf, PARF_LTSSM));
-+	sy_wr(parf, PARF_LTSSM, sy_rd(parf, PARF_LTSSM) | PARF_LTSSM_EN);
++	sy_wr(parf, PARF_LTSSM, sy_rd(parf, PARF_LTSSM) | PARF_LTSSM_EN);	/* vendor enable_link L896-899 */
 +	printf("PANDORA WLAN: after PERST: parf ltssm %#x sys %#x (information only)\n",
 +	    sy_rd(parf, PARF_LTSSM), sy_rd(parf, PARF_SYS_CTRL));
 +	/* Plan SS6 (L218-220): sm-debug, PARF LTSSM and DBI values are logged only and
