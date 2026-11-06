@@ -456,7 +456,7 @@
  }
  
  static void
-@@ -51,21 +470,1397 @@
+@@ -51,21 +470,1418 @@
  		cv_sleep(100);
  	}
  	if (rootvnode == NULLVP) {
@@ -653,6 +653,7 @@
 +#define IATU_ENABLE	0x80000000UL
 +#define IATU_CFG_SHIFT	0x10000000UL
 +#define IATU_TYPE_CFG0	0x04UL
++#define IATU_TYPE_CFG1	0x05UL
 +#define IATU_CTRL2(n)	(IATU_REGION(n) + 0x04UL)
 +#define IATU_LTAR(n)	(IATU_REGION(n) + 0x14UL)
 +#define IATU_LTAR_HI(n)	(IATU_REGION(n) + 0x18UL)
@@ -1398,8 +1399,19 @@
 +	sy_wr(iatu, IATU_CTRL1(0), IATU_TYPE_CFG0);
 +	sy_wr(iatu, IATU_LBAR(0), (uint32_t)SY_CONF_PA);
 +	sy_wr(iatu, IATU_UBAR(0), (uint32_t)(SY_CONF_PA >> 32));
-+	sy_wr(iatu, IATU_LAR(0), (uint32_t)(SY_CONF_PA + 0xfffff));
++	sy_wr(iatu, IATU_LAR(0), (uint32_t)(SY_CONF_PA + 0x0ffff));	/* bus0 only */
 +	sy_wr(iatu, IATU_CTRL2(0), IATU_ENABLE | IATU_CFG_SHIFT);
++	/* pci-msm.c msm_pcie_iatu_config_shift(): region 0 TYPE_CFG0 for the root complex,
++	 * a second window TYPE_CFG1 targets the endpoint bus (BDF in the target register);
++	 * CPU addresses inside it are devfn/register offsets. */
++	sy_wr(iatu, IATU_CTRL2(2), 0);
++	sy_wr(iatu, IATU_CTRL1(2), IATU_TYPE_CFG1);
++	sy_wr(iatu, IATU_LBAR(2), (uint32_t)(SY_CONF_PA + SY_EP_CONF));
++	sy_wr(iatu, IATU_UBAR(2), (uint32_t)((SY_CONF_PA + SY_EP_CONF) >> 32));
++	sy_wr(iatu, IATU_LAR(2), (uint32_t)(SY_CONF_PA + SY_EP_CONF + 0xffff));
++	sy_wr(iatu, IATU_LTAR(2), 0x01000000UL);	/* BDF(1,0) */
++	sy_wr(iatu, IATU_LTAR_HI(2), 0);
++	sy_wr(iatu, IATU_CTRL2(2), IATU_ENABLE | IATU_CFG_SHIFT);
 +	/* pci-msm.c msm_pcie_iatu_setup_ecam_blocker: point ECAM at the DBI base and block
 +	 * every function of bus 0 except the root port's own config space. */
 +	sy_wr(parf, PARF_ECAM_BASE, (uint32_t)SY_DBI_PA);
@@ -1413,8 +1425,9 @@
 +	sy_wr(parf, 0x378, (uint32_t)SY_DBI_PA + 0xfffff);	/* RD limit */
 +	sy_wr(parf, 0x37c, (uint32_t)(SY_DBI_PA >> 32));
 +	sy_wr(parf, PARF_SYS_CTRL, sy_rd(parf, PARF_SYS_CTRL) | 0x04000000);	/* PCIE_ECAM_BLOCKER_EN */
-+	printf("PANDORA WLAN: ECAM window %#lx via iATU region 0 (CFG0, cfg-shift), blocker set\n",
-+	    (unsigned long)SY_CONF_PA);
++	printf("PANDORA WLAN: ECAM windows: bus0 %#lx via iATU0, bus1 %#lx via iATU2; ids via bus0 %#x, via bus1 %#x\n",
++	    (unsigned long)SY_CONF_PA, (unsigned long)(SY_CONF_PA + SY_EP_CONF),
++	    sy_rd(conf, 0), sy_rd(conf, SY_EP_CONF));
 +	printf("PANDORA WLAN: iATU0 readback: ctrl1 %#x ctrl2 %#x lbar %#x ubar %#x lar %#x\n",
 +	    sy_rd(iatu, IATU_CTRL1(0)), sy_rd(iatu, IATU_CTRL2(0)), sy_rd(iatu, IATU_LBAR(0)),
 +	    sy_rd(iatu, IATU_UBAR(0)), sy_rd(iatu, IATU_LAR(0)));
@@ -1480,6 +1493,14 @@
 +	{
 +	/* saved so the endpoint's original command register can be restored afterwards */
 +	uint32_t pci_cmd = sy_rd(conf, SY_EP_CONF + 0x04);
++	{
++		int bar_on = 0;	/* BAR assign + BAR0 read stay off until CFG1 is proven */
++		(void)PE_parse_boot_argn("songyuan_bar", &bar_on, sizeof(bar_on));
++		if (!bar_on) {
++			printf("PANDORA WLAN: M2 BAR test skipped (songyuan_bar=0); windows verified only\n");
++			return true;
++		}
++	}
 +	sy_wr(conf, SY_EP_CONF + 0x10, (uint32_t)SY_BAR0_PA | 0x4UL);	/* 64-bit mem BAR, address part */
 +	sy_wr(conf, SY_EP_CONF + 0x14, (uint32_t)(SY_BAR0_PA >> 32));
 +	sy_wr(conf, SY_EP_CONF + 0x04, sy_rd(conf, SY_EP_CONF + 0x04) | 0x2UL);	/* memory space decode on */
