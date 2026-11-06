@@ -456,7 +456,7 @@
  }
  
  static void
-@@ -51,21 +470,1466 @@
+@@ -51,21 +470,1476 @@
  		cv_sleep(100);
  	}
  	if (rootvnode == NULLVP) {
@@ -1546,6 +1546,16 @@
 +		printf("PANDORA WLAN: PCI enable: pm cap %#x pmcsr %#x -> %#x; cmd %#x -> %#x\n",
 +		    pm_cap, pmcsr0, pmcsr1, cmd0, cmd1);
 +	}
++	/* The root port only forwards memory TLPs that fall inside its Type1 memory
++	 * base/limit window (DBI 0x20); Linux' enumeration programs it (the working k90
++	 * port does the same in assign_bar0(): wr(dm_core + 0x20, ...)). Also give the
++	 * bridge its bus numbers (DBI 0x18: primary 0, secondary 1, subordinate 1). */
++	sy_wr(dbi, 0x18, 0x00010100UL);
++	sy_wr(dbi, 0x20, ((uint32_t)(SY_BAR0_PA + SY_MEM_SIZE - 1) & 0xfff00000UL) |
++	    (((uint32_t)SY_BAR0_PA >> 16) & 0xfff0UL));
++	printf("PANDORA WLAN: root port window: dbi18 %#x dbi20 %#x (BAR0 %#x..%#x)\n",
++	    sy_rd(dbi, 0x18), sy_rd(dbi, 0x20), (uint32_t)SY_BAR0_PA,
++	    (uint32_t)(SY_BAR0_PA + SY_MEM_SIZE - 1));
 +	sy_wr(conf, SY_EP_CONF + 0x18, (uint32_t)SY_BAR2_PA | 0x4UL);	/* BAR2: 64-bit mem, 32 KiB */
 +	sy_wr(conf, SY_EP_CONF + 0x1c, (uint32_t)(SY_BAR2_PA >> 32));
 +	printf("PANDORA WLAN: BAR0 assigned: config10 %#x/%#x, BAR2: config18 %#x/%#x, cmd %#x status %#x\n",
