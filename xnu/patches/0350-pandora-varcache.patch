@@ -456,7 +456,7 @@
  }
  
  static void
-@@ -51,21 +470,1324 @@
+@@ -51,21 +470,1323 @@
  		cv_sleep(100);
  	}
  	if (rootvnode == NULLVP) {
@@ -1057,7 +1057,7 @@
 +
 +/* One ACTIVE TCS command on the PCIe set (TCS2); the clock level is the data word. */
 +static int
-+sy_rpmh_vote1(const char *res, uint32_t data)
++sy_rpmh_vote1(const char *res, uint32_t addr_off, uint32_t data)
 +{
 +	const struct sy_rpmh_layout *L = &sy_rpmh_v3;
 +	uint32_t id, address = 0, b, bit;
@@ -1082,6 +1082,7 @@
 +	rc = sy_rpmh_lookup_clock(res, &address);
 +	if (rc)
 +		return rc;
++	address += addr_off;	/* clk-rpmh: res_addr = cmd-db addr + CLK_RPMH_VRM_EN_OFFSET(4) */
 +	b = SY_TCS_OFF + 2 * SY_TCS_STRIDE;
 +	bit = 1u << 2;
 +	if (sy_rd(sy_rsc, b + L->control) != 0 || sy_rd(sy_rsc, b + L->enable) != 0 ||
@@ -1143,17 +1144,15 @@
 +		int rfclk = 1, wcal = 1;
 +
 +		(void)PE_parse_boot_argn("songyuan_rfclk", &rfclk, sizeof(rfclk));
-+		(void)PE_parse_boot_argn("songyuan_wcal", &wcal, sizeof(wcal));
 +		if (rfclk) {
-+			printf("PANDORA WLAN: voting rf_clk (RPMh clock, cnss rf_clk)\n");
-+			if (sy_rpmh_vote1("rf_clk", 1) != 0)
++			/* clk-rpmh.c canoe table: [RPMH_RF_CLK1] = clk_rpmh_c1a_e0_div1; the DT
++			 * consumer name is "rf_clk" but the cmd-db resource is "c1a_e0" and the
++			 * enable word lives at +CLK_RPMH_VRM_EN_OFFSET(4) with data 1. */
++			printf("PANDORA WLAN: voting rf_clk (RPMh VRM clock c1a_e0 +4, data 1)\n");
++			if (sy_rpmh_vote1("c1a_e0", 4, 1) != 0)
 +				printf("PANDORA WLAN: the rf_clk vote failed\n");
 +		}
-+		if (wcal) {
-+			printf("PANDORA WLAN: voting WCAL_PBS (wan calibration rail)\n");
-+			if (sy_rpmh_vote1("WCAL_PBS", 1) != 0)
-+				printf("PANDORA WLAN: the WCAL_PBS vote failed\n");
-+		}
++		(void)wcal;
 +	}
 +	return true;
 +}
