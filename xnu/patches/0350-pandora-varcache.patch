@@ -456,7 +456,7 @@
  }
  
  static void
-@@ -51,21 +470,1459 @@
+@@ -51,21 +470,1466 @@
  		cv_sleep(100);
  	}
  	if (rootvnode == NULLVP) {
@@ -1460,7 +1460,8 @@
 +static bool
 +sy_config_read(void)
 +{
-+	uint32_t rc = sy_rd(dbi, 0);		/* root port config lives at the DBI base */
++	uint32_t rc = sy_rd(dbi, 0);
++	uint32_t pm_state = 0xffffffffUL;	/* PMCSR power state seen by the PCI enable block */		/* root port config lives at the DBI base */
 +	uint32_t ep = sy_rd(conf, 0);		/* cfg0 ECAM window = bus 1 device 0 function 0 */
 +
 +	printf("PANDORA WLAN: config: root port (bus 0) id %#x, endpoint (bus 1) id %#x\n", rc, ep);
@@ -1528,13 +1529,19 @@
 +				sy_usleep(1000);
 +			}
 +			uint32_t v2 = sy_rd(conf, SY_EP_CONF + (pmcsr_off & ~3UL));
-+			pmcsr1 = (v2 >> sh) & 0xffffUL;
++			pmcsr1 = (v2 >> sh) & 0xffffUL;		/* 0 = D0 */
++			pm_state = pmcsr1;
 +		} else {
 +			pmcsr1 = 0xffffffffUL;
 +		}
 +		*(volatile uint16_t *)(conf + SY_EP_CONF + 0x04) =
 +		    (uint16_t)(cmd0 | 0x6UL);	/* memory + bus master */
-+		sy_usleep(1000);
++		{
++			unsigned w;
++
++			for (w = 0; w < 20 && !(sy_rd(conf, SY_EP_CONF + 0x04) & 0x2UL); w++)
++				sy_usleep(1000);
++		}
 +		cmd1 = sy_rd(conf, SY_EP_CONF + 0x04) & 0xffffUL;
 +		printf("PANDORA WLAN: PCI enable: pm cap %#x pmcsr %#x -> %#x; cmd %#x -> %#x\n",
 +		    pm_cap, pmcsr0, pmcsr1, cmd0, cmd1);
@@ -1558,9 +1565,9 @@
 +	    sy_rd(iatu, IATU_CTRL1(1)), sy_rd(iatu, IATU_CTRL2(1)), sy_rd(iatu, IATU_LBAR(1)),
 +	    sy_rd(iatu, IATU_UBAR(1)), sy_rd(iatu, IATU_LAR(1)), sy_rd(iatu, IATU_LTAR(1)),
 +	    sy_rd(iatu, IATU_LTAR_HI(1)));
-+	if (!(sy_rd(conf, SY_EP_CONF + 0x04) & 0x2UL)) {
-+		printf("PANDORA WLAN: endpoint memory decode is still off after the PCI enable; "
-+		    "skipping the BAR0 read\n");
++	if ((pm_state & 3UL) != 0 || !(sy_rd(conf, SY_EP_CONF + 0x04) & 0x2UL)) {
++		printf("PANDORA WLAN: PCI enable incomplete (pm state %#x, cmd %#x); "
++		    "skipping the BAR0 read\n", pm_state, sy_rd(conf, SY_EP_CONF + 0x04) & 0xffffUL);
 +		return true;
 +	}
 +	{
