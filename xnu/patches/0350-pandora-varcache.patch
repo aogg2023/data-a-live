@@ -456,7 +456,7 @@
  }
  
  static void
-@@ -51,21 +470,1630 @@
+@@ -51,21 +470,1650 @@
  		cv_sleep(100);
  	}
  	if (rootvnode == NULLVP) {
@@ -1698,6 +1698,26 @@
 +					    sy_rd(parf, 0x200c + e * 0x10));
 +				printf("PANDORA WLAN: PARF bypass[0x2c00] %#x [0x2c04] %#x\n",
 +				    sy_rd(parf, 0x2c00), sy_rd(parf, 0x2c04));
++		}
++		if (sy_step >= 12) {
++			/* SID table init, same order as the local driver's msm_pcie_config_sid():
++			 * clear the bypass bit, zero the 256 x 4-byte table, then write the
++			 * endpoint entry (PARF 0x2000 + 4*SID) with the plan's value. */
++			uint32_t byp = sy_rd(parf, 0x2c00);
++			unsigned e;
++
++			sy_wr(parf, 0x2c00, byp & ~1u);
++			printf("PANDORA WLAN: SID init: bypass %#x -> %#x\n", byp, sy_rd(parf, 0x2c00));
++			for (e = 0; e < 256; e++)
++				sy_wr(parf, 0x2000 + 4 * e, 0);
++			sy_wr(parf, 0x2054, 0x01000100UL);
++			printf("PANDORA WLAN: SID init: [0x2054] readback %#x (expect 0x1000100)\n",
++			    sy_rd(parf, 0x2054));
++			for (e = 0; e < 4; e++)
++				printf("PANDORA WLAN: SID init: [%#x] %#x %#x %#x %#x\n",
++				    0x2048 + e * 0x10, sy_rd(parf, 0x2048 + e * 0x10),
++				    sy_rd(parf, 0x204c + e * 0x10), sy_rd(parf, 0x2050 + e * 0x10),
++				    sy_rd(parf, 0x2054 + e * 0x10));
 +			}
 +			if (smmu) {
 +				printf("PANDORA WLAN: SMMU IDR0 %#x IDR1 %#x IDR2 %#x CR0 %#x\n",
