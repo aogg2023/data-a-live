@@ -456,7 +456,7 @@
  }
  
  static void
-@@ -51,21 +470,2234 @@
+@@ -51,21 +470,2269 @@
  		cv_sleep(100);
  	}
  	if (rootvnode == NULLVP) {
@@ -975,9 +975,26 @@
 +		rc = EBUSY;
 +		goto out;
 +	}
++	/* Fix 1: W1C our DRV_IRQ_STATUS bit and prove it reads back clear; a
++	 * leftover bit from a crashed boot can make the next trigger never
++	 * complete (observed as a hard reset on the first vote). */
 +	irq_en = sy_rd(sy_rsc, SY_TCS_OFF);
-+	sy_wr(sy_rsc, b + L->control, 0);
 +	sy_wr(sy_rsc, SY_TCS_OFF + 8, bit);	/* DRV_IRQ_CLEAR: our set only */
++	__asm__ volatile("dsb sy" ::: "memory");
++	if (sy_rd(sy_rsc, SY_TCS_OFF + 4) & bit) {
++		printf("PANDORA WLAN: RPMh: TCS%u stale IRQ status %#x after W1C; not voting\n",
++		    t, sy_rd(sy_rsc, SY_TCS_OFF + 4));
++		rc = EBUSY;
++		goto out;
++	}
++	printf("PANDORA WLAN: RPMh: TCS%u snapshot ctrl=%#x enable=%#x wait=%#x status=%#x "
++	    "cmd-status=%#x/%#x/%#x irq-enable=%#x\n", t, sy_rd(sy_rsc, b + L->control),
++	    sy_rd(sy_rsc, b + L->enable), sy_rd(sy_rsc, b + L->wait),
++	    sy_rd(sy_rsc, b + L->status),
++	    sy_rd(sy_rsc, b + L->cmd_status),
++	    sy_rd(sy_rsc, b + L->cmd_status + L->cmd_stride),
++	    sy_rd(sy_rsc, b + L->cmd_status + 2 * L->cmd_stride), irq_en);
++	sy_wr(sy_rsc, b + L->control, 0);
 +	for (unsigned c = 0; c < ncmd; c++) {
 +		uint32_t cmd = b + c * L->cmd_stride;
 +		word[c] = address + offs[c];
@@ -1005,10 +1022,22 @@
 +		rc = EIO;
 +		goto restore;
 +	}
-+	sy_wr(sy_rsc, SY_TCS_OFF, sy_rd(sy_rsc, SY_TCS_OFF) | bit);	/* DRV_IRQ_ENABLE |= ours */
++	/* Fix 2: set our DRV_IRQ_ENABLE bit from a fresh read and verify it. */
++	{
++		uint32_t en = sy_rd(sy_rsc, SY_TCS_OFF) | bit;
++
++		sy_wr(sy_rsc, SY_TCS_OFF, en);
++		__asm__ volatile("dsb sy" ::: "memory");
++		if ((sy_rd(sy_rsc, SY_TCS_OFF) & bit) == 0) {
++			printf("PANDORA WLAN: RPMh: TCS%u IRQ enable bit did not stick (%#x)\n",
++			    t, sy_rd(sy_rsc, SY_TCS_OFF));
++			rc = EIO;
++			goto restore;
++		}
++	}
 +	sy_wr(sy_rsc, b + L->control, SY_RPMH_AMC);
 +	sy_wr(sy_rsc, b + L->control, SY_RPMH_AMC | SY_RPMH_TRIGGER);
-+	for (unsigned us = 0; us < 10000 && !done; us++) {
++	for (unsigned us = 0; us < 2000 && !done; us++) {   /* <=~2 ms, not the WDT */
 +		/* K90 mhi_pcie_power.c polls only DRV_IRQ_STATUS. The per-command
 +		 * status offsets are not validated on this layout: a three-command
 +		 * LDO vote never matched and the wait used to spin until the WDT. */
@@ -1137,6 +1166,12 @@
 +	}
 +	sy_wr(sy_rsc, b + L->control, 0);
 +	sy_wr(sy_rsc, SY_TCS_OFF + 8, bit);
++	__asm__ volatile("dsb sy" ::: "memory");
++	if (sy_rd(sy_rsc, SY_TCS_OFF + 4) & bit) {
++		printf("PANDORA WLAN: RPMh: TCS2 stale IRQ status %#x; %s not voted\n",
++		    sy_rd(sy_rsc, SY_TCS_OFF + 4), res);
++		return EBUSY;
++	}
 +	if (!sy_rpmh_sync(b + L->msgid, SY_RPMH_WRITE) ||
 +	    !sy_rpmh_sync(b + L->addr, address) ||
 +	    !sy_rpmh_sync(b + L->data, data)) {
