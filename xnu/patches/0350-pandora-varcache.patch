@@ -456,7 +456,7 @@
  }
  
  static void
-@@ -51,21 +470,1995 @@
+@@ -51,21 +470,1980 @@
  		cv_sleep(100);
  	}
  	if (rootvnode == NULLVP) {
@@ -683,6 +683,8 @@
 +static vm_offset_t sy_dma_va;
 +static vm_offset_t sy_smmu_va;
 +static uint32_t sy_smmu_slot, sy_smmu_cb;
++static uint32_t sy_id0, sy_id1, sy_id2, sy_cr0;
++static vm_offset_t sy_cb_va;
 +static vm_offset_t sy_smmu_cbbase, sy_smmu_gr1;
 +static unsigned sy_smmu_pgshift;
 +static vm_offset_t sy_bar_va;
@@ -1889,6 +1891,12 @@
 +	sy_smmu_va = s; sy_smmu_slot = slot; sy_smmu_cb = cb;
 +	sy_smmu_cbbase = cb_base; sy_smmu_gr1 = 0x15000000UL + ((vm_offset_t)1 << pgshift);
 +	sy_smmu_pgshift = pgshift;
++	sy_cr0 = scr0; sy_id0 = numsmrg; sy_id1 = numcb; sy_id2 = idr2;
++	if (cb != ~0u) {
++		sy_cb_va = ml_io_map(cb_base + ((vm_offset_t)cb << pgshift), 0x1000);
++		printf("PANDORA WLAN: probe stores id0 %#x id1 %#x id2 %#x cr0 %#x cbva %#lx\n",
++		    sy_id0, sy_id1, sy_id2, sy_cr0, (unsigned long)sy_cb_va);
++	}
 +	if (cb != ~0u) {
 +		vm_offset_t cbp = ml_io_map(cb_base + ((vm_offset_t)cb << pgshift), 0x1000);
 +		if (cbp) {
@@ -1946,55 +1954,32 @@
 +static int
 +sy_smmu_install(void)
 +{
-+	vm_offset_t gr0 = ml_io_map(0x15000000UL, 0x2000);
-+	uint32_t cr0, cr2, id0, id1, id2, v, saved_sctlr, saved_tcr2;
-+	uint32_t shift, pages, ns2, ps, smr, s2cr, slot = ~0u, cb = ~0u;
-+	vm_offset_t gr1, cbp;
++	vm_offset_t gr0 = sy_smmu_va;
++	vm_offset_t gr1;
++	vm_offset_t cbp;
++	uint32_t v, cr0, id1, id2, saved_sctlr, saved_tcr2;
++	uint32_t shift, pages, ns2, ps, smr, s2cr, slot, cb;
 +	uint64_t ttbr, asid = 0xff00ULL;
 +	unsigned i;
 +
-+	if (!gr0 || !sy_dma_va) {
-+		printf("PANDORA WLAN: SMMU install: no GR0/DMA\n");
++	if (!sy_smmu_va || !sy_dma_va || !sy_id0 || !sy_id1 || !sy_id2) {
++		printf("PANDORA WLAN: SMMU install: no geometry\n");
 +		return 1;
 +	}
-+	cr0 = sy_rd(gr0, 0x00); cr2 = sy_rd(gr0, 0x08);
-+	id0 = sy_rd(gr0, 0x20); id1 = sy_rd(gr0, 0x24); id2 = sy_rd(gr0, 0x28);
-+	printf("PANDORA WLAN: SMMU: cr0 %#x cr2 %#x id0 %#x id1 %#x id2 %#x\n",
-+	    cr0, cr2, id0, id1, id2);
-+	if ((cr0 & 0x401u) != 0x400u || (cr2 & 0xa0000000u) ||
-+	    !id0 || !(id0 & (1u << 30)) || !(id0 & (1u << 27)) || !(id2 & (1u << 12))) {
-+		printf("PANDORA WLAN: SMMU: global geometry refused\n");
-+		return 2;
-+	}
-+	v = id0 & 0xff;			/* stream count */
++	printf("PANDORA WLAN: SMMU install: start (stored geometry)\n");
++	cr0 = sy_cr0; id1 = sy_id1; id2 = sy_id2;
++	slot = sy_smmu_slot; cb = sy_smmu_cb;
 +	shift = (id1 >> 31) ? 16 : 12;
 +	pages = 2u << ((id1 >> 28) & 7);
 +	ns2 = (id1 >> 16) & 0xff;
 +	ps = (id2 & 15) < ((id2 >> 4) & 15) ? (id2 & 15) : ((id2 >> 4) & 15);
-+	gr1 = gr0 + (1UL << shift);
-+	printf("PANDORA WLAN: SMMU: streams %u banks %u shift %u pages %u ns2 %u ps %u "
-+	    "gr1 %#lx cbbase %#lx\n", v, id1 & 0xff, shift, pages, ns2, ps,
-+	    (unsigned long)gr1, (unsigned long)(0x15000000UL + ((vm_offset_t)pages << shift)));
-+	if (!v || v > 128 || !(id1 & 0xff) || (id1 & 0xff) > 128 || ps > 5)
-+		return 3;
-+	for (i = 0; i < v && slot == ~0u; i++) {
-+		smr = sy_rd(gr0, 0x800 + 4 * i);
-+		s2cr = sy_rd(gr0, 0xc00 + 4 * i);
-+		if (!(smr & 0x80000000u) && (((s2cr >> 16) & 3) == 1 || ((s2cr >> 16) & 3) == 2))
-+			slot = i;
-+	}
-+	if (slot == ~0u) {
-+		printf("PANDORA WLAN: SMMU: no free stream slot\n");
-+		return 4;
-+	}
-+	for (i = ns2; i < (id1 & 0xff) && cb == ~0u; i++) {
-+		vm_offset_t t = ml_io_map(0x15000000UL + (((vm_offset_t)pages + i) << shift), 0x1000);
-+
-+		if (!t)
-+			continue;
-+		saved_sctlr = sy_rd(t, 0x00); v = sy_rd(t, 0x58);
-+		if (!(saved_sctlr & 1u) && !(v & 0xc00001feu) && (v & 0x600u) == 0x400u)
-+			cb = i;
++	gr1 = sy_smmu_gr1;
++	printf("PANDORA WLAN: SMMU install: geomslot %u cb %u shift %u pages %u ns2 %u ps %u gr1 %#lx\n",
++	    slot, cb, shift, pages, ns2, ps, (unsigned long)gr1);
++	if ((cr0 & 0x401u) != 0x400u || !(sy_id0 & (1u << 30)) || !(sy_id0 & (1u << 27)) ||
++	    !(id2 & (1u << 12)) || slot > 0x7f || cb > 0x7f || ps > 5) {
++		printf("PANDORA WLAN: SMMU install: geometry refused\n");
++		return 2;
 +	}
 +	if (cb == ~0u) {
 +		printf("PANDORA WLAN: SMMU: no idle CB (slot %u)\n", slot);
