@@ -456,7 +456,7 @@
  }
  
  static void
-@@ -51,21 +470,1506 @@
+@@ -51,21 +470,1500 @@
  		cv_sleep(100);
  	}
  	if (rootvnode == NULLVP) {
@@ -550,8 +550,9 @@
 +#define SY_IATU_SIZE	0x00001000UL
 +#define SY_CONF_PA	0x400100000UL	/* ECAM: dbi + 1 MiB (pci-msm.c cfg0_ecam_base) */
 +#define SY_EP_CONF	0x00000000UL	/* pci-msm: cfg0 ECAM window serves bus 1 (the endpoint) */
-+#define SY_MEM_PA	0x40400000UL	/* host==pci inside DT ranges mem32 (cpu 0x40300000..0x43ffffff) */
-+#define SY_MEM_SIZE	0x00200000UL	/* BAR0 is 2 MiB (kernel_26 sizing) */
++#define SY_MEM_BASE	0x40300000UL	/* DT ranges group2: cpu==pci (plan L246) */
++#define SY_MEM_SIZE	0x03d00000UL	/* ranges group2 length (plan L246) */
++#define SY_BAR0_SIZE	0x00200000UL	/* endpoint BAR0 2 MiB (sized on the card) */
 +#define SY_BAR0_PA	0x40400000UL	/* Android golden BAR0 */
 +#define SY_BAR2_PA	0x40300000UL	/* Android golden BAR2 (32 KiB) */	/* Android golden: 0000:01:00.0 BAR0 = 0x40400000..0x405FFFFF (2 MiB) */
 +#define SY_SM_PA	0x01d07000UL	/* "pcie_sm", 0x7000: the CESTA state machine */
@@ -1535,7 +1536,7 @@
 +			pmcsr1 = 0xffffffffUL;
 +		}
 +		*(volatile uint16_t *)(conf + SY_EP_CONF + 0x04) =
-+		    (uint16_t)(cmd0 | 0x6UL);	/* memory + bus master */
++		    (uint16_t)(cmd0 | 0x2UL);	/* memory only; bus master at MHI (plan L240) */
 +		{
 +			unsigned w;
 +
@@ -1551,11 +1552,11 @@
 +	 * port does the same in assign_bar0(): wr(dm_core + 0x20, ...)). Also give the
 +	 * bridge its bus numbers (DBI 0x18: primary 0, secondary 1, subordinate 1). */
 +	sy_wr(dbi, 0x18, 0x00010100UL);
-+	sy_wr(dbi, 0x20, ((uint32_t)(SY_BAR0_PA + SY_MEM_SIZE - 1) & 0xfff00000UL) |
++	sy_wr(dbi, 0x20, ((uint32_t)(SY_BAR0_PA + SY_BAR0_SIZE - 1) & 0xfff00000UL) |
 +	    (((uint32_t)SY_BAR0_PA >> 16) & 0xfff0UL));
 +	printf("PANDORA WLAN: root port window: dbi18 %#x dbi20 %#x (BAR0 %#x..%#x)\n",
 +	    sy_rd(dbi, 0x18), sy_rd(dbi, 0x20), (uint32_t)SY_BAR0_PA,
-+	    (uint32_t)(SY_BAR0_PA + SY_MEM_SIZE - 1));
++	    (uint32_t)(SY_BAR0_PA + SY_BAR0_SIZE - 1));
 +	sy_wr(conf, SY_EP_CONF + 0x18, (uint32_t)SY_BAR2_PA | 0x4UL);	/* BAR2: 64-bit mem, 32 KiB */
 +	sy_wr(conf, SY_EP_CONF + 0x1c, (uint32_t)(SY_BAR2_PA >> 32));
 +	printf("PANDORA WLAN: BAR0 assigned: config10 %#x/%#x, BAR2: config18 %#x/%#x, cmd %#x status %#x\n",
@@ -1565,10 +1566,10 @@
 +	    (sy_rd(conf, SY_EP_CONF + 0x04) >> 16) & 0xffffUL);
 +	sy_wr(iatu, IATU_CTRL2(1), 0);
 +	sy_wr(iatu, IATU_CTRL1(1), IATU_TYPE_MEM);
-+	sy_wr(iatu, IATU_LBAR(1), (uint32_t)SY_MEM_PA);
-+	sy_wr(iatu, IATU_UBAR(1), (uint32_t)(SY_MEM_PA >> 32));
-+	sy_wr(iatu, IATU_LAR(1), (uint32_t)(SY_MEM_PA + SY_MEM_SIZE - 1));
-+	sy_wr(iatu, IATU_LTAR(1), (uint32_t)SY_BAR0_PA);
++	sy_wr(iatu, IATU_LBAR(1), (uint32_t)SY_MEM_BASE);
++	sy_wr(iatu, IATU_UBAR(1), (uint32_t)(SY_MEM_BASE >> 32));
++	sy_wr(iatu, IATU_LAR(1), (uint32_t)(SY_MEM_BASE + SY_MEM_SIZE - 1));
++	sy_wr(iatu, IATU_LTAR(1), (uint32_t)SY_MEM_BASE);	/* identity: host==pci */
 +	sy_wr(iatu, IATU_LTAR_HI(1), (uint32_t)(SY_BAR0_PA >> 32));
 +	sy_wr(iatu, IATU_CTRL2(1), 0x80000000UL);
 +	printf("PANDORA WLAN: iATU1 readback: ctrl1 %#x ctrl2 %#x lbar %#x ubar %#x lar %#x ltar %#x/%#x\n",
@@ -1611,22 +1612,15 @@
 +		return true;
 +	}
 +	{
-+		vm_offset_t mem = ml_io_map(SY_MEM_PA, SY_MEM_SIZE);
-+		uint32_t w[8];
-+		unsigned k;
++		/* plan L240: map only the head we read; 4 KiB page, one word first */
++		vm_offset_t mem = ml_io_map(SY_BAR0_PA, 0x1000);
 +
 +		if (!mem) {
-+			printf("PANDORA WLAN: BAR0 window mapping failed\n");
++			printf("PANDORA WLAN: BAR0 page mapping failed\n");
 +			return true;
 +		}
-+		for (k = 0; k < 8; k++)
-+			w[k] = sy_rd(mem, k * 4);
-+		printf("PANDORA WLAN: BAR0 %#llx words 0x00-0x1c: %#x %#x %#x %#x %#x %#x %#x %#x\n",
-+		    (unsigned long long)SY_BAR0_PA, w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7]);
-+		for (k = 0; k < 8; k++)
-+			w[k] = sy_rd(mem, 0x100 + k * 4);
-+		printf("PANDORA WLAN: BAR0 words 0x100-0x11c: %#x %#x %#x %#x %#x %#x %#x %#x\n",
-+		    w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7]);
++		printf("PANDORA WLAN: BAR0 %#llx word0 (MHI_REGLEN) %#x\n",
++		    (unsigned long long)SY_BAR0_PA, sy_rd(mem, 0));
 +	}
 +	sy_wr(conf, SY_EP_CONF + 0x04, pci_cmd);	/* restore the endpoint's command register */
 +	}
