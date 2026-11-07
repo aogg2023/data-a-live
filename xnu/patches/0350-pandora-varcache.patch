@@ -456,7 +456,7 @@
  }
  
  static void
-@@ -51,21 +470,1586 @@
+@@ -51,21 +470,1587 @@
  		cv_sleep(100);
  	}
  	if (rootvnode == NULLVP) {
@@ -678,6 +678,7 @@
 +
 +
 +extern int pandora_fw_read(uint64_t off, void *dst, uint64_t len);	/* bsd/dev/sweet_ufs.c */
++static int sy_fw_find(const char *name, uint64_t *off, uint64_t *size);
 +
 +static vm_offset_t parf, phy, dbi, iatu, conf, pcism, gcc_low, gcc, tlmm_low, tlmm, tcsr, rsc, cmddb, crm;
 +#define SY_PHY_ROWS (sizeof(sy_phy_seq) / sizeof(sy_phy_seq[0]))
