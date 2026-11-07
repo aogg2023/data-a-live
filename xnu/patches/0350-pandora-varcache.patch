@@ -456,7 +456,7 @@
  }
  
  static void
-@@ -51,21 +470,1620 @@
+@@ -51,21 +470,1630 @@
  		cv_sleep(100);
  	}
  	if (rootvnode == NULLVP) {
@@ -1676,22 +1676,32 @@
 +						entry_lo |= (uint32_t)h[24 + i] << (8 * i);
 +						entry_hi |= (uint32_t)h[28 + i] << (8 * i);
 +					}
-+					printf("PANDORA WLAN: fw ELF magic %c%c%c%c class %u type %u mach %u "
-+					    "entry %#x%08x size %#llx (expect 0x6fa8c0)\n",
-+					    h[1], h[2], h[3], h[4], h[4] == 2 ? 64 : 32, h[16] | h[17] << 8,
-+					    h[18] | h[19] << 8 | h[20] << 16, entry_hi, entry_lo,
-+					    (unsigned long long)fs);
++					printf("PANDORA WLAN: fw ELF magic %c%c%c%c class %u data %u type %u mach %u "
++					    "entry %#x%08x size %#llx (expect 0x6fa8c0, pack size off by %#llx)\n",
++					    h[1], h[2], h[3], h[4], h[4], h[5], h[16] | h[17] << 8,
++					    h[18] | h[19] << 8, entry_hi, entry_lo,
++					    (unsigned long long)fs,
++					    (unsigned long long)(fs - (uint64_t)0x6fa8c0));
 +				}
 +			}
 +		}
 +		if (sy_step >= 11) {
 +			vm_offset_t smmu = ml_io_map(0x15000000UL, 0x1000);
 +
-+			printf("PANDORA WLAN: PARF SID[0x2054] %#x bypass[0x2c00] %#x\n",
-+			    sy_rd(parf, 0x2054), sy_rd(parf, 0x2c00));
++			{
++				unsigned e;
++
++				for (e = 0; e < 8; e++)
++					printf("PANDORA WLAN: PARF SID[%#x] %#x %#x %#x %#x\n",
++					    0x2000 + e * 0x10, sy_rd(parf, 0x2000 + e * 0x10),
++					    sy_rd(parf, 0x2004 + e * 0x10), sy_rd(parf, 0x2008 + e * 0x10),
++					    sy_rd(parf, 0x200c + e * 0x10));
++				printf("PANDORA WLAN: PARF bypass[0x2c00] %#x [0x2c04] %#x\n",
++				    sy_rd(parf, 0x2c00), sy_rd(parf, 0x2c04));
++			}
 +			if (smmu) {
-+				printf("PANDORA WLAN: SMMU IDR0 %#x IDR1 %#x\n",
-+				    sy_rd(smmu, 0x00), sy_rd(smmu, 0x04));
++				printf("PANDORA WLAN: SMMU IDR0 %#x IDR1 %#x IDR2 %#x CR0 %#x\n",
++				    sy_rd(smmu, 0x00), sy_rd(smmu, 0x04), sy_rd(smmu, 0x08), sy_rd(smmu, 0x20));
 +			} else {
 +				printf("PANDORA WLAN: SMMU 0x15000000 mapping failed\n");
 +			}
