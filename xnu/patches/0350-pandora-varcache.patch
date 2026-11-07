@@ -456,7 +456,7 @@
  }
  
  static void
-@@ -51,21 +470,1906 @@
+@@ -51,21 +470,1912 @@
  		cv_sleep(100);
  	}
  	if (rootvnode == NULLVP) {
@@ -1980,8 +1980,14 @@
 +		kr = kmem_alloc_contig(kernel_map, &sy_sbl_va, SY_FW_BUF, PAGE_MASK,
 +		    0, 0, KMA_DATA | KMA_ZERO | KMA_PERMANENT, VM_KERN_MEMORY_IOKIT);
 +		if (kr != KERN_SUCCESS || !sy_sbl_va) {
-+			printf("PANDORA WLAN: BHI: SBL contig alloc failed %d\n", kr);
-+			return;
++			printf("PANDORA WLAN: BHI: %#lx-byte contig failed %d, retry %#lx\n",
++			    (unsigned long)SY_FW_BUF, kr, (unsigned long)SY_SBL_SIZE);
++			kr = kmem_alloc_contig(kernel_map, &sy_sbl_va, SY_SBL_SIZE, PAGE_MASK,
++			    0, 0, KMA_DATA | KMA_ZERO | KMA_PERMANENT, VM_KERN_MEMORY_IOKIT);
++			if (kr != KERN_SUCCESS || !sy_sbl_va) {
++				printf("PANDORA WLAN: BHI: SBL contig alloc failed %d\n", kr);
++				return;
++			}
 +		}
 +		sy_sbl_pa = sy_pa(sy_sbl_va);
 +		printf("PANDORA WLAN: BHI: SBL buffer va %#lx pa %#llx size %#lx\n",
