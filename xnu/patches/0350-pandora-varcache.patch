@@ -456,7 +456,7 @@
  }
  
  static void
-@@ -51,21 +470,1588 @@
+@@ -51,21 +470,1586 @@
  		cv_sleep(100);
  	}
  	if (rootvnode == NULLVP) {
@@ -1661,8 +1661,6 @@
 +			} else {
 +				printf("PANDORA WLAN: fw amss20.bin not found in the pinned pack\n");
 +			}
-+			k = 0;
-+			(void)k;
 +		}
 +	}
 +	sy_wr(conf, SY_EP_CONF + 0x04, pci_cmd);	/* restore the endpoint's command register */
