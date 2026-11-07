@@ -456,7 +456,7 @@
  }
  
  static void
-@@ -51,21 +470,1926 @@
+@@ -51,21 +470,1935 @@
  		cv_sleep(100);
  	}
  	if (rootvnode == NULLVP) {
@@ -1872,7 +1872,7 @@
 +		printf("PANDORA WLAN: SMMU probe: no free SMR slot\n");
 +		return;
 +	}
-+	for (i = 0; i < cb_n && cb == ~0u; i++) {
++	for (i = 0; i < cb_n && cb == ~0u && i < 32; i++) {
 +		vm_offset_t cbp = ml_io_map(cb_base + ((vm_offset_t)i << pgshift), 0x1000);
 +		uint32_t ctl;
 +
@@ -1943,7 +1943,7 @@
 +static int
 +sy_smmu_install(void)
 +{
-+	vm_offset_t cb;
++	vm_offset_t cb = 0;
 +	uint64_t ttbr;
 +	uint32_t v;
 +	unsigned i;
@@ -1959,10 +1959,19 @@
 +	if (sy_pt_build())
 +		return 2;
 +	ttbr = sy_pa(sy_l1);
-+	cb = sy_smmu_cbbase + ((vm_offset_t)sy_smmu_cb << sy_smmu_pgshift);
-+	sy_wr(cb, 0x00, 0);                              /* SCTLR off */
-+	sy_wr(sy_smmu_gr1, 0x800 + 4 * sy_smmu_cb, 1);   /* CBA2R VA64 */
-+	sy_wr(sy_smmu_gr1, 4 * sy_smmu_cb, 0x1f300);     /* CBAR S1, S2 bypass */
++	{
++		vm_offset_t gr1 = ml_io_map(0x15000000UL + (1UL << sy_smmu_pgshift), 0x1000);
++		vm_offset_t cbp = ml_io_map(sy_smmu_cbbase + ((vm_offset_t)sy_smmu_cb << sy_smmu_pgshift), 0x1000);
++
++		if (!gr1 || !cbp) {
++			printf("PANDORA WLAN: SMMU install: GR1/CB map failed\n");
++			return 3;
++		}
++		cb = cbp;
++		sy_wr(cb, 0x00, 0);                          /* SCTLR off */
++		sy_wr(gr1, 0x800 + 4 * sy_smmu_cb, 1);       /* CBA2R VA64 */
++		sy_wr(gr1, 4 * sy_smmu_cb, 0x1f300);         /* CBAR S1, S2 bypass */
++	}
 +	sy_wr(cb, 0x10, 0x38011);                        /* TCR2 */
 +	sy_wr(cb, 0x30, 0x80a03520);                     /* TCR: 32-bit input, 4K */
 +	sy_wr(cb, 0x24, (uint32_t)(ttbr >> 32));         /* TTBR0 hi */
