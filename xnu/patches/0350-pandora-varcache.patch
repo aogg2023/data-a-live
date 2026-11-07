@@ -1900,7 +1900,7 @@
 +	}
 +	((uint64_t *)sy_l1)[(SY_IOVA_MAP >> 30) & 511] = sy_pa(sy_l2) | 3ull;
 +	for (i = 0; i < l3s; i++)
-+		((uint64_t *)sy_l2)[512 + (((SY_IOVA_MAP >> 21) + i) & 511)] =
++		((uint64_t *)sy_l2)[(((SY_IOVA_MAP >> 21) + i) & 511)] =
 +		    sy_pa(sy_l3 + (i << 12)) | 3ull;
 +	for (i = 0; i < (sy_buf_size >> 12); i++) {
 +		pa = sy_pa(sy_sbl_va + ((vm_offset_t)i << 12));
