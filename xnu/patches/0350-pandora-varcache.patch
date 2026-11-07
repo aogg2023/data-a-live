@@ -456,7 +456,7 @@
  }
  
  static void
-@@ -51,21 +470,1921 @@
+@@ -51,21 +470,1924 @@
  		cv_sleep(100);
  	}
  	if (rootvnode == NULLVP) {
@@ -680,6 +680,19 @@
 +
 +
 +extern int pandora_fw_read(uint64_t off, void *dst, uint64_t len);	/* bsd/dev/sweet_ufs.c */
++static vm_offset_t sy_dma_va;
++static vm_offset_t sy_smmu_va;
++static uint32_t sy_smmu_slot, sy_smmu_cb;
++static vm_offset_t sy_smmu_cbbase, sy_smmu_gr1;
++static unsigned sy_smmu_pgshift;
++static vm_offset_t sy_bar_va;
++static vm_offset_t sy_l1, sy_l2, sy_l3;
++static vm_offset_t sy_cb_va;
++#define SY_DMA_SIZE	0x2000000UL
++#define SY_IOVA_BASE	0xB0000000UL	/* DT cnss_pci0 partition window 2 */
++#define SY_SBL_SIZE	0x80000UL
++extern ppnum_t pmap_find_phys(pmap_t, addr64_t);
++extern void flush_dcache64(addr64_t addr, unsigned count, int phys);
 +static int sy_fw_find(const char *name, uint64_t *off, uint64_t *size);
 +static void sy_smmu_probe(void);
 +static int sy_smmu_install(void);
@@ -1816,17 +1829,7 @@
 +/* Stage 13: read-only SMMU stream/CB selection (same layout as the working
 + * same-card port: SMR at GR0+0x800, S2CR at GR0+0xc00, CBs after GR1) plus the
 + * 32 MiB cnss_wlan_region-style DMA pool, all below 4 GiB. No SMMU writes yet. */
-+static vm_offset_t sy_dma_va;
-+static vm_offset_t sy_smmu_va;
-+static uint32_t sy_smmu_slot, sy_smmu_cb;
-+static vm_offset_t sy_smmu_cbbase, sy_smmu_gr1;
-+static unsigned sy_smmu_pgshift;
-+static vm_offset_t sy_bar_va;
-+static vm_offset_t sy_l1, sy_l2, sy_l3;
-+static vm_offset_t sy_cb_va;
-+#define SY_DMA_SIZE	0x2000000UL
-+#define SY_IOVA_BASE	0xB0000000UL	/* DT cnss_pci0 partition window 2 */
-+#define SY_SBL_SIZE	0x80000UL
++
 +
 +static void
 +sy_smmu_probe(void)
