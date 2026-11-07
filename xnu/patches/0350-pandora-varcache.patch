@@ -456,7 +456,7 @@
  }
  
  static void
-@@ -51,21 +470,1927 @@
+@@ -51,21 +470,1906 @@
  		cv_sleep(100);
  	}
  	if (rootvnode == NULLVP) {
@@ -696,6 +696,7 @@
 +#define SY_DMA_SIZE	0x2000000UL
 +#define SY_IOVA_BASE	0xB0000000UL	/* DT cnss_pci0 partition window 2 */
 +#define SY_SBL_SIZE	0x80000UL
++#define SY_FW_BUF	0x00800000UL	/* full amss buffer, reused for BHIe */
 +extern ppnum_t pmap_find_phys(pmap_t, addr64_t);
 +extern void flush_dcache64(addr64_t addr, unsigned count, int phys);
 +static int sy_fw_find(const char *name, uint64_t *off, uint64_t *size);
@@ -1745,30 +1746,8 @@
 +				    sy_rd(parf, 0x204c + e * 0x10), sy_rd(parf, 0x2050 + e * 0x10),
 +				    sy_rd(parf, 0x2054 + e * 0x10));
 +			}
-+		if (sy_step >= 13) {
-+			kern_return_t kr;
-+			vm_size_t off;
-+			uint64_t lo = ~0ull, hi = 0, pa;
-+			unsigned bad = 0;
-+
++		if (sy_step >= 13)
 +			sy_smmu_probe();
-+			kr = kmem_alloc(kernel_map, &sy_dma_va, SY_DMA_SIZE,
-+			    KMA_DATA | KMA_ZERO | KMA_NOPAGEWAIT, VM_KERN_MEMORY_IOKIT);
-+			if (kr != KERN_SUCCESS) {
-+				printf("PANDORA WLAN: DMA pool alloc failed %d\n", kr);
-+			} else {
-+				for (off = 0; off < SY_DMA_SIZE; off += PAGE_SIZE) {
-+					pa = ptoa_64(pmap_find_phys(kernel_pmap, sy_dma_va + off));
-+					if (!pa || pa >= (1ull << 36))
-+						bad++;
-+					if (pa < lo) lo = pa;
-+					if (pa > hi) hi = pa;
-+				}
-+				printf("PANDORA WLAN: DMA pool va %#lx size %#lx phys %#llx..%#llx bad %u\n",
-+				    (unsigned long)sy_dma_va, (unsigned long)SY_DMA_SIZE,
-+				    (unsigned long long)lo, (unsigned long long)hi, bad);
-+			}
-+		}
 +		if (sy_step >= 14) {
 +			(void)sy_smmu_install();
 +		}
@@ -1982,8 +1961,8 @@
 +	vm_offset_t off;
 +	unsigned i;
 +
-+	if (!sy_bar_va || !sy_dma_va) {
-+		printf("PANDORA WLAN: BHI: missing BAR0/DMA mapping\n");
++	if (!sy_bar_va) {
++		printf("PANDORA WLAN: BHI: missing BAR0 mapping\n");
 +		return;
 +	}
 +	bhio = sy_rd(sy_bar_va, 0x28);
@@ -1998,8 +1977,8 @@
 +	if (!sy_sbl_va) {
 +		kern_return_t kr;
 +
-+		kr = kmem_alloc_contig(kernel_map, &sy_sbl_va, SY_SBL_SIZE, PAGE_MASK,
-+		    0x3ffff, 0, KMA_DATA | KMA_ZERO | KMA_PERMANENT, VM_KERN_MEMORY_IOKIT);
++		kr = kmem_alloc_contig(kernel_map, &sy_sbl_va, SY_FW_BUF, PAGE_MASK,
++		    0, 0, KMA_DATA | KMA_ZERO | KMA_PERMANENT, VM_KERN_MEMORY_IOKIT);
 +		if (kr != KERN_SUCCESS || !sy_sbl_va) {
 +			printf("PANDORA WLAN: BHI: SBL contig alloc failed %d\n", kr);
 +			return;
@@ -2008,8 +1987,8 @@
 +		printf("PANDORA WLAN: BHI: SBL buffer va %#lx pa %#llx size %#lx\n",
 +		    (unsigned long)sy_sbl_va, (unsigned long long)sy_sbl_pa,
 +		    (unsigned long)SY_SBL_SIZE);
-+		if (sy_sbl_pa + SY_SBL_SIZE > (1ull << 32)) {
-+			printf("PANDORA WLAN: BHI: SBL buffer above 4 GiB\n");
++		if (!sy_sbl_pa) {
++			printf("PANDORA WLAN: BHI: SBL buffer has no physical address\n");
 +			return;
 +		}
 +	}
