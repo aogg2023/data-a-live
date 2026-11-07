@@ -456,7 +456,7 @@
  }
  
  static void
-@@ -51,21 +470,1476 @@
+@@ -51,21 +470,1506 @@
  		cv_sleep(100);
  	}
  	if (rootvnode == NULLVP) {
@@ -1575,6 +1575,36 @@
 +	    sy_rd(iatu, IATU_CTRL1(1)), sy_rd(iatu, IATU_CTRL2(1)), sy_rd(iatu, IATU_LBAR(1)),
 +	    sy_rd(iatu, IATU_UBAR(1)), sy_rd(iatu, IATU_LAR(1)), sy_rd(iatu, IATU_LTAR(1)),
 +	    sy_rd(iatu, IATU_LTAR_HI(1)));
++	/* Is the iATU we program (DT "iatu", 0x410000000) the same instance the
++	 * hardware uses? The same-card fuxi port and the K90 port both access the
++	 * ATU registers at DBI + 0x1000. Print both aliases read-only. */
++	{
++		uint32_t a0[7], b0[7], a1[7], b1[7];
++		unsigned i;
++
++		for (i = 0; i < 7; i++) {
++			a0[i] = sy_rd(iatu, IATU_REGION(0) + 4 * i);
++			b0[i] = sy_rd(dbi, 0x1000 + IATU_REGION(0) + 4 * i);
++			a1[i] = sy_rd(iatu, IATU_REGION(1) + 4 * i);
++			b1[i] = sy_rd(dbi, 0x1000 + IATU_REGION(1) + 4 * i);
++		}
++		printf("PANDORA WLAN: ATU@iatu_r0:     %#x %#x %#x %#x %#x %#x %#x\n",
++		    a0[0], a0[1], a0[2], a0[3], a0[4], a0[5], a0[6]);
++		printf("PANDORA WLAN: ATU@dbi+1000_r0: %#x %#x %#x %#x %#x %#x %#x\n",
++		    b0[0], b0[1], b0[2], b0[3], b0[4], b0[5], b0[6]);
++		printf("PANDORA WLAN: ATU@iatu_r1:     %#x %#x %#x %#x %#x %#x %#x\n",
++		    a1[0], a1[1], a1[2], a1[3], a1[4], a1[5], a1[6]);
++		printf("PANDORA WLAN: ATU@dbi+1000_r1: %#x %#x %#x %#x %#x %#x %#x\n",
++		    b1[0], b1[1], b1[2], b1[3], b1[4], b1[5], b1[6]);
++	}
++	{
++		int bar_read = 0;	/* the BAR0 read itself stays opt-in this round */
++		(void)PE_parse_boot_argn("songyuan_barread", &bar_read, sizeof(bar_read));
++		if (!bar_read) {
++			printf("PANDORA WLAN: BAR0 read skipped (songyuan_barread=0); ATU aliases dumped\n");
++			return true;
++		}
++	}
 +	if ((pm_state & 3UL) != 0 || !(sy_rd(conf, SY_EP_CONF + 0x04) & 0x2UL)) {
 +		printf("PANDORA WLAN: PCI enable incomplete (pm state %#x, cmd %#x); "
 +		    "skipping the BAR0 read\n", pm_state, sy_rd(conf, SY_EP_CONF + 0x04) & 0xffffUL);
