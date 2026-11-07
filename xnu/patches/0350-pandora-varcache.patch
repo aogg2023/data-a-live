@@ -456,7 +456,7 @@
  }
  
  static void
-@@ -51,21 +470,1650 @@
+@@ -51,21 +470,1742 @@
  		cv_sleep(100);
  	}
  	if (rootvnode == NULLVP) {
@@ -495,6 +495,7 @@
 +#include <machine/machine_routines.h>
 +#include <pexpert/pexpert.h>
 +#include <vm/vm_kern.h>
++#include <vm/pmap.h>
 +
 +static const uint16_t sy_phy_seq[][2] = {
 +	{ 0x1440, 0x03 }, { 0x0030, 0x1b }, { 0x0034, 0x14 }, { 0x007c, 0x00 }, { 0x0080, 0x40 }, { 0x0084, 0x00 },
@@ -679,6 +680,7 @@
 +
 +extern int pandora_fw_read(uint64_t off, void *dst, uint64_t len);	/* bsd/dev/sweet_ufs.c */
 +static int sy_fw_find(const char *name, uint64_t *off, uint64_t *size);
++static void sy_smmu_probe(void);
 +
 +static vm_offset_t parf, phy, dbi, iatu, conf, pcism, gcc_low, gcc, tlmm_low, tlmm, tcsr, rsc, cmddb, crm;
 +#define SY_PHY_ROWS (sizeof(sy_phy_seq) / sizeof(sy_phy_seq[0]))
@@ -1719,6 +1721,30 @@
 +				    sy_rd(parf, 0x204c + e * 0x10), sy_rd(parf, 0x2050 + e * 0x10),
 +				    sy_rd(parf, 0x2054 + e * 0x10));
 +			}
++		if (sy_step >= 13) {
++			kern_return_t kr;
++			vm_size_t off;
++			uint64_t lo = ~0ull, hi = 0, pa;
++			unsigned bad = 0;
++
++			sy_smmu_probe();
++			kr = kmem_alloc(kernel_map, &sy_dma_va, SY_DMA_SIZE,
++			    KMA_DATA | KMA_ZERO | KMA_NOPAGEWAIT, VM_KERN_MEMORY_IOKIT);
++			if (kr != KERN_SUCCESS) {
++				printf("PANDORA WLAN: DMA pool alloc failed %d\n", kr);
++			} else {
++				for (off = 0; off < SY_DMA_SIZE; off += PAGE_SIZE) {
++					pa = ptoa_64(pmap_find_phys(kernel_pmap, sy_dma_va + off));
++					if (!pa || pa >= (1ull << 36))
++						bad++;
++					if (pa < lo) lo = pa;
++					if (pa > hi) hi = pa;
++				}
++				printf("PANDORA WLAN: DMA pool va %#lx size %#lx phys %#llx..%#llx bad %u\n",
++				    (unsigned long)sy_dma_va, (unsigned long)SY_DMA_SIZE,
++				    (unsigned long long)lo, (unsigned long long)hi, bad);
++			}
++		}
 +			if (smmu) {
 +				printf("PANDORA WLAN: SMMU IDR0 %#x IDR1 %#x IDR2 %#x CR0 %#x\n",
 +				    sy_rd(smmu, 0x00), sy_rd(smmu, 0x04), sy_rd(smmu, 0x08), sy_rd(smmu, 0x20));
@@ -1775,6 +1801,72 @@
 +		}
 +	}
 +	return -1;
++}
++
++/* Stage 13: read-only SMMU stream/CB selection (same layout as the working
++ * same-card port: SMR at GR0+0x800, S2CR at GR0+0xc00, CBs after GR1) plus the
++ * 32 MiB cnss_wlan_region-style DMA pool, all below 4 GiB. No SMMU writes yet. */
++static vm_offset_t sy_dma_va;
++#define SY_DMA_SIZE	0x2000000UL
++
++static void
++sy_smmu_probe(void)
++{
++	vm_offset_t s = ml_io_map(0x15000000UL, 0x1000);
++	uint32_t scr0, numsmrg, numcb, idr2;
++	unsigned smr_n, cb_n, pgshift, pages, i;
++	unsigned slot = ~0u, cb = ~0u;
++	uint32_t old_smr = 0, old_s2cr = 0;
++	vm_offset_t cb_base;
++
++	if (!s) {
++		printf("PANDORA WLAN: SMMU map failed\n");
++		return;
++	}
++	scr0 = sy_rd(s, 0x00); numsmrg = sy_rd(s, 0x20);
++	numcb = sy_rd(s, 0x24); idr2 = sy_rd(s, 0x28);
++	smr_n = numsmrg & 0xff; cb_n = numcb & 0xff;
++	pgshift = (numcb & (1u << 31)) ? 16 : 12;
++	pages = 1u << (((numcb >> 28) & 7) + 1);
++	cb_base = 0x15000000UL + ((vm_offset_t)pages << pgshift);
++	printf("PANDORA WLAN: SMMU probe: scr0 %#x numsmrg %#x numcb %#x idr2 %#x -> smr %u cb %u pgshift %u cbbase %#lx\n",
++	    scr0, numsmrg, numcb, idr2, smr_n, cb_n, pgshift, (unsigned long)cb_base);
++	if (!smr_n || !cb_n || cb_n > 128) {
++		printf("PANDORA WLAN: SMMU probe: implausible geometry, stop\n");
++		return;
++	}
++	for (i = 0; i < smr_n && slot == ~0u; i++) {
++		uint32_t smr = sy_rd(s, 0x800 + 4 * i);
++		uint32_t s2cr = sy_rd(s, 0xc00 + 4 * i);
++		unsigned type = (s2cr >> 16) & 3;
++
++		if (!(smr & 0x80000000u) && type >= 1 && type <= 2) {
++			slot = i; old_smr = smr; old_s2cr = s2cr;
++		}
++	}
++	if (slot == ~0u) {
++		printf("PANDORA WLAN: SMMU probe: no free SMR slot\n");
++		return;
++	}
++	for (i = 0; i < cb_n && cb == ~0u; i++) {
++		vm_offset_t cbp = ml_io_map(cb_base + ((vm_offset_t)i << pgshift), 0x1000);
++		uint32_t ctl;
++
++		if (!cbp)
++			break;
++		ctl = sy_rd(cbp, 0x00);
++		if (!(ctl & 1u))
++			cb = i;
++	}
++	printf("PANDORA WLAN: SMMU probe: free slot %u old smr %#x s2cr %#x; free cb %u\n",
++	    slot, old_smr, old_s2cr, cb);
++	if (cb != ~0u) {
++		vm_offset_t cbp = ml_io_map(cb_base + ((vm_offset_t)cb << pgshift), 0x1000);
++		if (cbp) {
++			printf("PANDORA WLAN: SMMU probe: cb %u sctlr %#x ttbr0 %#x tcr %#x mair %#x\n",
++			    cb, sy_rd(cbp, 0x00), sy_rd(cbp, 0x20), sy_rd(cbp, 0x10), sy_rd(cbp, 0x50));
++		}
++	}
 +}
 +
 +/* CRM D0: the power state vote the local driver's CESTA path sends before it resets
