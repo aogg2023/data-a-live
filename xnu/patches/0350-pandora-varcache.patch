@@ -456,7 +456,7 @@
  }
  
  static void
-@@ -51,21 +470,1500 @@
+@@ -51,21 +470,1588 @@
  		cv_sleep(100);
  	}
  	if (rootvnode == NULLVP) {
@@ -676,6 +676,8 @@
 +#define IO_HIGH		0x2UL
 +
 +
++
++extern int pandora_fw_read(uint64_t off, void *dst, uint64_t len);	/* bsd/dev/sweet_ufs.c */
 +
 +static vm_offset_t parf, phy, dbi, iatu, conf, pcism, gcc_low, gcc, tlmm_low, tlmm, tcsr, rsc, cmddb, crm;
 +#define SY_PHY_ROWS (sizeof(sy_phy_seq) / sizeof(sy_phy_seq[0]))
@@ -1621,10 +1623,96 @@
 +		}
 +		printf("PANDORA WLAN: BAR0 %#llx word0 (MHI_REGLEN) %#x\n",
 +		    (unsigned long long)SY_BAR0_PA, sy_rd(mem, 0));
++		if (sy_step >= 8) {
++			uint32_t ver = sy_rd(mem, 0x08), cfg = sy_rd(mem, 0x10);
++			uint32_t chdb = sy_rd(mem, 0x18), erdb = sy_rd(mem, 0x20);
++			uint32_t bhio = sy_rd(mem, 0x28), bhie = sy_rd(mem, 0x2c);
++			uint32_t ctrl = sy_rd(mem, 0x38), st = sy_rd(mem, 0x48);
++
++			printf("PANDORA WLAN: MHI: ver %#x (major %u minor %u) cfg %#x chdb %#x erdb %#x "
++			    "bhio %#x bhie %#x ctrl %#x status %#x state %u syserr %u\n",
++			    ver, ver & 0xffff, ver >> 16, cfg, chdb, erdb, bhio, bhie, ctrl, st,
++			    (st >> 8) & 0xff, (st >> 2) & 1);
++			if (bhio && (bhio & 3u) == 0 && bhio + 0x40u <= 0x1000u) {
++				printf("PANDORA WLAN: BHI: version %#x/%#x execenv %#x status %#x errcode %#x "
++				    "errdbg %#x/%#x/%#x\n",
++				    sy_rd(mem, bhio + 0x00), sy_rd(mem, bhio + 0x04),
++				    sy_rd(mem, bhio + 0x28), sy_rd(mem, bhio + 0x2c),
++				    sy_rd(mem, bhio + 0x30), sy_rd(mem, bhio + 0x34),
++				    sy_rd(mem, bhio + 0x38), sy_rd(mem, bhio + 0x3c));
++			} else {
++				printf("PANDORA WLAN: BHI: BHIOFF %#x not in the first 4 KiB page\n", bhio);
++			}
++		}
++		if (sy_step >= 9) {
++			uint64_t fo = 0, fs = 0;
++
++			if (sy_fw_find("amss20.bin", &fo, &fs) == 0) {
++				uint8_t h[16];
++				unsigned k;
++
++				(void)pandora_fw_read(fo, h, sizeof(h));
++				printf("PANDORA WLAN: fw amss20.bin off %#llx size %#llx magic %#x %#x %#x %#x\n",
++				    (unsigned long long)fo, (unsigned long long)fs,
++				    (unsigned)h[0] << 24 | (unsigned)h[1] << 16 | (unsigned)h[2] << 8 | h[3],
++				    (unsigned)h[4] << 24 | (unsigned)h[5] << 16 | (unsigned)h[6] << 8 | h[7],
++				    (unsigned)h[8] << 24 | (unsigned)h[9] << 16 | (unsigned)h[10] << 8 | h[11],
++				    (unsigned)h[12] << 24 | (unsigned)h[13] << 16 | (unsigned)h[14] << 8 | h[15]);
++			} else {
++				printf("PANDORA WLAN: fw amss20.bin not found in the pinned pack\n");
++			}
++			k = 0;
++			(void)k;
++		}
 +	}
 +	sy_wr(conf, SY_EP_CONF + 0x04, pci_cmd);	/* restore the endpoint's command register */
 +	}
 +	return true;
++}
++
++/* Locate a file in the pinned firmware pack (PANDFW01: u32 count, entries of
++ * {char name[48]; u64 offset; u64 size} at blk+16; names are basenames). */
++static int
++sy_fw_find(const char *name, uint64_t *off, uint64_t *size)
++{
++	uint8_t blk[4096];
++	uint32_t n = 0;
++	unsigned i, k;
++
++	if (pandora_fw_read(0, blk, sizeof(blk)))
++		return -1;
++	if (blk[0] != 'P' || blk[1] != 'A' || blk[2] != 'N' || blk[3] != 'D' ||
++	    blk[4] != 'F' || blk[5] != 'W' || blk[6] != '0' || blk[7] != '1')
++		return -1;
++	for (i = 0; i < 4; i++)
++		n |= (uint32_t)blk[8 + i] << (8 * i);
++	if (!n || n > 63)
++		return -1;
++	{
++		unsigned nl = 0;
++
++		while (name[nl] && nl < 47)
++			nl++;
++		for (i = 0; i < n; i++) {
++			const uint8_t *e = blk + 16 + i * 64;
++			uint64_t eo = 0, es = 0;
++
++			for (k = 0; k < nl; k++) {
++				if (e[k] != (uint8_t)name[k])
++					break;
++			}
++			if (k != nl || e[nl] != 0)
++				continue;
++			for (k = 0; k < 8; k++) {
++				eo |= (uint64_t)e[48 + k] << (8 * k);
++				es |= (uint64_t)e[56 + k] << (8 * k);
++			}
++			*off = eo;
++			*size = es;
++			return 0;
++		}
++	}
++	return -1;
 +}
 +
 +/* CRM D0: the power state vote the local driver's CESTA path sends before it resets
