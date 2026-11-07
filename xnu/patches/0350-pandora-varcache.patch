@@ -456,7 +456,7 @@
  }
  
  static void
-@@ -51,21 +470,1925 @@
+@@ -51,21 +470,1995 @@
  		cv_sleep(100);
  	}
  	if (rootvnode == NULLVP) {
@@ -1934,7 +1934,8 @@
 +		((uint64_t *)sy_l2)[0x180 + i] = sy_pa(sy_l3 + (i << 12)) | 3ull;
 +	for (i = 0; i < (SY_DMA_SIZE >> 12); i++) {
 +		pa = sy_pa(sy_dma_va + ((vm_offset_t)i << 12));
-+		((uint64_t *)(sy_l3 + ((i >> 9) << 12)))[i & 0x1ff] = (pa & 0x0000ffffff000ull) | 0xe63ull;
++		((uint64_t *)(sy_l3 + ((i >> 9) << 12)))[i & 0x1ff] =
++		    (pa & 0x0000fffffffff000ull) | 0x0060000000000f43ull;
 +	}
 +	printf("PANDORA WLAN: PT: l1 %#lx l2 %#lx l3 %#lx root %#llx iova %#x size %#lx\n",
 +	    (unsigned long)sy_l1, (unsigned long)sy_l2, (unsigned long)sy_l3,
@@ -1945,25 +1946,113 @@
 +static int
 +sy_smmu_install(void)
 +{
-+	uint32_t old_s2cr, old_smr;
++	vm_offset_t gr0 = ml_io_map(0x15000000UL, 0x2000);
++	uint32_t cr0, cr2, id0, id1, id2, v, saved_sctlr, saved_tcr2;
++	uint32_t shift, pages, ns2, ps, smr, s2cr, slot = ~0u, cb = ~0u;
++	vm_offset_t gr1, cbp;
++	uint64_t ttbr, asid = 0xff00ULL;
++	unsigned i;
 +
-+	if (!sy_smmu_va || sy_smmu_slot > 0x7f) {
-+		printf("PANDORA WLAN: SMMU install: no probe data\n");
++	if (!gr0 || !sy_dma_va) {
++		printf("PANDORA WLAN: SMMU install: no GR0/DMA\n");
 +		return 1;
 +	}
-+	/* First pass uses S2CR BYPASS for our stream (type 1, no context bank):
-+	 * the device then DMA-addressed by physical address, so no CB/TTBR writes
-+	 * are needed before BHI. Never write the CB page (kernel_45 panicked there). */
-+	old_s2cr = sy_rd(sy_smmu_va, 0xc00 + 4 * sy_smmu_slot);
-+	old_smr = sy_rd(sy_smmu_va, 0x800 + 4 * sy_smmu_slot);
-+	printf("PANDORA WLAN: SMMU bypass: slot %u old smr %#x s2cr %#x\n",
-+	    sy_smmu_slot, old_smr, old_s2cr);
-+	sy_wr(sy_smmu_va, 0xc00 + 4 * sy_smmu_slot, 1u << 16);    /* S2CR: bypass */
-+	sy_wr(sy_smmu_va, 0x800 + 4 * sy_smmu_slot, 0x80001401);  /* SMR: SID 0x1401 */
++	cr0 = sy_rd(gr0, 0x00); cr2 = sy_rd(gr0, 0x08);
++	id0 = sy_rd(gr0, 0x20); id1 = sy_rd(gr0, 0x24); id2 = sy_rd(gr0, 0x28);
++	printf("PANDORA WLAN: SMMU: cr0 %#x cr2 %#x id0 %#x id1 %#x id2 %#x\n",
++	    cr0, cr2, id0, id1, id2);
++	if ((cr0 & 0x401u) != 0x400u || (cr2 & 0xa0000000u) ||
++	    !id0 || !(id0 & (1u << 30)) || !(id0 & (1u << 27)) || !(id2 & (1u << 12))) {
++		printf("PANDORA WLAN: SMMU: global geometry refused\n");
++		return 2;
++	}
++	v = id0 & 0xff;			/* stream count */
++	shift = (id1 >> 31) ? 16 : 12;
++	pages = 2u << ((id1 >> 28) & 7);
++	ns2 = (id1 >> 16) & 0xff;
++	ps = (id2 & 15) < ((id2 >> 4) & 15) ? (id2 & 15) : ((id2 >> 4) & 15);
++	gr1 = gr0 + (1UL << shift);
++	printf("PANDORA WLAN: SMMU: streams %u banks %u shift %u pages %u ns2 %u ps %u "
++	    "gr1 %#lx cbbase %#lx\n", v, id1 & 0xff, shift, pages, ns2, ps,
++	    (unsigned long)gr1, (unsigned long)(0x15000000UL + ((vm_offset_t)pages << shift)));
++	if (!v || v > 128 || !(id1 & 0xff) || (id1 & 0xff) > 128 || ps > 5)
++		return 3;
++	for (i = 0; i < v && slot == ~0u; i++) {
++		smr = sy_rd(gr0, 0x800 + 4 * i);
++		s2cr = sy_rd(gr0, 0xc00 + 4 * i);
++		if (!(smr & 0x80000000u) && (((s2cr >> 16) & 3) == 1 || ((s2cr >> 16) & 3) == 2))
++			slot = i;
++	}
++	if (slot == ~0u) {
++		printf("PANDORA WLAN: SMMU: no free stream slot\n");
++		return 4;
++	}
++	for (i = ns2; i < (id1 & 0xff) && cb == ~0u; i++) {
++		vm_offset_t t = ml_io_map(0x15000000UL + (((vm_offset_t)pages + i) << shift), 0x1000);
++
++		if (!t)
++			continue;
++		saved_sctlr = sy_rd(t, 0x00); v = sy_rd(t, 0x58);
++		if (!(saved_sctlr & 1u) && !(v & 0xc00001feu) && (v & 0x600u) == 0x400u)
++			cb = i;
++	}
++	if (cb == ~0u) {
++		printf("PANDORA WLAN: SMMU: no idle CB (slot %u)\n", slot);
++		return 5;
++	}
++	cbp = ml_io_map(0x15000000UL + (((vm_offset_t)pages + cb) << shift), 0x1000);
++	if (!cbp)
++		return 6;
++	saved_sctlr = sy_rd(cbp, 0x00);
++	saved_tcr2 = sy_rd(cbp, 0x10);
++	if (saved_sctlr & 1u) {
++		printf("PANDORA WLAN: SMMU: CB %u busy\n", cb);
++		return 7;
++	}
++	printf("PANDORA WLAN: SMMU: free slot %u old smr/s2cr %#x/%#x; cb %u sctlr %#x tcr2 %#x\n",
++	    slot, sy_rd(gr0, 0x800 + 4 * slot), sy_rd(gr0, 0xc00 + 4 * slot),
++	    cb, saved_sctlr, saved_tcr2);
++	if (sy_pt_build())
++		return 8;
++	ttbr = sy_pa(sy_l1) | (asid << 48);
++	sy_wr(gr1, 0x800 + 4 * cb, 1);			/* CBA2R: VA64 */
++	sy_wr(gr1, 4 * cb, 0x1f300);			/* CBAR: S1 trans, S2 bypass */
++	sy_wr(cbp, 0x10, (saved_tcr2 & ~0x38017u) | 0x38010u | ps);	/* TCR2 */
++	sy_wr(cbp, 0x30, 0x803520u);			/* TCR: EPD1, SH_IS, WBWA, T0SZ32 */
++	sy_wr(cbp, 0x24, (uint32_t)(ttbr >> 32));	/* TTBR0 hi */
++	sy_wr(cbp, 0x20, (uint32_t)ttbr);		/* TTBR0 lo */
++	sy_wr(cbp, 0x2c, (uint32_t)(asid << 16));	/* TTBR1 hi = asid<<48 */
++	sy_wr(cbp, 0x28, 0);				/* TTBR1 lo */
++	sy_wr(cbp, 0x38, 0xffu);			/* MAIR0 */
++	sy_wr(cbp, 0x3c, 0);				/* MAIR1 */
++	sy_wr(cbp, 0x34, 0);				/* CB+0x34 */
++	for (i = 0; i < (0x2000u >> 12); i++)
++		flush_dcache64(sy_pa(sy_l1 + (i << 12)), (unsigned)PAGE_SIZE, TRUE);
++	for (i = 0; i < (0x10000u >> 12); i++)
++		flush_dcache64(sy_pa(sy_l3 + (i << 12)), (unsigned)PAGE_SIZE, TRUE);
 +	__asm__ volatile("dsb sy" ::: "memory");
-+	printf("PANDORA WLAN: SMMU bypass readback: smr %#x s2cr %#x\n",
-+	    sy_rd(sy_smmu_va, 0x800 + 4 * sy_smmu_slot),
-+	    sy_rd(sy_smmu_va, 0xc00 + 4 * sy_smmu_slot));
++	sy_wr(cbp, 0x610, (uint32_t)asid);		/* TLBIALL (CB local) */
++	sy_wr(cbp, 0x7f0, 0xffffffffu);			/* TLBSYNC */
++	for (i = 0; i < 100; i++) {
++		if (sy_rd(cbp, 0x7f4) & 1u)
++			break;
++		sy_usleep(1000);
++	}
++	printf("PANDORA WLAN: SMMU: sync %#x\n", sy_rd(cbp, 0x7f4));
++	sy_wr(cbp, 0x00, 0x27u);			/* SCTLR: enable */
++	sy_wr(gr0, 0xc00 + 4 * slot, cb);		/* S2CR: translate */
++	sy_wr(gr0, 0x800 + 4 * slot, 0x1401u);		/* SMR raw */
++	sy_wr(gr0, 0x800 + 4 * slot, 0x80001401u);	/* SMR valid */
++	__asm__ volatile("dsb sy" ::: "memory");
++	v = sy_rd(cbp, 0x58);
++	if ((v & 0xc00001feu) || (v & 0x600u) != 0x400u) {
++		printf("PANDORA WLAN: SMMU: FSR not idle after install (%#x)\n", v);
++		return 9;
++	}
++	printf("PANDORA WLAN: SMMU installed: slot %u cb %u asid %#llx sctlr %#x tcr %#x "
++	    "tcr2 %#x smr %#x s2cr %#x fsr %#x\n", slot, cb, (unsigned long long)asid,
++	    sy_rd(cbp, 0x00), sy_rd(cbp, 0x30), sy_rd(cbp, 0x10),
++	    sy_rd(gr0, 0x800 + 4 * slot), sy_rd(gr0, 0xc00 + 4 * slot), v);
 +	return 0;
 +}
 +
@@ -1992,31 +2081,12 @@
 +		printf("PANDORA WLAN: BHI: firmware not usable (size %#llx)\n", (unsigned long long)fs);
 +		return;
 +	}
-+	if (!sy_sbl_va) {
-+		kern_return_t kr = kmem_alloc_contig(kernel_map, &sy_sbl_va, SY_SBL_SIZE,
-+		    PAGE_MASK, 0x3ffff, 0, KMA_DATA | KMA_ZERO | KMA_PERMANENT,
-+		    VM_KERN_MEMORY_IOKIT);
-+
-+		if (kr != KERN_SUCCESS || !sy_sbl_va) {
-+			printf("PANDORA WLAN: BHI: SBL contig alloc failed %d\n", kr);
-+			return;
-+		}
-+		sy_sbl_pa = sy_pa(sy_sbl_va);
-+		if (sy_sbl_pa + SY_SBL_SIZE > (1ull << 32)) {
-+			printf("PANDORA WLAN: BHI: SBL buffer above 4 GiB (%#llx)\n",
-+			    (unsigned long long)sy_sbl_pa);
-+			return;
-+		}
-+		printf("PANDORA WLAN: BHI: SBL buffer va %#lx pa %#llx size %#lx\n",
-+		    (unsigned long)sy_sbl_va, (unsigned long long)sy_sbl_pa,
-+		    (unsigned long)SY_SBL_SIZE);
-+	}
-+	if (pandora_fw_read(fo, (void *)sy_sbl_va, SY_SBL_SIZE)) {
++	if (pandora_fw_read(fo, (void *)sy_dma_va, SY_SBL_SIZE)) {
 +		printf("PANDORA WLAN: BHI: SBL read failed\n");
 +		return;
 +	}
 +	for (off = 0; off < SY_SBL_SIZE; off += PAGE_SIZE)
-+		flush_dcache64(sy_pa(sy_sbl_va + off), (unsigned)PAGE_SIZE, TRUE);
++		flush_dcache64(sy_pa(sy_dma_va + off), (unsigned)PAGE_SIZE, TRUE);
 +	__asm__ volatile("dsb sy" ::: "memory");
 +	cmd = sy_rd(conf, SY_EP_CONF + 0x04) & 0xffff;
 +	sy_wr(conf, SY_EP_CONF + 0x04, cmd | 0x404);
@@ -2025,8 +2095,8 @@
 +	    (unsigned long)SY_SBL_SIZE, SY_IOVA_BASE);
 +	sy_wr(sy_bar_va, bhio + 0x20, 0);          /* INTVEC */
 +	sy_wr(sy_bar_va, bhio + 0x2c, 0);          /* STATUS clear */
-+	sy_wr(sy_bar_va, bhio + 0x08, (uint32_t)sy_sbl_pa);   /* IMGADDR lo (bypass) */
-+	sy_wr(sy_bar_va, bhio + 0x0c, (uint32_t)(sy_sbl_pa >> 32)); /* IMGADDR hi */
++	sy_wr(sy_bar_va, bhio + 0x08, SY_IOVA_BASE);   /* IMGADDR lo (bypass) */
++	sy_wr(sy_bar_va, bhio + 0x0c, 0); /* IMGADDR hi */
 +	sy_wr(sy_bar_va, bhio + 0x10, SY_SBL_SIZE);           /* IMGSIZE */
 +	__asm__ volatile("dsb sy" ::: "memory");
 +	hi = sy_rd(sy_bar_va, bhio + 0x0c); lo = sy_rd(sy_bar_va, bhio + 0x08);
@@ -2034,7 +2104,7 @@
 +	st = sy_rd(sy_bar_va, bhio + 0x2c);   ee = sy_rd(sy_bar_va, bhio + 0x28);
 +	printf("PANDORA WLAN: BHI preflight: %#x:%08x size %#x ivec %#x status %#x ee %#x\n",
 +	    hi, lo, size, ivec, st, ee);
-+	if (hi != (uint32_t)(sy_sbl_pa >> 32) || lo != (uint32_t)sy_sbl_pa ||
++	if (hi != 0 || lo != SY_IOVA_BASE ||
 +	    size != SY_SBL_SIZE || ivec || st || ee) {
 +		printf("PANDORA WLAN: BHI: preflight mismatch, doorbell not rung\n");
 +		return;
