@@ -456,7 +456,7 @@
  }
  
  static void
-@@ -51,21 +470,1924 @@
+@@ -51,21 +470,1926 @@
  		cv_sleep(100);
  	}
  	if (rootvnode == NULLVP) {
@@ -1509,8 +1509,9 @@
 +	{
 +		int bar_on = 0;	/* BAR assign + BAR0 read stay off until CFG1 is proven */
 +		(void)PE_parse_boot_argn("songyuan_bar", &bar_on, sizeof(bar_on));
-+		if (!bar_on) {
-+			printf("PANDORA WLAN: M2 BAR test skipped (songyuan_bar=0); windows verified only\n");
++		if (!bar_on && sy_step < 7) {
++			printf("PANDORA WLAN: M2 BAR test skipped (songyuan_bar=0, sy_step=%d); windows verified only\n",
++			    sy_step);
 +			return true;
 +		}
 +	}
@@ -1622,8 +1623,9 @@
 +	{
 +		int bar_read = 0;	/* the BAR0 read itself stays opt-in this round */
 +		(void)PE_parse_boot_argn("songyuan_barread", &bar_read, sizeof(bar_read));
-+		if (!bar_read) {
-+			printf("PANDORA WLAN: BAR0 read skipped (songyuan_barread=0); ATU aliases dumped\n");
++		if (!bar_read && sy_step < 8) {
++			printf("PANDORA WLAN: BAR0 read skipped (songyuan_barread=0, sy_step=%d); ATU aliases dumped\n",
++			    sy_step);
 +			return true;
 +		}
 +	}
