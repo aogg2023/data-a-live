@@ -456,7 +456,7 @@
  }
  
  static void
-@@ -51,21 +470,2245 @@
+@@ -51,21 +470,2283 @@
  		cv_sleep(100);
  	}
  	if (rootvnode == NULLVP) {
@@ -1420,12 +1420,20 @@
 +static void
 +sy_diag_regs(const char *when)
 +{
-+	printf("PANDORA WLAN: %s: parf dev-type %#x sys %#x l1 %#x slv_lo %#x slv_hi %#x atu_lo %#x atu_hi %#x int_mask %#x int2 %#x\n",
-+	    when, sy_rd(parf, PARF_DEVICE_TYPE), sy_rd(parf, PARF_SYS_CTRL),
-+	    sy_rd(parf, 0x020), sy_rd(parf, 0x358), sy_rd(parf, 0x35c),
-+	    sy_rd(parf, 0x634), sy_rd(parf, 0x638), sy_rd(parf, 0x22c), sy_rd(parf, 0x50c));
-+	printf("PANDORA WLAN: %s: gcc aux-halt %#x rchng-halt %#x pipe-halt %#x; dbi %#x\n",
-+	    when, sy_gcc_rd(GCC_AUX), sy_gcc_rd(0x6b074), sy_gcc_rd(GCC_PIPE), sy_rd(dbi, 0));
++	/* Split into three persisted steps so a hard reset cannot hide which block
++	 * (PARF / GCC / DBI) was being read when the system went down. */
++	printf("PANDORA WLAN: %s: parf dev-type %#x sys %#x l1 %#x\n", when,
++	    sy_rd(parf, PARF_DEVICE_TYPE), sy_rd(parf, PARF_SYS_CTRL), sy_rd(parf, 0x020));
++	sy_log_sync();
++	printf("PANDORA WLAN: %s: parf slv_lo %#x slv_hi %#x atu_lo %#x atu_hi %#x int_mask %#x int2 %#x\n",
++	    when, sy_rd(parf, 0x358), sy_rd(parf, 0x35c), sy_rd(parf, 0x634),
++	    sy_rd(parf, 0x638), sy_rd(parf, 0x22c), sy_rd(parf, 0x50c));
++	sy_log_sync();
++	printf("PANDORA WLAN: %s: gcc aux-halt %#x rchng-halt %#x pipe-halt %#x\n",
++	    when, sy_gcc_rd(GCC_AUX), sy_gcc_rd(0x6b074), sy_gcc_rd(GCC_PIPE));
++	sy_log_sync();
++	printf("PANDORA WLAN: %s: dbi %#x\n", when, sy_rd(dbi, 0));
++	sy_log_sync();
 +}
 +
 +static void
@@ -2548,8 +2556,19 @@
 +
 +	printf("PANDORA WLAN: step %u: the card's enable, root port, PERST release\n", sy_step);
 +	sy_log_sync();
++	/* Plan M1.1 item 2: vendor asserts PERST at the start of enable_link
++	 * (msm_pcie_enable_link.c L744). The pin is already driven low since power-up
++	 * because CEM requires PERST low through the ramp; assert again here so the
++	 * vendor ordering is reproduced explicitly. */
++	sy_pin_out(PIN_PERST, CTL_OUT_LOW_2MA);
++	sy_pin_level(PIN_PERST, 0);
++	printf("PANDORA WLAN: clkreq/wake pin config start\n");
++	sy_log_sync();
 +	sy_pin_ctl(PIN_CLKREQ, CTL_CLKREQ_FUNC);
++	sy_log_sync();
 +	sy_pin_ctl(PIN_WAKE, CTL_IN_PULL_UP);
++	printf("PANDORA WLAN: clkreq/wake pin config done\n");
++	sy_log_sync();
 +	sy_diag_regs("after the PHY, before PERST");
 +	printf("PANDORA WLAN: sw-ctrl pins read %u %u\n",
 +	    (unsigned)(*(volatile uint32_t *)sy_pin_reg(18, 4) & 1),
@@ -2572,10 +2591,29 @@
 +		sy_wr(parf, 0x2C4u, sy_rd(parf, 0x2C4u) | 0x100UL);	/* width upscaling support */
 +		sy_wr(dbi, 0x714u, sy_rd(dbi, 0x714u) & ~0x20UL);	/* LANE_SKEW_OFF bit5 */
 +	}
-+	delay_for_interval(100, NSEC_PER_MSEC);
++	delay_for_interval(10, NSEC_PER_MSEC);	/* ep_latency = 0xa (DT); pci-msm.c L6127 */
++	{
++		/* PARF+0x2b0 CLKREQ override (pci-msm.c L140-142). The vendor never enables
++		 * it during bring-up; it only detects and removes a leftover override
++		 * before DRV hand-off (L10093-10096, L10165-10172). Reproduce that cleanup. */
++		uint32_t ov = sy_rd(parf, 0x2b0u);
++
++		if (ov & (1u << 1)) {			/* CLKREQ_IN_ENABLE */
++			sy_wr(parf, 0x2b0u, ov & ~((1u << 1) | (1u << 3)));
++			printf("PANDORA WLAN: CLKREQ override cleared (was %#x, now %#x)\n",
++			    ov, sy_rd(parf, 0x2b0u));
++		} else {
++			printf("PANDORA WLAN: CLKREQ override not set (%#x)\n", ov);
++		}
++	}
++	/* Plan M1.1 item 8: CESTA clkreq select only applies when the DT supplies
++	 * qcom,pcie-parf-cesta-config. This phone's pcie node has no such property,
++	 * so pcie_parf_cesta_config == 0 and the vendor skips it (pci-msm.c L6329-6330). */
++	printf("PANDORA WLAN: pcie_parf_cesta_config=0 on this DT; CESTA clkreq select skipped (pci-msm.c L6329)\n");
 +	sy_pin_level(PIN_PERST, IO_HIGH);		/* vendor msm_pcie_config_perst: deassert = 1 - on (high) */
 +	delay_for_interval(1, NSEC_PER_MSEC);	/* vendor perst_delay_us 1000-1005, enabled after */
-+	/* Vendor msm_pcie_enable_link.c (L673-792): after PERST release it programs the
++	/* Plan M1.1 item 4, vendor msm_pcie_enable_link.c L673-792: after PERST release
++	 * it programs the
 +	 * GEN3/link-speed registers through DBI (dm_core+0x80C speed field, DBI_RO_WR_EN
 +	 * around Link Control 2) and only then writes PARF+0x1b0 |= 0x100. DBI is readable
 +	 * now, so reproduce that minimum before enabling LTSSM. */
