@@ -456,7 +456,7 @@
  }
  
  static void
-@@ -51,21 +470,2500 @@
+@@ -51,21 +470,2501 @@
  		cv_sleep(100);
  	}
  	if (rootvnode == NULLVP) {
@@ -730,6 +730,7 @@
 +static void sy_mhi_ready(void);
 +static void sy_mhi_init(void);
 +static void sy_smmu_dump(void);
++static int sy_iatu_inbound_window(void);
 +static void sy_smmu_bank_scan(void);
 +static void sy_bhi_sbl(void);
 +static void sy_buf_alloc(void);
