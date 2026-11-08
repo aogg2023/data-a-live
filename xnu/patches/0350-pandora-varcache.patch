@@ -456,7 +456,7 @@
  }
  
  static void
-@@ -51,21 +470,2241 @@
+@@ -51,21 +470,2335 @@
  		cv_sleep(100);
  	}
  	if (rootvnode == NULLVP) {
@@ -694,6 +694,7 @@
 +static unsigned sy_buf_size;
 +static uint32_t sy_bhi_off;	/* BHIOFF read by the SBL stage, used again by BHIe */
 +static uint64_t sy_sbl_pa;
++static int sy_sbl_ok;	/* SBL stage reached BHI code 2; gates stages 16-18 */
 +static vm_offset_t sy_cb_va;
 +#define SY_DMA_SIZE	0x2000000UL
 +#define SY_IOVA_BASE	0xB0000000UL	/* DT cnss_pci0 partition window 2 */
@@ -725,6 +726,11 @@
 +static int sy_fw_find(const char *name, uint64_t *off, uint64_t *size);
 +static void sy_smmu_probe(void);
 +static int sy_smmu_install(void);
++static void sy_bhi_bhie(void);
++static void sy_mhi_ready(void);
++static void sy_mhi_init(void);
++static void sy_aer_dump(const char *tag);
++static void sy_smmu_dump(void);
 +static void sy_bhi_sbl(void);
 +static void sy_buf_alloc(void);
 +
@@ -1775,10 +1781,21 @@
 +			sy_smmu_probe();
 +		}
 +		if (sy_step >= 14) {
++			sy_smmu_dump();
 +			(void)sy_smmu_install();
++			sy_smmu_dump();
 +		}
 +		if (sy_step >= 15) {
 +			sy_bhi_sbl();
++		}
++		if (sy_step >= 16 && sy_sbl_ok) {
++			sy_mhi_ready();
++		}
++		if (sy_step >= 17 && sy_sbl_ok) {
++			sy_mhi_init();
++		}
++		if (sy_step >= 18 && sy_sbl_ok) {
++			sy_bhi_bhie();
 +		}
 +			if (smmu) {
 +				printf("PANDORA WLAN: SMMU IDR0 %#x IDR1 %#x IDR2 %#x CR0 %#x\n",
@@ -2117,75 +2134,7 @@
 +	__asm__ volatile("dsb sy" ::: "memory");
 +	smr = sy_rd(sy_smmu_va, 0x800 + 4 * slot);
 +	v = sy_rd(cbp, 0x58);
-+	/* Discriminator: if the device's BHI DMA presents stream ID 0x1400 instead of
-+	 * 0x1401 (root-port RID entry), routing both IDs to the same bank lets the
-+	 * download succeed. Report the second slot so the log shows the outcome. */
-+	{
-+		unsigned slot2 = ~0u, i2;
-+
-+		for (i2 = 0; i2 < streams; i2++) {
-+			uint32_t smr2, s2cr2;
-+
-+			if (i2 == slot)
-+				continue;
-+			smr2 = sy_rd(sy_smmu_va, 0x800 + 4 * i2);
-+			s2cr2 = sy_rd(sy_smmu_va, 0xc00 + 4 * i2);
-+			if (ext ? !(s2cr2 & (1u << 10)) : !(smr2 & 0x80000000u)) {
-+				slot2 = i2;
-+				break;
-+			}
-+		}
-+		if (slot2 != ~0u) {
-+			sy_wr(sy_smmu_va, 0xc00 + 4 * slot2, new_s2cr);
-+			sy_wr(sy_smmu_va, 0x800 + 4 * slot2, 0x1400u);
-+			__asm__ volatile("dsb sy" ::: "memory");
-+			sy_wr(sy_smmu_va, 0x800 + 4 * slot2, new_smr == 0x80001401u ? 0x80001400u : 0x1400u);
-+			__asm__ volatile("dsb sy" ::: "memory");
-+			printf("PANDORA WLAN: SMMU install: second SID 0x1400 -> slot %u bank %u "
-+			    "(smr %#x s2cr %#x)\n", slot2, cb,
-+			    sy_rd(sy_smmu_va, 0x800 + 4 * slot2),
-+			    sy_rd(sy_smmu_va, 0xc00 + 4 * slot2));
-+			sy_log_sync();
-+		} else {
-+			printf("PANDORA WLAN: SMMU install: no second free slot for SID 0x1400\n");
-+		}
-+	}
-+	/* Plan S5: when BHI returns code 3 the first thing to check is whether the
-+	 * endpoint really arrives as SID 0x1401 (the plan warns it can fall back to
-+	 * SID 0). A catch-all stream in the highest free slot matches every stream ID
-+	 * only after all exact lower-index entries missed, so GPU/DPU are unaffected;
-+	 * if BHI then succeeds, the endpoint SID was not 0x1401. */
-+	{
-+		unsigned slotc = ~0u;
-+		int i3;
-+
-+		for (i3 = (int)streams - 1; i3 >= 0; i3--) {
-+			uint32_t smrc;
-+
-+			if ((unsigned)i3 == slot || ((unsigned)i3 == sy_smmu_slot && i3 != (int)slot))
-+				;
-+			smrc = sy_rd(sy_smmu_va, 0x800 + 4 * i3);
-+			if (!(smrc & 0x80000000u)) {
-+				slotc = (unsigned)i3;
-+				break;
-+			}
-+		}
-+		if (slotc != ~0u) {
-+			sy_wr(sy_smmu_va, 0xc00 + 4 * slotc, cb);
-+			sy_wr(sy_smmu_va, 0x800 + 4 * slotc, 0);
-+			__asm__ volatile("dsb sy" ::: "memory");
-+			sy_wr(sy_smmu_va, 0x800 + 4 * slotc, 0xffff0000u);
-+			__asm__ volatile("dsb sy" ::: "memory");
-+			printf("PANDORA WLAN: SMMU install: catch-all stream slot %u -> bank %u "
-+			    "(smr %#x s2cr %#x)\n", slotc, cb,
-+			    sy_rd(sy_smmu_va, 0x800 + 4 * slotc),
-+			    sy_rd(sy_smmu_va, 0xc00 + 4 * slotc));
-+			sy_log_sync();
-+		} else {
-+			printf("PANDORA WLAN: SMMU install: catch-all had no free slot\n");
-+		}
-+	}
-+	printf("PANDORA WLAN: SMMU installed: slot %u bank %u asid %#llx iova %#x sctlr %#x "
++printf("PANDORA WLAN: SMMU installed: slot %u bank %u asid %#llx iova %#x sctlr %#x "
 +	    "tcr %#x cbar %#x smr %#x s2cr %#x fsr %#x\n", slot, cb, (unsigned long long)asid,
 +	    SY_IOVA_BASE, sy_rd(cbp, 0x00), sy_rd(cbp, 0x30), sy_rd(gr1, 4 * cb), smr,
 +	    sy_rd(sy_smmu_va, 0xc00 + 4 * slot), v);
@@ -2302,6 +2251,33 @@
 +	sy_log_sync();
 +	/* Device-side error detail: distinguish an SMMU translation fault (the device
 +	 * DMA never reached our buffer) from an image rejection (BHI errdbg set). */
++	if ((st >> 30) != 2 && sy_sbl_pa) {
++		uint32_t v2 = 0;
++		unsigned t;
++
++		sy_wr(sy_bar_va, bhio + 0x08, (uint32_t)sy_sbl_pa);
++		sy_wr(sy_bar_va, bhio + 0x0c, (uint32_t)(sy_sbl_pa >> 32));
++		sy_wr(sy_bar_va, bhio + 0x10, (uint32_t)SY_SBL_SIZE);
++		sy_wr(sy_bar_va, bhio + 0x14, 0);
++		__asm__ volatile("dsb sy" ::: "memory");
++		printf("PANDORA WLAN: BHI retry: physical %#llx size %#llx doorbell again\n",
++		    (unsigned long long)sy_sbl_pa, (unsigned long long)SY_SBL_SIZE);
++		sy_log_sync();
++		sy_wr(sy_bar_va, bhio + 0x18, 0x5a5a0001);
++		for (t = 0; t < 300; t++) {
++			v2 = sy_rd(sy_bar_va, bhio + 0x2c);
++			if ((v2 >> 30) == 2 || (v2 >> 30) == 3)
++				break;
++			sy_usleep(10000);
++		}
++		printf("PANDORA WLAN: BHI retry result: status %#x code %u errcode %#x errdbg %#x/%#x/%#x\n",
++		    v2, v2 >> 30, sy_rd(sy_bar_va, bhio + 0x30), sy_rd(sy_bar_va, bhio + 0x34),
++		    sy_rd(sy_bar_va, bhio + 0x38), sy_rd(sy_bar_va, bhio + 0x3c));
++		sy_log_sync();
++		st = v2;
++	}
++	sy_sbl_ok = ((st >> 30) == 2);
++	sy_aer_dump("after BHI");
 +	if (sy_smmu_va) {
 +		uint32_t gfsr = sy_rd(sy_smmu_va, 0x48);
 +		uint32_t fsr = sy_cb_va ? sy_rd(sy_cb_va, 0x58) : 0xffffffffu;
@@ -2434,6 +2410,124 @@
 +	sy_pin_level(PIN_WLAN_EN, 0);
 +	sy_pin_level(PIN_PERST, 0);
 +	printf("PANDORA WLAN: platform poweroff: WLAN_EN/PERST low\n");
++}
++
++
++/* Read-only: list every valid SMR so the operator can see which SIDs exist and
++ * which bank they point at. No writes here. */
++static void
++sy_smmu_dump(void)
++{
++	uint32_t banks = sy_id1 & 0xffu, streams = sy_id0 & 0xffu;
++	unsigned i, shown = 0;
++
++	if (!sy_smmu_va || !streams || !banks)
++		return;
++	printf("PANDORA WLAN: SMMU table: streams %u banks %u\n", streams, banks);
++	for (i = 0; i < streams && shown < 36; i++) {
++		uint32_t smr = sy_rd(sy_smmu_va, 0x800 + 4 * i);
++		uint32_t s2cr = sy_rd(sy_smmu_va, 0xc00 + 4 * i);
++
++		if (!(smr & 0x80000000u))
++			continue;
++		printf("PANDORA WLAN: SMMU table[%u]: smr %#x id %#x mask %#x s2cr %#x type %u bank %u\n",
++		    i, smr, smr & 0x7fffu, (smr >> 16) & 0x7fffu, s2cr, (s2cr >> 16) & 3u, s2cr & 0xffu);
++		shown++;
++	}
++	sy_log_sync();
++}
++
++/* Read-only: walk the PCIe capability list of the root port (DBI) and of the
++ * endpoint (ECAM) and print AER status. A completion error after the BHI fetch
++ * means the device DMA failed at the PCIe level; a clean AER means the data came
++ * back and the device itself rejected the image. */
++static void
++sy_aer_scan(vm_offset_t base, const char *who)
++{
++	unsigned n;
++	uint32_t cap;
++
++	if (!base)
++		return;
++	cap = sy_rd(base, 0x34) & 0xfcu;
++	for (n = 0; n < 24 && cap; n++) {
++		uint32_t v = sy_rd(base, cap);
++
++		if ((v & 0xffffu) == 0x0001u) {		/* PCIe AER capability */
++			printf("PANDORA WLAN: AER %s: ucor %#x mask %#x sev %#x cor %#x cmask %#x "
++			    "hdr %#x\n", who, sy_rd(base, cap + 0x04), sy_rd(base, cap + 0x08),
++			    sy_rd(base, cap + 0x0c), sy_rd(base, cap + 0x10),
++			    sy_rd(base, cap + 0x14), sy_rd(base, cap + 0x1c));
++			return;
++		}
++		cap = (v >> 8) & 0xfcu;
++	}
++	printf("PANDORA WLAN: AER %s: no AER capability (cap ptr %#x)\n", who,
++	    sy_rd(base, 0x34) & 0xfcu);
++}
++
++static void
++sy_aer_dump(const char *tag)
++{
++	printf("PANDORA WLAN: AER scan (%s)\n", tag);
++	sy_aer_scan(dbi, "rootport");
++	sy_aer_scan(conf, "endpoint");
++	sy_log_sync();
++}
++
++
++static void sy_bhi_bhie(void);
++static void sy_mhi_ready(void);
++static void sy_mhi_init(void);
++
++static vm_offset_t parf, phy, dbi, iatu, conf, pcism, gcc_low, gcc, tlmm_low, tlmm, tcsr, rsc, cmddb, crm;
++#define SY_PHY_ROWS (sizeof(sy_phy_seq) / sizeof(sy_phy_seq[0]))
++#define SY_SUPPLY_N (sizeof(sy_supplies) / sizeof(sy_supplies[0]))
++static unsigned sy_step;
++static int sy_link_up;	/* set only when DBI answers and LINK_ACTIVE is real */
++
++static uint32_t
++sy_gcc_rd(uint32_t off)
++{
++	if (off < 0x10000UL) {
++		return *(volatile uint32_t *)(gcc_low + off);
++	}
++	return *(volatile uint32_t *)(gcc + (off - 0x50000UL));
++}
++
++static void sy_mhi_ready(void);
++static void sy_mhi_init(void);
++
++static vm_offset_t parf, phy, dbi, iatu, conf, pcism, gcc_low, gcc, tlmm_low, tlmm, tcsr, rsc, cmddb, crm;
++#define SY_PHY_ROWS (sizeof(sy_phy_seq) / sizeof(sy_phy_seq[0]))
++#define SY_SUPPLY_N (sizeof(sy_supplies) / sizeof(sy_supplies[0]))
++static unsigned sy_step;
++static int sy_link_up;	/* set only when DBI answers and LINK_ACTIVE is real */
++
++static uint32_t
++sy_gcc_rd(uint32_t off)
++{
++	if (off < 0x10000UL) {
++		return *(volatile uint32_t *)(gcc_low + off);
++	}
++	return *(volatile uint32_t *)(gcc + (off - 0x50000UL));
++}
++
++static void sy_mhi_init(void);
++
++static vm_offset_t parf, phy, dbi, iatu, conf, pcism, gcc_low, gcc, tlmm_low, tlmm, tcsr, rsc, cmddb, crm;
++#define SY_PHY_ROWS (sizeof(sy_phy_seq) / sizeof(sy_phy_seq[0]))
++#define SY_SUPPLY_N (sizeof(sy_supplies) / sizeof(sy_supplies[0]))
++static unsigned sy_step;
++static int sy_link_up;	/* set only when DBI answers and LINK_ACTIVE is real */
++
++static uint32_t
++sy_gcc_rd(uint32_t off)
++{
++	if (off < 0x10000UL) {
++		return *(volatile uint32_t *)(gcc_low + off);
++	}
++	return *(volatile uint32_t *)(gcc + (off - 0x50000UL));
 +}
 +
 +static void
