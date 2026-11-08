@@ -456,7 +456,7 @@
  }
  
  static void
-@@ -51,21 +470,2100 @@
+@@ -51,21 +470,2114 @@
  		cv_sleep(100);
  	}
  	if (rootvnode == NULLVP) {
@@ -1982,7 +1982,10 @@
 +		if (!t)
 +			continue;
 +		v = sy_rd(t, 0);
-+		if (((v >> 16) & 3) == 3 && ((v >> 8) & 0xff) < banks)
++		/* S2CR.TYPE: 0=Fault (free), 1=Bypass, 2=Stage1, 3=Stage2. Any non-zero
++		 * type means the bank is owned by another stream; reprogramming such a
++		 * bank wedges the SMMU (kernel_60: bank 0 had sctlr 0xa9f00e0). */
++		if (((v >> 16) & 3) != 0 && ((v >> 8) & 0xff) < banks)
 +			used[(v >> 8) & 0xff] = 1;
 +	}
 +	for (i = 0; i < banks; i++) {
@@ -2012,9 +2015,18 @@
 +		}
 +	}
 +	if (cb == ~0u) {
-+		printf("PANDORA WLAN: SMMU install: no free bank (slot %u)\n", slot);
++		unsigned u = 0, f = 0;
++
++		for (i = 0; i < banks; i++) {
++			if (used[i]) u++;
++			else f++;
++		}
++		printf("PANDORA WLAN: SMMU install: no free bank (slot %u, used %u, unreferenced %u)\n",
++		    slot, u, f);
 +		return 4;
 +	}
++	printf("PANDORA WLAN: SMMU install: picked bank %u (old sctlr %#x fsr %#x)\n",
++	    cb, sy_rd(cbp, 0x00), sy_rd(cbp, 0x58));
 +	/* ASID: 0xff00 down, not used by any enabled bank (QcomUsbDomainInstall) */
 +	for (a_ = 0xff00; a_ > 0x100; a_--) {
 +		unsigned k, hit = 0;
@@ -2042,6 +2054,7 @@
 +		return 6;
 +	ttbr = sy_pa(sy_l1) | (asid << 48);
 +	printf("PANDORA WLAN: SMMU install: cfg start ttbr %#llx\n", (unsigned long long)ttbr);
++	sy_log_sync();
 +	sy_wr(gr1, 0x800 + 4 * cb, 1);                        /* CBA2R: VA64 */
 +	sy_wr(gr1, 4 * cb, 0x1f300);                          /* CBAR: S1 trans/S2 bypass */
 +	sy_wr(cbp, 0x10, (tcr2 & ~0x38017u) | 0x38010u | ((sy_id2 & 15) < ((sy_id2 >> 4) & 15) ?
@@ -2057,6 +2070,7 @@
 +	__asm__ volatile("dsb sy" ::: "memory");
 +	printf("PANDORA WLAN: SMMU install: cfg written sctlr %#x tcr %#x tcr2 %#x cbar %#x\n",
 +	    sy_rd(cbp, 0x00), sy_rd(cbp, 0x30), sy_rd(cbp, 0x10), sy_rd(gr1, 4 * cb));
++	sy_log_sync();
 +	printf("PANDORA WLAN: SMMU install: tlbi start (CB local)\n");
 +	sy_wr(cbp, 0x610, (uint32_t)asid);                    /* TLBI (CB local) */
 +	sy_wr(cbp, 0x7f0, 0xffffffffu);
