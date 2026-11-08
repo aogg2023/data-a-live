@@ -456,7 +456,7 @@
  }
  
  static void
-@@ -51,21 +470,2206 @@
+@@ -51,21 +470,2241 @@
  		cv_sleep(100);
  	}
  	if (rootvnode == NULLVP) {
@@ -2148,6 +2148,41 @@
 +			sy_log_sync();
 +		} else {
 +			printf("PANDORA WLAN: SMMU install: no second free slot for SID 0x1400\n");
++		}
++	}
++	/* Plan S5: when BHI returns code 3 the first thing to check is whether the
++	 * endpoint really arrives as SID 0x1401 (the plan warns it can fall back to
++	 * SID 0). A catch-all stream in the highest free slot matches every stream ID
++	 * only after all exact lower-index entries missed, so GPU/DPU are unaffected;
++	 * if BHI then succeeds, the endpoint SID was not 0x1401. */
++	{
++		unsigned slotc = ~0u;
++		int i3;
++
++		for (i3 = (int)streams - 1; i3 >= 0; i3--) {
++			uint32_t smrc;
++
++			if ((unsigned)i3 == slot || ((unsigned)i3 == sy_smmu_slot && i3 != (int)slot))
++				;
++			smrc = sy_rd(sy_smmu_va, 0x800 + 4 * i3);
++			if (!(smrc & 0x80000000u)) {
++				slotc = (unsigned)i3;
++				break;
++			}
++		}
++		if (slotc != ~0u) {
++			sy_wr(sy_smmu_va, 0xc00 + 4 * slotc, cb);
++			sy_wr(sy_smmu_va, 0x800 + 4 * slotc, 0);
++			__asm__ volatile("dsb sy" ::: "memory");
++			sy_wr(sy_smmu_va, 0x800 + 4 * slotc, 0xffff0000u);
++			__asm__ volatile("dsb sy" ::: "memory");
++			printf("PANDORA WLAN: SMMU install: catch-all stream slot %u -> bank %u "
++			    "(smr %#x s2cr %#x)\n", slotc, cb,
++			    sy_rd(sy_smmu_va, 0x800 + 4 * slotc),
++			    sy_rd(sy_smmu_va, 0xc00 + 4 * slotc));
++			sy_log_sync();
++		} else {
++			printf("PANDORA WLAN: SMMU install: catch-all had no free slot\n");
 +		}
 +	}
 +	printf("PANDORA WLAN: SMMU installed: slot %u bank %u asid %#llx iova %#x sctlr %#x "
