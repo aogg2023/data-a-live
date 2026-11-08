@@ -456,7 +456,7 @@
  }
  
  static void
-@@ -51,21 +470,2433 @@
+@@ -51,21 +470,2500 @@
  		cv_sleep(100);
  	}
  	if (rootvnode == NULLVP) {
@@ -1784,6 +1784,7 @@
 +			sy_smmu_dump();
 +			(void)sy_smmu_install();
 +			sy_smmu_dump();
++			(void)sy_iatu_inbound_window();
 +		}
 +		if (sy_step >= 15) {
 +			sy_bhi_sbl();
@@ -2253,6 +2254,39 @@
 +	/* Device-side error detail: distinguish an SMMU translation fault (the device
 +	 * DMA never reached our buffer) from an image rejection (BHI errdbg set). */
 +	sy_sbl_ok = ((st >> 30) == 2);
++	/* Second in-boot attempt: the device locks BHI after a fatal error, so clear
++	 * STATUS first; route SID 0x1401 with S2CR BYPASS (the iATU inbound region 2
++	 * now maps the 32-bit device address onto our buffer) and ring again. */
++	{
++		uint32_t v2 = 0;
++		unsigned t2;
++
++		if (sy_smmu_va && sy_smmu_slot <= 0x7f)
++			sy_wr(sy_smmu_va, 0xc00 + 4 * sy_smmu_slot, 0x10000u);	/* S2CR: BYPASS */
++		sy_wr(sy_bar_va, bhio + 0x2c, 0);
++		sy_wr(sy_bar_va, bhio + 0x30, 0);
++		sy_wr(sy_bar_va, bhio + 0x08, SY_IOVA_BASE);
++		sy_wr(sy_bar_va, bhio + 0x0c, 0);
++		sy_wr(sy_bar_va, bhio + 0x10, SY_SBL_SIZE);
++		__asm__ volatile("dsb sy" ::: "memory");
++		printf("PANDORA WLAN: BHI try2 (iATU inbound + SID bypass): status %#x s2cr %#x\n",
++		    sy_rd(sy_bar_va, bhio + 0x2c),
++		    sy_smmu_va ? sy_rd(sy_smmu_va, 0xc00 + 4 * sy_smmu_slot) : 0xffffffffu);
++		sy_log_sync();
++		sy_wr(sy_bar_va, bhio + 0x18, 0x0badc0de);
++		for (t2 = 0; t2 < 300; t2++) {
++			v2 = sy_rd(sy_bar_va, bhio + 0x2c);
++			if ((v2 >> 30) == 2 || (v2 >> 30) == 3)
++				break;
++			sy_usleep(10000);
++		}
++		printf("PANDORA WLAN: BHI try2 result: status %#x code %u errcode %#x errdbg %#x/%#x/%#x\n",
++		    v2, v2 >> 30, sy_rd(sy_bar_va, bhio + 0x30), sy_rd(sy_bar_va, bhio + 0x34),
++		    sy_rd(sy_bar_va, bhio + 0x38), sy_rd(sy_bar_va, bhio + 0x3c));
++		sy_log_sync();
++		if ((v2 >> 30) == 2)
++			st = v2;
++	}
 +	sy_smmu_bank_scan();
 +	if (sy_smmu_va) {
 +		uint32_t gfsr = sy_rd(sy_smmu_va, 0x48);
@@ -2626,6 +2660,39 @@
 +	    sy_rd(sy_bar_va, 0x10), sy_rd(sy_bar_va, 0x58), sy_rd(sy_bar_va, 0x60),
 +	    sy_rd(sy_bar_va, 0x68), sy_rd(sy_bar_va, 0x20), sy_rd(sy_bar_va, 0x28));
 +	printf("PANDORA WLAN: MHI init done (M0 deferred to after BHIe)\n");
++}
++
++
++/* The BHI/PBL fetch does not reach apps-smmu (kernel_68: 81 banks, no fault), so
++ * the device takes the 32-bit address as a PCIe/home address. Give it a real
++ * translation: iATU inbound region 2 maps device address SY_IOVA_BASE .. +8 MiB
++ * onto the physical SBL buffer. Region 0 (config) and 1 (BAR0) stay untouched. */
++static int
++sy_iatu_inbound_window(void)
++{
++	uint32_t c1, c2;
++
++	if (!iatu || !sy_sbl_pa || sy_buf_size < 0x1000)
++		return -1;
++	sy_wr(iatu, IATU_CTRL2(2), 0);
++	c1 = sy_rd(iatu, IATU_CTRL1(2));
++	c2 = sy_rd(iatu, IATU_CTRL2(2));
++	sy_wr(iatu, IATU_CTRL1(2), IATU_TYPE_MEM);
++	sy_wr(iatu, IATU_LBAR(2), (uint32_t)SY_IOVA_BASE);
++	sy_wr(iatu, IATU_UBAR(2), (uint32_t)((uint64_t)SY_IOVA_BASE >> 32));
++	sy_wr(iatu, IATU_LAR(2), (uint32_t)(SY_IOVA_BASE + sy_buf_size - 1));
++	sy_wr(iatu, IATU_LTAR(2), (uint32_t)sy_sbl_pa);
++	sy_wr(iatu, IATU_LTAR_HI(2), (uint32_t)(sy_sbl_pa >> 32));
++	sy_wr(iatu, IATU_CTRL2(2), IATU_ENABLE);
++	__asm__ volatile("dsb sy" ::: "memory");
++	printf("PANDORA WLAN: iATU2 inbound: old ctrl1 %#x ctrl2 %#x -> dev %#x+%#x => pa %#llx; "
++	    "readback ctrl1 %#x ctrl2 %#x lbar %#x ubar %#x lar %#x ltar %#x/%#x\n",
++	    c1, c2, SY_IOVA_BASE, sy_buf_size, (unsigned long long)sy_sbl_pa,
++	    sy_rd(iatu, IATU_CTRL1(2)), sy_rd(iatu, IATU_CTRL2(2)), sy_rd(iatu, IATU_LBAR(2)),
++	    sy_rd(iatu, IATU_UBAR(2)), sy_rd(iatu, IATU_LAR(2)), sy_rd(iatu, IATU_LTAR(2)),
++	    sy_rd(iatu, IATU_LTAR_HI(2)));
++	sy_log_sync();
++	return 0;
 +}
 +
 +static void
