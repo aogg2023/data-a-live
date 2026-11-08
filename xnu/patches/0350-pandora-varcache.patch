@@ -456,7 +456,7 @@
  }
  
  static void
-@@ -51,21 +470,2162 @@
+@@ -51,21 +470,2206 @@
  		cv_sleep(100);
  	}
  	if (rootvnode == NULLVP) {
@@ -2117,6 +2117,39 @@
 +	__asm__ volatile("dsb sy" ::: "memory");
 +	smr = sy_rd(sy_smmu_va, 0x800 + 4 * slot);
 +	v = sy_rd(cbp, 0x58);
++	/* Discriminator: if the device's BHI DMA presents stream ID 0x1400 instead of
++	 * 0x1401 (root-port RID entry), routing both IDs to the same bank lets the
++	 * download succeed. Report the second slot so the log shows the outcome. */
++	{
++		unsigned slot2 = ~0u, i2;
++
++		for (i2 = 0; i2 < streams; i2++) {
++			uint32_t smr2, s2cr2;
++
++			if (i2 == slot)
++				continue;
++			smr2 = sy_rd(sy_smmu_va, 0x800 + 4 * i2);
++			s2cr2 = sy_rd(sy_smmu_va, 0xc00 + 4 * i2);
++			if (ext ? !(s2cr2 & (1u << 10)) : !(smr2 & 0x80000000u)) {
++				slot2 = i2;
++				break;
++			}
++		}
++		if (slot2 != ~0u) {
++			sy_wr(sy_smmu_va, 0xc00 + 4 * slot2, new_s2cr);
++			sy_wr(sy_smmu_va, 0x800 + 4 * slot2, 0x1400u);
++			__asm__ volatile("dsb sy" ::: "memory");
++			sy_wr(sy_smmu_va, 0x800 + 4 * slot2, new_smr == 0x80001401u ? 0x80001400u : 0x1400u);
++			__asm__ volatile("dsb sy" ::: "memory");
++			printf("PANDORA WLAN: SMMU install: second SID 0x1400 -> slot %u bank %u "
++			    "(smr %#x s2cr %#x)\n", slot2, cb,
++			    sy_rd(sy_smmu_va, 0x800 + 4 * slot2),
++			    sy_rd(sy_smmu_va, 0xc00 + 4 * slot2));
++			sy_log_sync();
++		} else {
++			printf("PANDORA WLAN: SMMU install: no second free slot for SID 0x1400\n");
++		}
++	}
 +	printf("PANDORA WLAN: SMMU installed: slot %u bank %u asid %#llx iova %#x sctlr %#x "
 +	    "tcr %#x cbar %#x smr %#x s2cr %#x fsr %#x\n", slot, cb, (unsigned long long)asid,
 +	    SY_IOVA_BASE, sy_rd(cbp, 0x00), sy_rd(cbp, 0x30), sy_rd(gr1, 4 * cb), smr,
@@ -2207,6 +2240,17 @@
 +	    size != SY_SBL_SIZE || ivec || st || ee) {
 +		printf("PANDORA WLAN: BHI: preflight mismatch, doorbell not rung\n");
 +		return;
++	}
++	{
++		volatile uint32_t *w = (volatile uint32_t *)sy_sbl_va;
++		uint32_t fsum = 0;
++		unsigned fi;
++
++		for (fi = 0; fi < 256; fi++)
++			fsum += w[fi];
++		printf("PANDORA WLAN: BHI: SBL head %08x %08x %08x %08x %08x %08x %08x %08x sum1k %08x\n",
++		    w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7], fsum);
++		sy_log_sync();
 +	}
 +	sy_wr(sy_bar_va, bhio + 0x18, 0x1234567);
 +	printf("PANDORA WLAN: BHI: doorbell rung seq 0x1234567, polling\n");
