@@ -456,7 +456,7 @@
  }
  
  static void
-@@ -51,21 +470,2027 @@
+@@ -51,21 +470,2028 @@
  		cv_sleep(100);
  	}
  	if (rootvnode == NULLVP) {
@@ -692,6 +692,7 @@
 +static vm_offset_t sy_l1, sy_l2, sy_l3;
 +static vm_offset_t sy_sbl_va;
 +static unsigned sy_buf_size;
++static uint32_t sy_bhi_off;	/* BHIOFF read by the SBL stage, used again by BHIe */
 +static uint64_t sy_sbl_pa;
 +static vm_offset_t sy_cb_va;
 +#define SY_DMA_SIZE	0x2000000UL
