@@ -456,7 +456,7 @@
  }
  
  static void
-@@ -51,21 +470,2283 @@
+@@ -51,21 +470,2027 @@
  		cv_sleep(100);
  	}
  	if (rootvnode == NULLVP) {
@@ -692,25 +692,20 @@
 +static vm_offset_t sy_l1, sy_l2, sy_l3;
 +static vm_offset_t sy_sbl_va;
 +static unsigned sy_buf_size;
-+static uint32_t sy_bhi_off;
 +static uint64_t sy_sbl_pa;
 +static vm_offset_t sy_cb_va;
 +#define SY_DMA_SIZE	0x2000000UL
 +#define SY_IOVA_BASE	0xB0000000UL	/* DT cnss_pci0 partition window 2 */
++#define SY_IOVA_MAP	SY_IOVA_BASE	/* translating SMMU IOVA (BHI/BHIe window) */
 +#define SY_SBL_SIZE	0x80000UL
-+#define SY_FW_BUF	0x00800000UL
-+#define SY_IOVA_MAP	0xB0000000UL	/* DT cnss_pci0 partition window 2, <4 GiB */	/* full amss buffer, reused for BHIe */
++#define SY_FW_BUF	0x00800000UL	/* full amss buffer, reused for BHIe */
 +extern ppnum_t pmap_find_phys(pmap_t, addr64_t);
-+extern bool pandora_log_sync(void);
 +extern void flush_dcache64(addr64_t addr, unsigned count, int phys);
 +static int sy_fw_find(const char *name, uint64_t *off, uint64_t *size);
 +static void sy_smmu_probe(void);
 +static int sy_smmu_install(void);
 +static void sy_bhi_sbl(void);
 +static void sy_buf_alloc(void);
-+static void sy_bhi_bhie(void);
-+static void sy_mhi_ready(void);
-+static void sy_mhi_init(void);
 +
 +static vm_offset_t parf, phy, dbi, iatu, conf, pcism, gcc_low, gcc, tlmm_low, tlmm, tcsr, rsc, cmddb, crm;
 +#define SY_PHY_ROWS (sizeof(sy_phy_seq) / sizeof(sy_phy_seq[0]))
@@ -835,6 +830,19 @@
 +	return (uint16_t)(sy_rd(sy_cmddb, off & ~3u) >> (8u * (off & 3u)));
 +}
 +
++/* PAND:722-734: write, then read back until the register keeps the value. */
++static bool
++sy_rpmh_sync(uint32_t off, uint32_t v)
++{
++	sy_wr(sy_rsc, off, v);
++	for (unsigned i = 0; i < 1000; i++) {
++		if (sy_rd(sy_rsc, off) == v) {
++			return true;
++		}
++		delay(1);
++	}
++	return false;
++}
 +
 +/* PAND:682-720: the resource's RPMh address out of the cmd-db (slave 4 = VRM). */
 +static int
@@ -884,139 +892,29 @@
 + * is touched, and it is put back. The first call's outcome is kept, so a second
 + * call cannot arm a second request for the same rail.
 + */
-+/* Persist the PANDORLG ring tail to UFS so a hard reset still shows how far we
-+ * got (pl_flush is the same path the panic hook uses). */
-+static void
-+sy_log_sync(void)
-+{
-+	(void)pandora_log_sync();
-+}
-+
-+static bool sy_rsc_poisoned;	/* an uncertain TCS transaction: stop voting */
-+
-+/* RSC v3 writes are ordered Device accesses; the same-family proven transport
-+ * puts a dsb osh after every write so ADDR/DATA cannot land after EN/TRIGGER. */
-+static void
-+sy_rsc_wr(uint32_t off, uint32_t v)
-+{
-+	sy_wr(sy_rsc, off, v);
-+	__asm__ volatile("dsb osh" ::: "memory");
-+}
-+
-+/* Program one ACTIVE TCS with ncmd commands (0x10108 write+4B+ack), verify the
-+ * programming, then trigger with the three-step CTRL sequence. Completion is
-+ * IDLE != 0 plus each command's issued|completed bits, as in the same-family
-+ * transport; the TCS IRQ is deliberately left disabled. */
-+/* §11.4 verified transport: TCS2, msgid 0x10108, completion from the TCS IRQ
-+ * (done/irq/status) exactly as the plan records for this device. The only
-+ * additions are locally evidenced: dsb osh after every RSC write (same-family
-+ * transport) and a programming readback before the trigger. DRV_IRQ_ENABLE is
-+ * shared with touch/adreno8_rpmh, so only our own bit is set and cleared. */
-+static int
-+sy_rsc_send(const char *res, uint32_t t, const uint32_t *addr, const uint32_t *data,
-+    unsigned ncmd, uint32_t mv, uint32_t mode)
-+{
-+	const struct sy_rpmh_layout *L = &sy_rpmh_v3;
-+	uint32_t b = SY_TCS_OFF + t * SY_TCS_STRIDE, bit = 1u << t;
-+	uint32_t irq_en, wait = 0, cs[3] = {0, 0, 0};
-+	bool done = false;
-+	unsigned c;
-+
-+	if (!ncmd || ncmd > 3 || t > 2)
-+		return EINVAL;
-+	if (sy_rd(sy_rsc, b + L->status) == 0 || sy_rd(sy_rsc, b + L->control) ||
-+	    sy_rd(sy_rsc, b + L->enable) || sy_rd(sy_rsc, b + L->wait) ||
-+	    (sy_rd(sy_rsc, SY_TCS_OFF + 4) & bit)) {
-+		printf("PANDORA WLAN: RPMh: TCS%u not clean: idle=%#x control=%#x enable=%#x "
-+		    "wait=%#x irq=%#x; not voting\n", t, sy_rd(sy_rsc, b + L->status),
-+		    sy_rd(sy_rsc, b + L->control), sy_rd(sy_rsc, b + L->enable),
-+		    sy_rd(sy_rsc, b + L->wait), sy_rd(sy_rsc, SY_TCS_OFF + 4));
-+		return EBUSY;
-+	}
-+	irq_en = sy_rd(sy_rsc, SY_TCS_OFF);
-+	sy_rsc_wr(b + L->control, 0);
-+	sy_rsc_wr(SY_TCS_OFF + 8, bit);			/* W1C: our bit only */
-+	sy_rsc_wr(SY_TCS_OFF, irq_en | bit);		/* enable: our bit only */
-+	if ((sy_rd(sy_rsc, SY_TCS_OFF) & bit) == 0) {
-+		printf("PANDORA WLAN: RPMh: TCS%u IRQ enable did not stick\n", t);
-+		goto fail;
-+	}
-+	for (c = 0; c < ncmd; c++) {
-+		uint32_t cb = b + c * L->cmd_stride;
-+
-+		sy_rsc_wr(cb + L->msgid, SY_RPMH_WRITE);
-+		sy_rsc_wr(cb + L->addr, addr[c]);
-+		sy_rsc_wr(cb + L->data, data[c]);
-+		wait |= 1u << c;
-+	}
-+	sy_rsc_wr(b + L->wait, wait);
-+	sy_rsc_wr(b + L->enable, (1u << ncmd) - 1u);
-+	for (c = 0; c < ncmd; c++) {
-+		uint32_t cb = b + c * L->cmd_stride;
-+
-+		if (sy_rd(sy_rsc, cb + L->msgid) != SY_RPMH_WRITE ||
-+		    sy_rd(sy_rsc, cb + L->addr) != addr[c] ||
-+		    sy_rd(sy_rsc, cb + L->data) != data[c]) {
-+			printf("PANDORA WLAN: RPMh: TCS%u program readback failed (cmd %u)\n",
-+			    t, c);
-+			goto fail;
-+		}
-+	}
-+	if (sy_rd(sy_rsc, b + L->wait) != wait ||
-+	    sy_rd(sy_rsc, b + L->enable) != ((1u << ncmd) - 1u)) {
-+		printf("PANDORA WLAN: RPMh: TCS%u arm readback failed wait=%#x enable=%#x\n",
-+		    t, sy_rd(sy_rsc, b + L->wait), sy_rd(sy_rsc, b + L->enable));
-+		goto fail;
-+	}
-+	sy_rsc_wr(b + L->control, SY_RPMH_AMC);
-+	if (sy_rd(sy_rsc, b + L->control) != SY_RPMH_AMC) {
-+		printf("PANDORA WLAN: RPMh: TCS%u AMC readback failed\n", t);
-+		goto fail;
-+	}
-+	sy_rsc_wr(b + L->control, SY_RPMH_AMC | SY_RPMH_TRIGGER);
-+	for (unsigned us = 0; us < 10000 && !done; us++) {
-+		bool all = (sy_rd(sy_rsc, SY_TCS_OFF + 4) & bit) != 0;
-+
-+		for (c = 0; c < ncmd; c++)
-+			cs[c] = sy_rd(sy_rsc, b + c * L->cmd_stride + L->cmd_status);
-+		done = all && sy_rd(sy_rsc, b + L->status) != 0;
-+		if (!done)
-+			delay(1);
-+	}
-+	printf("PANDORA WLAN: RPMh: %s %u mV/mode %u/enable on TCS%u done=%d irq=%#x "
-+	    "status=%#x cmd-status=%#x/%#x/%#x\n", res, mv, mode, t, done,
-+	    sy_rd(sy_rsc, SY_TCS_OFF + 4), sy_rd(sy_rsc, b + L->status),
-+	    cs[0], cs[1], cs[2]);
-+	if (!done)
-+		goto fail;
-+	sy_rsc_wr(b + L->control, SY_RPMH_AMC);
-+	sy_rsc_wr(b + L->control, 0);
-+	sy_rsc_wr(b + L->enable, 0);
-+	sy_rsc_wr(b + L->wait, 0);
-+	sy_rsc_wr(SY_TCS_OFF + 8, bit);
-+	sy_rsc_wr(SY_TCS_OFF, sy_rd(sy_rsc, SY_TCS_OFF) & ~bit);	/* our bit only */
-+	if (sy_rd(sy_rsc, b + L->control) || sy_rd(sy_rsc, b + L->enable) ||
-+	    sy_rd(sy_rsc, b + L->wait) || (sy_rd(sy_rsc, SY_TCS_OFF + 4) & bit) ||
-+	    sy_rd(sy_rsc, b + L->status) == 0) {
-+		printf("PANDORA WLAN: RPMh: TCS%u cleanup verify failed\n", t);
-+		goto fail;
-+	}
-+	return 0;
-+fail:
-+	sy_rsc_poisoned = true;
-+	printf("PANDORA WLAN: RPMh: TCS%u quarantined for this boot\n", t);
-+	return EIO;
-+}
-+
 +static int
 +sy_rpmh_vote_res(const char *res, uint32_t mv, uint32_t mode, bool ldo)
 +{
-+	uint32_t id = 0, config = 0, magic = 0, address = 0, major, minor, ntcs, ncpt;
-+	uint32_t addr[3], data[3];
++	const struct sy_rpmh_layout *L = NULL;
++	uint32_t id = 0, config = 0, magic = 0, address = 0;
++	uint32_t major, minor, ntcs, ncpt, b = 0, bit = 0, irq_en = 0;
++	uint32_t word[3] = {0, 0, 0}, cs[3] = {0, 0, 0};
++	uint32_t vals[3] = {mv, SY_VRM_ENABLE, mode};
++	/* voltage, enable, mode: an LDO also gets its mode voted, an SMPS does not */
 +	static const uint32_t offs[3] = {0, 4, 8};
++	unsigned t = 0;
 +	static int sy_ldo2 = -1;
 +	unsigned ncmd;
++
++	if (sy_ldo2 < 0) {
++		int v = 0;
++		sy_ldo2 = (PE_parse_boot_argn("songyuan_wlan_ldo2", &v, sizeof(v)) && v) ? 1 : 0;
++		printf("PANDORA WLAN: RPMh: LDO votes use %u commands (songyuan_wlan_ldo2=%d)\n",
++		    (ldo && !sy_ldo2) ? 3u : 2u, sy_ldo2);
++	}
++	ncmd = (ldo && !sy_ldo2) ? 3u : 2u;
 +	int rc = 0;
++	bool done = false;
 +
 +	if (!sy_rsc) {
 +		sy_rsc = ml_io_map(SY_RSC_PA, SY_RSC_SIZE);
@@ -1026,19 +924,6 @@
 +			return ENOMEM;
 +		}
 +	}
-+	if (sy_ldo2 < 0) {
-+		int v = 0;
-+
-+		sy_ldo2 = (PE_parse_boot_argn("songyuan_wlan_ldo2", &v, sizeof(v)) && v) ? 1 : 0;
-+		printf("PANDORA WLAN: RPMh: LDO votes use %u commands (songyuan_wlan_ldo2=%d)\n",
-+		    (ldo && !sy_ldo2) ? 3u : 2u, sy_ldo2);
-+	}
-+	ncmd = (ldo && !sy_ldo2) ? 3u : 2u;
-+	data[0] = mv; data[1] = SY_VRM_ENABLE; data[2] = mode;
-+	if (sy_rsc_poisoned) {
-+		printf("PANDORA WLAN: RPMh: TCS quarantined; %s not voted\n", res);
-+		return EIO;
-+	}
 +	id = sy_rd(sy_rsc, 0);
 +	config = sy_rd(sy_rsc, 0x0c);
 +	major = (id >> 16) & 0xffu;
@@ -1047,34 +932,132 @@
 +	ncpt = (config >> 27) & 0x1fu;
 +	printf("PANDORA WLAN: RPMh: rsc=%#x id=%#x (v%u.%u) solver=%#x config=%#x tcs=%u ncpt=%u\n",
 +	    SY_RSC_PA, id, major, minor, sy_rd(sy_rsc, 4), config, ntcs, ncpt);
-+	if (major < 3 || ntcs < 3 || ntcs > 16 || ncpt < 3 || ncpt > 16) {
-+		printf("PANDORA WLAN: RPMh: RSC layout not known; not voting\n");
-+		return ENODEV;
++	/* Linux uses the 3.0 layout for every major >= 3 (PAND:751-756). */
++	L = major >= 3 ? &sy_rpmh_v3 : (major == 2 ? &sy_rpmh_v2 : NULL);
++	if (!L || ntcs < 3 || ntcs > 16 || ncpt < 3 || ncpt > 16) {
++		printf("PANDORA WLAN: RPMh: RSC v%u.%u layout/geometry not known (tcs %u, "
++		    "ncpt %u); not voting\n", major, minor, ntcs, ncpt);
++		rc = ENODEV;
++		goto out;
 +	}
 +	magic = sy_rd(sy_cmddb, 4);
 +	printf("PANDORA WLAN: RPMh: cmd-db %#x size %#x version=%#x magic=%#x\n",
 +	    SY_CMDDB_PA, SY_CMDDB_SIZE, sy_rd(sy_cmddb, 0), magic);
 +	if (magic != SY_CMDDB_MAGIC) {
-+		printf("PANDORA WLAN: RPMh: cmd-db magic mismatch; not voting\n");
-+		return ENODEV;
++		printf("PANDORA WLAN: RPMh: cmd-db magic %#x is not %#x; not voting\n",
++		    magic, SY_CMDDB_MAGIC);
++		rc = ENODEV;
++		goto out;
 +	}
 +	if ((rc = sy_rpmh_lookup(res, &address))) {
-+		return rc;
++		goto out;
 +	}
-+	{
-+		unsigned c;
-+
-+		for (c = 0; c < ncmd; c++) {
-+			addr[c] = address + offs[c];
-+			printf("PANDORA WLAN: RPMh: cmd %u/%u msgid %#x addr %#x data %u\n",
-+			    c, ncmd, SY_RPMH_WRITE, addr[c], data[c]);
++	/* K90/SM8750 mhi_pcie_power.c and the vendor rpmh-rsc ownership: DRV2's ACTIVE
++	 * sets 0/1/2 belong to touch, adreno8_rpmh and PCIe. The PCIe vote must use set 2
++	 * (TCS2) and interrupt bit 2; scanning for a "free" set steals another driver's
++	 * TCS and can wedge the RSC (observed as a reset at the first S1J vote). */
++	/* Locally verified on this phone (ioslog_86): PCIe voted all nine rails on
++	 * TCS2 with irq=0x4 and done=1; this is this device's own measurement, not a
++	 * copy of another board's set ownership. */
++	t = 2;
++	b = SY_TCS_OFF + t * SY_TCS_STRIDE;
++	bit = 1u << t;
++	printf("PANDORA WLAN: RPMh: TCS%u idle=%#x control=%#x enable=%#x wait=%#x (PCIe's set)\n",
++	    t, sy_rd(sy_rsc, b + L->status), sy_rd(sy_rsc, b + L->control),
++	    sy_rd(sy_rsc, b + L->enable), sy_rd(sy_rsc, b + L->wait));
++	if (sy_rd(sy_rsc, b + L->control) != 0 || sy_rd(sy_rsc, b + L->enable) != 0 ||
++	    sy_rd(sy_rsc, b + L->wait) != 0) {
++		printf("PANDORA WLAN: RPMh: TCS%u is not idle; not voting\n", t);
++		rc = EBUSY;
++		goto out;
++	}
++	irq_en = sy_rd(sy_rsc, SY_TCS_OFF);
++	sy_wr(sy_rsc, b + L->control, 0);
++	sy_wr(sy_rsc, SY_TCS_OFF + 8, bit);	/* DRV_IRQ_CLEAR: our set only */
++	for (unsigned c = 0; c < ncmd; c++) {
++		uint32_t cmd = b + c * L->cmd_stride;
++		word[c] = address + offs[c];
++		printf("PANDORA WLAN: RPMh: cmd %u/%u at rsc+%#x: msgid %#x addr %#x data %u\n",
++		    c, ncmd, cmd + L->msgid, SY_RPMH_WRITE, word[c], vals[c]);
++		if (!sy_rpmh_sync(cmd + L->msgid, SY_RPMH_WRITE) ||
++		    !sy_rpmh_sync(cmd + L->addr, word[c]) ||
++		    !sy_rpmh_sync(cmd + L->data, vals[c])) {
++			printf("PANDORA WLAN: RPMh: command %u write failed: msgid %#x (want %#x), "
++			    "addr %#x (want %#x), data %#x (want %u); id=%#x (v%u.%u)\n", c,
++			    sy_rd(sy_rsc, cmd + L->msgid), SY_RPMH_WRITE,
++			    sy_rd(sy_rsc, cmd + L->addr), word[c],
++			    sy_rd(sy_rsc, cmd + L->data), vals[c], id, major, minor);
++			rc = EIO;
++			goto restore;
 +		}
 +	}
-+	rc = sy_rsc_send(res, 2, addr, data, ncmd, mv, mode);
-+	sy_log_sync();
++	if (!sy_rpmh_sync(b + L->wait, (1u << ncmd) - 1u) ||
++	    !sy_rpmh_sync(b + L->enable, (1u << ncmd) - 1u)) {
++		printf("PANDORA WLAN: RPMh: TCS%u arm failed: wait=%#x enable=%#x "
++		    "(want %#x, %#x), commands %#x/%#x/%#x = %u/%u/%u\n",
++		    t, sy_rd(sy_rsc, b + L->wait), sy_rd(sy_rsc, b + L->enable),
++		    (1u << ncmd) - 1u, (1u << ncmd) - 1u,
++		    word[0], word[1], word[2], vals[0], vals[1], vals[2]);
++		rc = EIO;
++		goto restore;
++	}
++	sy_wr(sy_rsc, SY_TCS_OFF, sy_rd(sy_rsc, SY_TCS_OFF) | bit);	/* DRV_IRQ_ENABLE |= ours */
++	sy_wr(sy_rsc, b + L->control, SY_RPMH_AMC);
++	sy_wr(sy_rsc, b + L->control, SY_RPMH_AMC | SY_RPMH_TRIGGER);
++	for (unsigned us = 0; us < 10000 && !done; us++) {
++		/* K90 mhi_pcie_power.c polls only DRV_IRQ_STATUS. The per-command
++		 * status offsets are not validated on this layout: a three-command
++		 * LDO vote never matched and the wait used to spin until the WDT. */
++		bool all = (sy_rd(sy_rsc, SY_TCS_OFF + 4) & bit) != 0;	/* DRV_IRQ_STATUS */
++		for (unsigned c = 0; c < ncmd; c++)
++			cs[c] = sy_rd(sy_rsc, b + L->cmd_status + c * L->cmd_stride);
++		done = all && sy_rd(sy_rsc, b + L->status) != 0;
++		if (!done) {
++			delay(1);
++		}
++	}
++	printf("PANDORA WLAN: RPMh: %s %u mV/mode %u/enable on TCS%u done=%d irq=%#x "
++	    "status=%#x cmd-status=%#x/%#x/%#x\n", res, mv, mode, t, done,
++	    sy_rd(sy_rsc, SY_TCS_OFF + 4), sy_rd(sy_rsc, b + L->status),
++	    cs[0], cs[1], cs[2]);
++	if (!done) {
++		printf("PANDORA WLAN: RPMh: %s vote timed out: rsc id=%#x (v%u.%u), "
++		    "commands %#x/%#x/%#x = %u/%u/%u, control=%#x status=%#x\n", res, id,
++		    major, minor, word[0], word[1], word[2], vals[0], vals[1], vals[2],
++		    sy_rd(sy_rsc, b + L->control), sy_rd(sy_rsc, b + L->status));
++		rc = ETIMEDOUT;
++	}
++restore:
++	/* Proven or not, return TCS2 to idle and put our interrupt bit back. */
++	(void)sy_rpmh_sync(b + L->control, SY_RPMH_AMC);
++	(void)sy_rpmh_sync(b + L->control, 0);
++	(void)sy_rpmh_sync(b + L->enable, 0);
++	(void)sy_rpmh_sync(b + L->wait, 0);
++	sy_wr(sy_rsc, SY_TCS_OFF + 8, bit);	/* W1C: our set only */
++	sy_wr(sy_rsc, SY_TCS_OFF, sy_rd(sy_rsc, SY_TCS_OFF) & ~bit);	/* only our bit back */
++out:
 +	return rc;
 +}
 +
++
++/* The card's seven rails: live DT vdd-wlan-*-supply -> rpmh-regulator node ->
++ * qcom,resource-name and qcom,init-voltage; min/max are the regulator's range. */
++struct sy_supply {
++	const char *name, *what;
++	uint32_t mv, min_uv, max_uv;
++	bool ldo;
++};
++static const struct sy_supply sy_supplies[] = {
++	{ "S1J_E1", "vdd-wlan-cx (S1J, pmh0104 S1)", 852, 400000, 1000000, false },
++	{ "S2J_E1", "vdd-wlan-dig (S2J, pmh0104 S2)", 852, 500000, 1100000, false },
++	{ "L3G_E0", "vdd-wlan-io12 (L3G, pmh0110 G L3)", 1200, 1200000, 1200000, true },
++	{ "L2G_E0", "vdd-wlan-aon (L2G, pmh0110 G L2)", 1800, 1800000, 1800000, true },
++	{ "S8F_E0", "vdd-wlan-rfa1 (S8F, pmh0110 F S8)", 1856, 1800000, 2000000, false },
++	{ "S7F_E0", "vdd-wlan-rfa2 (S7F, pmh0110 F S7)", 1256, 1224000, 1372000, false },
++	{ "L3K_E1", "vdd-wlan-ant-share (L3K, pmr735d L3)", 1200, 1200000, 1200000, true },
++};
++
++/* RPMh clock/single-command vote: cmd-db entry for a non-VRM resource (e.g. "rf_clk"). */
 +static int
 +sy_rpmh_lookup_clock(const char *res, uint32_t *address)
 +{
@@ -1113,14 +1096,17 @@
 +	return 0;
 +}
 +
-+
++/* One ACTIVE TCS command on the PCIe set (TCS2); the clock level is the data word. */
 +static int
 +sy_rpmh_vote1(const char *res, uint32_t addr_off, uint32_t data)
 +{
-+	uint32_t address = 0, addr[1], d[1];
++	const struct sy_rpmh_layout *L = &sy_rpmh_v3;
++	uint32_t id, address = 0, b, bit;
++	unsigned major;
++	bool done = false;
 +	int rc;
 +
-+	if (!sy_rsc) {
++	if (!sy_rsc || !sy_cmddb) {
 +		sy_rsc = ml_io_map(SY_RSC_PA, SY_RSC_SIZE);
 +		sy_cmddb = ml_io_map(SY_CMDDB_PA, SY_CMDDB_SIZE);
 +		if (!sy_rsc || !sy_cmddb) {
@@ -1128,39 +1114,49 @@
 +			return ENOMEM;
 +		}
 +	}
-+	if (sy_rsc_poisoned) {
-+		printf("PANDORA WLAN: RPMh: TCS quarantined; %s not voted\n", res);
-+		return EIO;
++	id = sy_rd(sy_rsc, 0);
++	major = (id >> 16) & 0xffu;
++	if (major < 3) {
++		printf("PANDORA WLAN: RPMh: RSC v%u: no 3.0 layout for %s\n", major, res);
++		return ENODEV;
 +	}
 +	rc = sy_rpmh_lookup_clock(res, &address);
-+	if (rc) {
++	if (rc)
 +		return rc;
++	address += addr_off;	/* clk-rpmh: res_addr = cmd-db addr + CLK_RPMH_VRM_EN_OFFSET(4) */
++	b = SY_TCS_OFF + 2 * SY_TCS_STRIDE;
++	bit = 1u << 2;
++	if (sy_rd(sy_rsc, b + L->control) != 0 || sy_rd(sy_rsc, b + L->enable) != 0 ||
++	    sy_rd(sy_rsc, b + L->wait) != 0) {
++		printf("PANDORA WLAN: RPMh: TCS2 busy; %s not voted\n", res);
++		return EBUSY;
 +	}
-+	addr[0] = address + addr_off;
-+	d[0] = data;
-+	printf("PANDORA WLAN: RPMh: %s cmd msgid %#x addr %#x data %u\n",
-+	    res, SY_RPMH_WRITE, addr[0], d[0]);
-+	rc = sy_rsc_send(res, 2, addr, d, 1, data, 0);
-+	sy_log_sync();
-+	return rc;
++	sy_wr(sy_rsc, b + L->control, 0);
++	sy_wr(sy_rsc, SY_TCS_OFF + 8, bit);
++	if (!sy_rpmh_sync(b + L->msgid, SY_RPMH_WRITE) ||
++	    !sy_rpmh_sync(b + L->addr, address) ||
++	    !sy_rpmh_sync(b + L->data, data)) {
++		printf("PANDORA WLAN: RPMh: %s command write failed\n", res);
++		return EIO;
++	}
++	if (!sy_rpmh_sync(b + L->wait, 1) || !sy_rpmh_sync(b + L->enable, 1)) {
++		printf("PANDORA WLAN: RPMh: %s arm failed\n", res);
++		return EIO;
++	}
++	sy_wr(sy_rsc, SY_TCS_OFF, sy_rd(sy_rsc, SY_TCS_OFF) | bit);
++	sy_wr(sy_rsc, b + L->control, SY_RPMH_AMC);
++	sy_wr(sy_rsc, b + L->control, SY_RPMH_AMC | SY_RPMH_TRIGGER);
++	for (unsigned us = 0; us < 10000 && !done; us++) {
++		done = ((sy_rd(sy_rsc, SY_TCS_OFF + 4) & bit) != 0) &&
++		    sy_rd(sy_rsc, b + L->status) != 0;
++		if (!done)
++			delay(1);
++	}
++	printf("PANDORA WLAN: RPMh: %s addr %#x data %u on TCS2 done=%d irq=%#x status=%#x\n",
++	    res, address, data, done, sy_rd(sy_rsc, SY_TCS_OFF + 4),
++	    sy_rd(sy_rsc, b + L->status));
++	return done ? 0 : ETIMEDOUT;
 +}
-+
-+/* The card's seven rails: live DT vdd-wlan-*-supply -> rpmh-regulator node ->
-+ * qcom,resource-name and qcom,init-voltage; min/max are the regulator's range. */
-+struct sy_supply {
-+	const char *name, *what;
-+	uint32_t mv, min_uv, max_uv;
-+	bool ldo;
-+};
-+static const struct sy_supply sy_supplies[] = {
-+	{ "S1J_E1", "vdd-wlan-cx (S1J, pmh0104 S1)", 852, 400000, 1000000, false },
-+	{ "S2J_E1", "vdd-wlan-dig (S2J, pmh0104 S2)", 852, 500000, 1100000, false },
-+	{ "L3G_E0", "vdd-wlan-io12 (L3G, pmh0110 G L3)", 1200, 1200000, 1200000, true },
-+	{ "L2G_E0", "vdd-wlan-aon (L2G, pmh0110 G L2)", 1800, 1800000, 1800000, true },
-+	{ "S8F_E0", "vdd-wlan-rfa1 (S8F, pmh0110 F S8)", 1856, 1800000, 2000000, false },
-+	{ "S7F_E0", "vdd-wlan-rfa2 (S7F, pmh0110 F S7)", 1256, 1224000, 1372000, false },
-+	{ "L3K_E1", "vdd-wlan-ant-share (L3K, pmr735d L3)", 1200, 1200000, 1200000, true },
-+};
 +
 +static bool
 +sy_supplies_on(void)
@@ -1182,7 +1178,6 @@
 +			return false;
 +		}
 +		printf("PANDORA WLAN: %s on at %u mV\n", s->name, s->mv);
-+		sy_log_sync();
 +	}
 +	/* cnss-peach node: clocks = <&rsc_clk 6> "rf_clk" and wcal-pbs-supply; both are
 +	 * RPMh resources the vendor cnss driver enables, and both were missing here. */
@@ -1420,20 +1415,12 @@
 +static void
 +sy_diag_regs(const char *when)
 +{
-+	/* Split into three persisted steps so a hard reset cannot hide which block
-+	 * (PARF / GCC / DBI) was being read when the system went down. */
-+	printf("PANDORA WLAN: %s: parf dev-type %#x sys %#x l1 %#x\n", when,
-+	    sy_rd(parf, PARF_DEVICE_TYPE), sy_rd(parf, PARF_SYS_CTRL), sy_rd(parf, 0x020));
-+	sy_log_sync();
-+	printf("PANDORA WLAN: %s: parf slv_lo %#x slv_hi %#x atu_lo %#x atu_hi %#x int_mask %#x int2 %#x\n",
-+	    when, sy_rd(parf, 0x358), sy_rd(parf, 0x35c), sy_rd(parf, 0x634),
-+	    sy_rd(parf, 0x638), sy_rd(parf, 0x22c), sy_rd(parf, 0x50c));
-+	sy_log_sync();
-+	printf("PANDORA WLAN: %s: gcc aux-halt %#x rchng-halt %#x pipe-halt %#x\n",
-+	    when, sy_gcc_rd(GCC_AUX), sy_gcc_rd(0x6b074), sy_gcc_rd(GCC_PIPE));
-+	sy_log_sync();
-+	printf("PANDORA WLAN: %s: dbi %#x\n", when, sy_rd(dbi, 0));
-+	sy_log_sync();
++	printf("PANDORA WLAN: %s: parf dev-type %#x sys %#x l1 %#x slv_lo %#x slv_hi %#x atu_lo %#x atu_hi %#x int_mask %#x int2 %#x\n",
++	    when, sy_rd(parf, PARF_DEVICE_TYPE), sy_rd(parf, PARF_SYS_CTRL),
++	    sy_rd(parf, 0x020), sy_rd(parf, 0x358), sy_rd(parf, 0x35c),
++	    sy_rd(parf, 0x634), sy_rd(parf, 0x638), sy_rd(parf, 0x22c), sy_rd(parf, 0x50c));
++	printf("PANDORA WLAN: %s: gcc aux-halt %#x rchng-halt %#x pipe-halt %#x; dbi %#x\n",
++	    when, sy_gcc_rd(GCC_AUX), sy_gcc_rd(0x6b074), sy_gcc_rd(GCC_PIPE), sy_rd(dbi, 0));
 +}
 +
 +static void
@@ -1772,15 +1759,6 @@
 +		if (sy_step >= 15) {
 +			sy_bhi_sbl();
 +		}
-+		if (sy_step >= 16) {
-+			sy_mhi_ready();
-+		}
-+		if (sy_step >= 17) {
-+			sy_mhi_init();
-+		}
-+		if (sy_step >= 18) {
-+			sy_bhi_bhie();
-+		}
 +			if (smmu) {
 +				printf("PANDORA WLAN: SMMU IDR0 %#x IDR1 %#x IDR2 %#x CR0 %#x\n",
 +				    sy_rd(smmu, 0x00), sy_rd(smmu, 0x04), sy_rd(smmu, 0x08), sy_rd(smmu, 0x20));
@@ -1920,9 +1898,9 @@
 +		printf("PANDORA WLAN: PT: L3 alloc failed %d\n", kr);
 +		return 2;
 +	}
-+	((uint64_t *)sy_l1)[(SY_IOVA_MAP >> 30) & 511] = sy_pa(sy_l2) | 3ull;
++	((uint64_t *)sy_l1)[(SY_IOVA_BASE >> 30) & 511] = sy_pa(sy_l2) | 3ull;
 +	for (i = 0; i < l3s; i++)
-+		((uint64_t *)sy_l2)[(((SY_IOVA_MAP >> 21) + i) & 511)] =
++		((uint64_t *)sy_l2)[(((SY_IOVA_BASE >> 21) + i) & 511)] =
 +		    sy_pa(sy_l3 + (i << 12)) | 3ull;
 +	for (i = 0; i < (sy_buf_size >> 12); i++) {
 +		pa = sy_pa(sy_sbl_va + ((vm_offset_t)i << 12));
@@ -1935,37 +1913,9 @@
 +		flush_dcache64(sy_pa(sy_l3 + (i << 12)), (unsigned)PAGE_SIZE, TRUE);
 +	__asm__ volatile("dsb sy" ::: "memory");
 +	printf("PANDORA WLAN: PT: iova %#x size %#x l1 %#lx root %#llx l3s %u\n",
-+	    SY_IOVA_MAP, sy_buf_size, (unsigned long)sy_l1,
++	    SY_IOVA_BASE, sy_buf_size, (unsigned long)sy_l1,
 +	    (unsigned long long)sy_pa(sy_l1), l3s);
 +	return 0;
-+}
-+
-+/* The firmware buffer must be physically contiguous; XNU RAM is above 4 GiB so
-+ * the page tables translate IOVA SY_IOVA_MAP (<4 GiB) to these pages. */
-+static void
-+sy_buf_alloc(void)
-+{
-+	kern_return_t kr;
-+
-+	if (sy_sbl_va)
-+		return;
-+	kr = kmem_alloc_contig(kernel_map, &sy_sbl_va, SY_FW_BUF, PAGE_MASK, 0, 0,
-+	    KMA_DATA | KMA_ZERO | KMA_PERMANENT, VM_KERN_MEMORY_IOKIT);
-+	sy_buf_size = SY_FW_BUF;
-+	if (kr != KERN_SUCCESS || !sy_sbl_va) {
-+		printf("PANDORA WLAN: BHI: %#lx-byte contig failed %d, retry %#lx\n",
-+		    (unsigned long)SY_FW_BUF, kr, (unsigned long)SY_SBL_SIZE);
-+		kr = kmem_alloc_contig(kernel_map, &sy_sbl_va, SY_SBL_SIZE, PAGE_MASK, 0, 0,
-+		    KMA_DATA | KMA_ZERO | KMA_PERMANENT, VM_KERN_MEMORY_IOKIT);
-+		sy_buf_size = SY_SBL_SIZE;
-+		if (kr != KERN_SUCCESS || !sy_sbl_va) {
-+			printf("PANDORA WLAN: BHI: SBL contig alloc failed %d\n", kr);
-+			return;
-+		}
-+	}
-+	sy_sbl_pa = sy_pa(sy_sbl_va);
-+	printf("PANDORA WLAN: BHI: buffer va %#lx pa %#llx size %#x\n",
-+	    (unsigned long)sy_sbl_va, (unsigned long long)sy_sbl_pa, sy_buf_size);
 +}
 +
 +static int
@@ -2102,7 +2052,7 @@
 +	v = sy_rd(cbp, 0x58);
 +	printf("PANDORA WLAN: SMMU installed: slot %u bank %u asid %#llx iova %#x sctlr %#x "
 +	    "tcr %#x cbar %#x smr %#x s2cr %#x fsr %#x\n", slot, cb, (unsigned long long)asid,
-+	    SY_IOVA_MAP, sy_rd(cbp, 0x00), sy_rd(cbp, 0x30), sy_rd(gr1, 4 * cb), smr,
++	    SY_IOVA_BASE, sy_rd(cbp, 0x00), sy_rd(cbp, 0x30), sy_rd(gr1, 4 * cb), smr,
 +	    sy_rd(sy_smmu_va, 0xc00 + 4 * slot), v);
 +	if ((v & 0xc00001feu) || (v & 0x600u) != 0x400u) {
 +		printf("PANDORA WLAN: SMMU install: FSR not idle (%#x)\n", v);
@@ -2115,6 +2065,32 @@
 + * INTx off, INTVEC/STATUS cleared, IMGADDR/IMGSIZE written and verified,
 + * cache cleaned, then the image doorbell; poll BHI_STATUS[31:30] (2 ok, 3 err).
 + * Any mismatch stops here with the values printed; nothing panics. */
++static void
++sy_buf_alloc(void)
++{
++	kern_return_t kr;
++
++	if (sy_sbl_va)
++		return;
++	kr = kmem_alloc_contig(kernel_map, &sy_sbl_va, SY_FW_BUF, PAGE_MASK, 0, 0,
++	    KMA_DATA | KMA_ZERO | KMA_PERMANENT, VM_KERN_MEMORY_IOKIT);
++	sy_buf_size = SY_FW_BUF;
++	if (kr != KERN_SUCCESS || !sy_sbl_va) {
++		printf("PANDORA WLAN: BHI: %#lx-byte contig failed %d, retry %#lx\n",
++		    (unsigned long)SY_FW_BUF, kr, (unsigned long)SY_SBL_SIZE);
++		kr = kmem_alloc_contig(kernel_map, &sy_sbl_va, SY_SBL_SIZE, PAGE_MASK, 0, 0,
++		    KMA_DATA | KMA_ZERO | KMA_PERMANENT, VM_KERN_MEMORY_IOKIT);
++		sy_buf_size = SY_SBL_SIZE;
++		if (kr != KERN_SUCCESS || !sy_sbl_va) {
++			printf("PANDORA WLAN: BHI: SBL contig alloc failed %d\n", kr);
++			return;
++		}
++	}
++	sy_sbl_pa = sy_pa(sy_sbl_va);
++	printf("PANDORA WLAN: BHI: buffer va %#lx pa %#llx size %#x\n",
++	    (unsigned long)sy_sbl_va, (unsigned long long)sy_sbl_pa, sy_buf_size);
++}
++
 +static void
 +sy_bhi_sbl(void)
 +{
@@ -2148,10 +2124,10 @@
 +	sy_wr(conf, SY_EP_CONF + 0x04, cmd | 0x404);
 +	printf("PANDORA WLAN: BHI: ep cmd %#x -> %#x; bhio %#x sbl %#lx iova %#x\n",
 +	    cmd, sy_rd(conf, SY_EP_CONF + 0x04) & 0xffff, bhio,
-+	    (unsigned long)SY_SBL_SIZE, SY_IOVA_MAP);
++	    (unsigned long)SY_SBL_SIZE, SY_IOVA_BASE);
 +	sy_wr(sy_bar_va, bhio + 0x20, 0);          /* INTVEC */
 +	sy_wr(sy_bar_va, bhio + 0x2c, 0);          /* STATUS clear */
-+	sy_wr(sy_bar_va, bhio + 0x08, SY_IOVA_MAP);            /* IMGADDR lo (IOVA) */
++	sy_wr(sy_bar_va, bhio + 0x08, SY_IOVA_BASE);            /* IMGADDR lo (IOVA) */
 +	sy_wr(sy_bar_va, bhio + 0x0c, 0);                      /* IMGADDR hi */
 +	sy_wr(sy_bar_va, bhio + 0x10, SY_SBL_SIZE);           /* IMGSIZE */
 +	__asm__ volatile("dsb sy" ::: "memory");
@@ -2160,7 +2136,7 @@
 +	st = sy_rd(sy_bar_va, bhio + 0x2c);   ee = sy_rd(sy_bar_va, bhio + 0x28);
 +	printf("PANDORA WLAN: BHI preflight: %#x:%08x size %#x ivec %#x status %#x ee %#x\n",
 +	    hi, lo, size, ivec, st, ee);
-+	if (hi != 0 || lo != SY_IOVA_MAP ||
++	if (hi != 0 || lo != SY_IOVA_BASE ||
 +	    size != SY_SBL_SIZE || ivec || st || ee) {
 +		printf("PANDORA WLAN: BHI: preflight mismatch, doorbell not rung\n");
 +		return;
@@ -2176,198 +2152,6 @@
 +	}
 +	printf("PANDORA WLAN: BHI result: status %#x code %u ee %#x errcode %#x mhi %#x\n",
 +	    st, st >> 30, ee, sy_rd(sy_bar_va, bhio + 0x30), sy_rd(sy_bar_va, 0x48));
-+}
-+
-+
-+/* Stage 16: BHIe transfer of the full image (official boot.c): write
-+ * TXVECADDR_LOW/HIGH(0x2c/0x30), TXVECSIZE(0x34), TXVECDB(0x38)=seq, then
-+ * poll TXVECSTATUS(0x44). Vector table lives in the same contiguous buffer.
-+ * Stage 17: RESET->READY per official pm.c (MHICTRL 0x38, MHISTATUS 0x48). */
-+static void
-+sy_bhi_bhie(void)
-+{
-+	uint64_t fo = 0, fs = 0, iova = SY_IOVA_MAP;
-+	uint32_t i, seg = SY_SBL_SIZE, n, ts, st;
-+	uint64_t *vec;
-+
-+	if (!sy_bar_va || !sy_sbl_va || !sy_buf_size || !sy_bhi_off) {
-+		printf("PANDORA WLAN: BHIe: missing state\n");
-+		return;
-+	}
-+	if (sy_fw_find("amss20.bin", &fo, &fs) || fs <= SY_SBL_SIZE) {
-+		printf("PANDORA WLAN: BHIe: firmware not usable\n");
-+		return;
-+	}
-+	n = (uint32_t)((fs - SY_SBL_SIZE + seg - 1) / seg) + 1;   /* + vector table */
-+	if (n > 16 || (uint64_t)n * 16 > 0x1000) {
-+		printf("PANDORA WLAN: BHIe: too many segments %u\n", n);
-+		return;
-+	}
-+	if (pandora_fw_read(fo + SY_SBL_SIZE, (void *)(sy_sbl_va + SY_SBL_SIZE),
-+	    (vm_size_t)(fs - SY_SBL_SIZE))) {
-+		printf("PANDORA WLAN: BHIe: image read failed\n");
-+		return;
-+	}
-+	vec = (uint64_t *)(sy_sbl_va + SY_FW_BUF - 0x1000);
-+	for (i = 0; i + 1 < n; i++) {
-+		vec[2 * i] = iova + SY_SBL_SIZE + (uint64_t)i * seg;
-+		vec[2 * i + 1] = (i + 2 == n) ? (fs - SY_SBL_SIZE - (uint64_t)i * seg) : seg;
-+	}
-+	for (i = 0; i < (SY_FW_BUF >> 12); i++)
-+		flush_dcache64(sy_pa(sy_sbl_va + ((vm_offset_t)i << 12)), (unsigned)PAGE_SIZE, TRUE);
-+	__asm__ volatile("dsb sy" ::: "memory");
-+	sy_wr(sy_bar_va, sy_bhi_off + 0x3c, 0);
-+	sy_wr(sy_bar_va, sy_bhi_off + 0x2c, (uint32_t)(iova + SY_FW_BUF - 0x1000));
-+	sy_wr(sy_bar_va, sy_bhi_off + 0x30, 0);
-+	sy_wr(sy_bar_va, sy_bhi_off + 0x34, n * 16);
-+	sy_wr(sy_bar_va, sy_bhi_off + 0x3c, 0x5a5a5a5a);
-+	__asm__ volatile("dsb sy" ::: "memory");
-+	printf("PANDORA WLAN: BHIe: vec %#llx n %u size %u addr %#x/%#x size %#x db %#x\n",
-+	    (unsigned long long)(iova + SY_FW_BUF - 0x1000), n, n * 16,
-+	    sy_rd(sy_bar_va, sy_bhi_off + 0x2c), sy_rd(sy_bar_va, sy_bhi_off + 0x30),
-+	    sy_rd(sy_bar_va, sy_bhi_off + 0x34), sy_rd(sy_bar_va, sy_bhi_off + 0x3c));
-+	for (i = 0; i < 400; i++) {
-+		st = sy_rd(sy_bar_va, sy_bhi_off + 0x44);
-+		if (st)
-+			break;
-+		sy_usleep(10000);
-+	}
-+	ts = sy_rd(sy_bar_va, sy_bhi_off + 0x44);
-+	printf("PANDORA WLAN: BHIe result: txvecstatus %#x\n", ts);
-+	{
-+		uint32_t c = sy_rd(sy_bar_va, 0x38);
-+
-+		printf("PANDORA WLAN: BHIe done, AMSS should boot; setting M0\n");
-+		sy_wr(sy_bar_va, 0x38, (c & ~(0xffu << 8)) | (2u << 8));
-+		__asm__ volatile("dsb sy" ::: "memory");
-+		printf("PANDORA WLAN: MHI M0 after BHIe: ctrl %#x status %#x (state %u ready %u)\n",
-+		    sy_rd(sy_bar_va, 0x38), sy_rd(sy_bar_va, 0x48),
-+		    (sy_rd(sy_bar_va, 0x48) >> 8) & 0xff, sy_rd(sy_bar_va, 0x48) & 1);
-+	}
-+}
-+
-+static void
-+sy_mhi_ready(void)
-+{
-+	uint32_t v;
-+	unsigned i;
-+
-+	if (!sy_bar_va) {
-+		printf("PANDORA WLAN: MHI: no BAR0\n");
-+		return;
-+	}
-+	for (i = 0; i < 200; i++) {
-+		v = sy_rd(sy_bar_va, 0x38);
-+		if (!(v & 0x2u))
-+			break;
-+		sy_usleep(25000);
-+	}
-+	for (i = 0; i < 200; i++) {
-+		v = sy_rd(sy_bar_va, 0x48);
-+		if (v & 1u)
-+			break;
-+		sy_usleep(25000);
-+	}
-+	v = sy_rd(sy_bar_va, 0x48);
-+	printf("PANDORA WLAN: MHI ready poll: ctrl %#x status %#x (state %u ready %u)\n",
-+	    sy_rd(sy_bar_va, 0x38), v, (v >> 8) & 0xff, v & 1);
-+	if (v & 1u)
-+		printf("PANDORA WLAN: MHI READY reached; M0 is set in stage 17 "
-+		    "after context/mmio init (official pm.c order)\n");
-+}
-+
-+
-+/* Stage 17: 16 KiB MHI context page, layout exactly as the same-card port:
-+ * chan ctx @0, event ctx @0x1800, cmd ctx @0x1900, ER0 @0x1a00(512),
-+ * ER1 @0x2000(4096), CR @0x3000(2048). All addresses are IOVA inside the
-+ * mapped 0xB0000000 window; iova_start/stop follow local ath12k_mhi.c. */
-+static void
-+sy_mhi_init(void)
-+{
-+	vm_offset_t pg_va;
-+	uint64_t pg, er0, er1, cr;
-+	uint32_t cfg, i;
-+
-+	if (!sy_bar_va || !sy_sbl_va || sy_buf_size < 0x800000) {
-+		printf("PANDORA WLAN: MHI init: buffer too small/absent (%#x)\n", sy_buf_size);
-+		return;
-+	}
-+	pg_va = sy_sbl_va + 0x7C0000;
-+	pg = SY_IOVA_MAP + 0x7C0000;
-+	er0 = pg + 0x1a00; er1 = pg + 0x2000; cr = pg + 0x3000;
-+	/* event contexts (44 B stride) at +0x1800 */
-+	for (i = 0; i < 2; i++) {
-+		vm_offset_t e = pg_va + 0x1800 + i * 0x44;
-+		uint64_t ring = i ? er1 : er0;
-+		uint32_t rlen = i ? 4096 : 512;
-+
-+		/* packed wl_context: cfg@0 type@4 index@8 base@0xc len@0x14 rp@0x1c wp@0x24 */
-+		uint64_t wpe = ring + rlen - 16;
-+
-+		sy_wr(e, 0x00, 0);
-+		sy_wr(e, 0x04, 1);
-+		sy_wr(e, 0x08, 0);
-+		sy_wr(e, 0x0c, (uint32_t)ring); sy_wr(e, 0x10, (uint32_t)(ring >> 32));
-+		sy_wr(e, 0x14, rlen); sy_wr(e, 0x18, 0);
-+		sy_wr(e, 0x1c, (uint32_t)ring); sy_wr(e, 0x20, (uint32_t)(ring >> 32));
-+		sy_wr(e, 0x24, (uint32_t)wpe); sy_wr(e, 0x28, (uint32_t)(wpe >> 32));
-+	}
-+	/* cmd context at +0x1900: base/rp/wp = CR, len 2048 */
-+	{
-+		vm_offset_t c = pg_va + 0x1900;
-+
-+		sy_wr(c, 0x00, 0); sy_wr(c, 0x04, 0); sy_wr(c, 0x08, 0);
-+		sy_wr(c, 0x0c, (uint32_t)cr); sy_wr(c, 0x10, (uint32_t)(cr >> 32));
-+		sy_wr(c, 0x14, 2048); sy_wr(c, 0x18, 0);
-+		sy_wr(c, 0x1c, (uint32_t)cr); sy_wr(c, 0x20, (uint32_t)(cr >> 32));
-+		sy_wr(c, 0x24, (uint32_t)cr); sy_wr(c, 0x28, (uint32_t)(cr >> 32));
-+	}
-+	/* PCIe DMA is not cache-coherent for these allocations: clean the
-+	 * context page AFTER filling it, before the device fetches it. */
-+	for (i = 0; i < 4; i++)
-+		flush_dcache64(sy_pa(pg_va + ((vm_offset_t)i << 12)), (unsigned)PAGE_SIZE, TRUE);
-+	__asm__ volatile("dsb sy" ::: "memory");
-+	printf("PANDORA WLAN: MHI ctx: iova %#llx chan+0 ectx+0x1800 cctx+0x1900 er0 %#llx er1 %#llx cr %#llx\n",
-+	    (unsigned long long)pg, (unsigned long long)er0, (unsigned long long)er1,
-+	    (unsigned long long)cr);
-+	sy_wr(sy_bar_va, 0x5c, (uint32_t)(pg >> 32)); sy_wr(sy_bar_va, 0x58, (uint32_t)pg);
-+	sy_wr(sy_bar_va, 0x64, (uint32_t)(pg >> 32)); sy_wr(sy_bar_va, 0x60, (uint32_t)(pg + 0x1800));
-+	sy_wr(sy_bar_va, 0x6c, (uint32_t)(pg >> 32)); sy_wr(sy_bar_va, 0x68, (uint32_t)(pg + 0x1900));
-+	/* With S1 translation enabled we only map SY_IOVA_MAP..+8 MiB, so the
-+	 * control/data BASE/LIMIT registers must describe that mapped window;
-+	 * vendor ath12k values (0..0xF_FFFFFFFF) assume a full IOMMU domain. */
-+	sy_wr(sy_bar_va, 0x84, (uint32_t)(SY_IOVA_MAP >> 32));
-+	sy_wr(sy_bar_va, 0x80, (uint32_t)SY_IOVA_MAP);
-+	sy_wr(sy_bar_va, 0x9c, (uint32_t)(SY_IOVA_MAP >> 32));
-+	sy_wr(sy_bar_va, 0x98, (uint32_t)SY_IOVA_MAP);
-+	sy_wr(sy_bar_va, 0x8c, (uint32_t)((SY_IOVA_MAP + SY_FW_BUF - 1) >> 32));
-+	sy_wr(sy_bar_va, 0x88, (uint32_t)(SY_IOVA_MAP + SY_FW_BUF - 1));
-+	sy_wr(sy_bar_va, 0xa4, (uint32_t)((SY_IOVA_MAP + SY_FW_BUF - 1) >> 32));
-+	sy_wr(sy_bar_va, 0xa0, (uint32_t)(SY_IOVA_MAP + SY_FW_BUF - 1));
-+	cfg = sy_rd(sy_bar_va, 0x10);
-+	cfg &= ~((0xffu << 16) | (0xffu << 24));
-+	cfg |= (2u << 16);                                                    /* NER=2, NHWER=0 */
-+	sy_wr(sy_bar_va, 0x10, cfg);
-+	/* initial event ring doorbells live at BAR0+ERDBOFF (0x20 is the offset
-+	 * register itself); same-card port writes ring_end-16 to erdb+0/+8. */
-+	{
-+		uint32_t erdb = sy_rd(sy_bar_va, 0x20) & 0xffffu;
-+
-+		if (erdb && erdb + 16 <= 0x1000) {
-+			sy_wr(sy_bar_va, erdb, (uint32_t)(er0 + 512 - 16));
-+			sy_wr(sy_bar_va, erdb + 4, (uint32_t)((er0 + 512 - 16) >> 32));
-+			sy_wr(sy_bar_va, erdb + 8, (uint32_t)(er1 + 4096 - 16));
-+			sy_wr(sy_bar_va, erdb + 12, (uint32_t)((er1 + 4096 - 16) >> 32));
-+			printf("PANDORA WLAN: MHI erdb base %#x\n", erdb);
-+		} else {
-+			printf("PANDORA WLAN: MHI erdb offset invalid %#x\n", erdb);
-+		}
-+	}
-+	__asm__ volatile("dsb sy" ::: "memory");
-+	printf("PANDORA WLAN: MHI mmio: cfg %#x ccab %#x ecab %#x crcb %#x erdb %#x/%#x\n",
-+	    sy_rd(sy_bar_va, 0x10), sy_rd(sy_bar_va, 0x58), sy_rd(sy_bar_va, 0x60),
-+	    sy_rd(sy_bar_va, 0x68), sy_rd(sy_bar_va, 0x20), sy_rd(sy_bar_va, 0x28));
-+	printf("PANDORA WLAN: MHI init done (M0 deferred to after BHIe)\n");
 +}
 +
 +/* CRM D0: the power state vote the local driver's CESTA path sends before it resets
@@ -2505,15 +2289,8 @@
 +	if (!sy_supplies_on()) {
 +		return;
 +	}
-+	/* Plan L234/L236 (vendor cnss_power_on_device): rails and rf_clk first, then
-+	 * WLAN_EN active, then udelay(1000); only after that comes the RC link
-+	 * bring-up (clocks/GDSC/PHY/PERST). PERST is not part of this function. */
-+	sy_pin_level(PIN_WLAN_EN, IO_HIGH);
-+	delay_for_interval(1, NSEC_PER_MSEC);
-+	sy_log_sync();
 +
 +	printf("PANDORA WLAN: step %u: clocks\n", sy_step);
-+	sy_log_sync();
 +	if (!sy_clocks_on()) {
 +		return;
 +	}
@@ -2523,19 +2300,16 @@
 +		(void)PE_parse_boot_argn("pandora_crm", &crm_on, sizeof(crm_on));
 +		if (crm_on) {
 +			printf("PANDORA WLAN: step %u: CRM D0 (power state vote)\n", sy_step);
-+		sy_log_sync();
 +			if (!sy_crm_d0())
 +				printf("PANDORA WLAN: CRM D0 did not complete; the controller may stay off\n");
 +		}
 +	}
 +	printf("PANDORA WLAN: step %u: resets and PARF\n", sy_step);
-+	sy_log_sync();
 +	sy_gcc_wr(GCC_BCR_PCIE, sy_gcc_rd(GCC_BCR_PCIE) | 1);
 +	sy_gcc_wr(GCC_BCR_PHY, sy_gcc_rd(GCC_BCR_PHY) | 1);
 +	sy_usleep(1000);
 +	sy_gcc_wr(GCC_BCR_PHY, sy_gcc_rd(GCC_BCR_PHY) & ~1UL);
 +	sy_gcc_wr(GCC_BCR_PCIE, sy_gcc_rd(GCC_BCR_PCIE) & ~1UL);
-+	sy_log_sync();
 +	printf("PANDORA WLAN: resets released: core bcr %#x phy bcr %#x noc bcr %#x phy gdsc %#x\n",
 +	    sy_gcc_rd(GCC_BCR_PCIE), sy_gcc_rd(GCC_BCR_PHY), sy_gcc_rd(0x6c020),
 +	    sy_gcc_rd(GCC_GDSC_PHY));
@@ -2546,7 +2320,6 @@
 +	}
 +
 +	printf("PANDORA WLAN: step %u: the PHY\n", sy_step);
-+	sy_log_sync();
 +	if (!sy_phy_start()) {
 +		return;
 +	}
@@ -2555,20 +2328,10 @@
 +	}
 +
 +	printf("PANDORA WLAN: step %u: the card's enable, root port, PERST release\n", sy_step);
-+	sy_log_sync();
-+	/* Plan M1.1 item 2: vendor asserts PERST at the start of enable_link
-+	 * (msm_pcie_enable_link.c L744). The pin is already driven low since power-up
-+	 * because CEM requires PERST low through the ramp; assert again here so the
-+	 * vendor ordering is reproduced explicitly. */
-+	sy_pin_out(PIN_PERST, CTL_OUT_LOW_2MA);
-+	sy_pin_level(PIN_PERST, 0);
-+	printf("PANDORA WLAN: clkreq/wake pin config start\n");
-+	sy_log_sync();
++	sy_pin_level(PIN_WLAN_EN, IO_HIGH);
++	delay_for_interval(1, NSEC_PER_MSEC);		/* cnss_power_on_device(): udelay(1000) */
 +	sy_pin_ctl(PIN_CLKREQ, CTL_CLKREQ_FUNC);
-+	sy_log_sync();
 +	sy_pin_ctl(PIN_WAKE, CTL_IN_PULL_UP);
-+	printf("PANDORA WLAN: clkreq/wake pin config done\n");
-+	sy_log_sync();
 +	sy_diag_regs("after the PHY, before PERST");
 +	printf("PANDORA WLAN: sw-ctrl pins read %u %u\n",
 +	    (unsigned)(*(volatile uint32_t *)sy_pin_reg(18, 4) & 1),
@@ -2591,29 +2354,10 @@
 +		sy_wr(parf, 0x2C4u, sy_rd(parf, 0x2C4u) | 0x100UL);	/* width upscaling support */
 +		sy_wr(dbi, 0x714u, sy_rd(dbi, 0x714u) & ~0x20UL);	/* LANE_SKEW_OFF bit5 */
 +	}
-+	delay_for_interval(10, NSEC_PER_MSEC);	/* ep_latency = 0xa (DT); pci-msm.c L6127 */
-+	{
-+		/* PARF+0x2b0 CLKREQ override (pci-msm.c L140-142). The vendor never enables
-+		 * it during bring-up; it only detects and removes a leftover override
-+		 * before DRV hand-off (L10093-10096, L10165-10172). Reproduce that cleanup. */
-+		uint32_t ov = sy_rd(parf, 0x2b0u);
-+
-+		if (ov & (1u << 1)) {			/* CLKREQ_IN_ENABLE */
-+			sy_wr(parf, 0x2b0u, ov & ~((1u << 1) | (1u << 3)));
-+			printf("PANDORA WLAN: CLKREQ override cleared (was %#x, now %#x)\n",
-+			    ov, sy_rd(parf, 0x2b0u));
-+		} else {
-+			printf("PANDORA WLAN: CLKREQ override not set (%#x)\n", ov);
-+		}
-+	}
-+	/* Plan M1.1 item 8: CESTA clkreq select only applies when the DT supplies
-+	 * qcom,pcie-parf-cesta-config. This phone's pcie node has no such property,
-+	 * so pcie_parf_cesta_config == 0 and the vendor skips it (pci-msm.c L6329-6330). */
-+	printf("PANDORA WLAN: pcie_parf_cesta_config=0 on this DT; CESTA clkreq select skipped (pci-msm.c L6329)\n");
++	delay_for_interval(100, NSEC_PER_MSEC);
 +	sy_pin_level(PIN_PERST, IO_HIGH);		/* vendor msm_pcie_config_perst: deassert = 1 - on (high) */
 +	delay_for_interval(1, NSEC_PER_MSEC);	/* vendor perst_delay_us 1000-1005, enabled after */
-+	/* Plan M1.1 item 4, vendor msm_pcie_enable_link.c L673-792: after PERST release
-+	 * it programs the
++	/* Vendor msm_pcie_enable_link.c (L673-792): after PERST release it programs the
 +	 * GEN3/link-speed registers through DBI (dm_core+0x80C speed field, DBI_RO_WR_EN
 +	 * around Link Control 2) and only then writes PARF+0x1b0 |= 0x100. DBI is readable
 +	 * now, so reproduce that minimum before enabling LTSSM. */
