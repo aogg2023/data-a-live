@@ -456,7 +456,7 @@
  }
  
  static void
-@@ -51,21 +470,2235 @@
+@@ -51,21 +470,2241 @@
  		cv_sleep(100);
  	}
  	if (rootvnode == NULLVP) {
@@ -907,16 +907,22 @@
 + * programming, then trigger with the three-step CTRL sequence. Completion is
 + * IDLE != 0 plus each command's issued|completed bits, as in the same-family
 + * transport; the TCS IRQ is deliberately left disabled. */
++/* §11.4 verified transport: TCS2, msgid 0x10108, completion from the TCS IRQ
++ * (done/irq/status) exactly as the plan records for this device. The only
++ * additions are locally evidenced: dsb osh after every RSC write (same-family
++ * transport) and a programming readback before the trigger. DRV_IRQ_ENABLE is
++ * shared with touch/adreno8_rpmh, so only our own bit is set and cleared. */
 +static int
-+sy_rsc_send(uint32_t t, const uint32_t *addr, const uint32_t *data, unsigned ncmd)
++sy_rsc_send(const char *res, uint32_t t, const uint32_t *addr, const uint32_t *data,
++    unsigned ncmd, uint32_t mv, uint32_t mode)
 +{
 +	const struct sy_rpmh_layout *L = &sy_rpmh_v3;
 +	uint32_t b = SY_TCS_OFF + t * SY_TCS_STRIDE, bit = 1u << t;
-+	uint32_t irq_en, wait = 0;
++	uint32_t irq_en, wait = 0, cs[3] = {0, 0, 0};
 +	bool done = false;
 +	unsigned c;
 +
-+	if (t > 2 || !ncmd || ncmd > 16)
++	if (!ncmd || ncmd > 3 || t > 2)
 +		return EINVAL;
 +	if (sy_rd(sy_rsc, b + L->status) == 0 || sy_rd(sy_rsc, b + L->control) ||
 +	    sy_rd(sy_rsc, b + L->enable) || sy_rd(sy_rsc, b + L->wait) ||
@@ -928,8 +934,13 @@
 +		return EBUSY;
 +	}
 +	irq_en = sy_rd(sy_rsc, SY_TCS_OFF);
-+	/* never let our TCS raise an interrupt while we poll status instead */
-+	sy_rsc_wr(SY_TCS_OFF, irq_en & ~bit);
++	sy_rsc_wr(b + L->control, 0);
++	sy_rsc_wr(SY_TCS_OFF + 8, bit);			/* W1C: our bit only */
++	sy_rsc_wr(SY_TCS_OFF, irq_en | bit);		/* enable: our bit only */
++	if ((sy_rd(sy_rsc, SY_TCS_OFF) & bit) == 0) {
++		printf("PANDORA WLAN: RPMh: TCS%u IRQ enable did not stick\n", t);
++		goto fail;
++	}
 +	for (c = 0; c < ncmd; c++) {
 +		uint32_t cb = b + c * L->cmd_stride;
 +
@@ -945,8 +956,7 @@
 +
 +		if (sy_rd(sy_rsc, cb + L->msgid) != SY_RPMH_WRITE ||
 +		    sy_rd(sy_rsc, cb + L->addr) != addr[c] ||
-+		    sy_rd(sy_rsc, cb + L->data) != data[c] ||
-+		    (sy_rd(sy_rsc, SY_TCS_OFF) & bit)) {
++		    sy_rd(sy_rsc, cb + L->data) != data[c]) {
 +			printf("PANDORA WLAN: RPMh: TCS%u program readback failed (cmd %u)\n",
 +			    t, c);
 +			goto fail;
@@ -958,40 +968,33 @@
 +		    t, sy_rd(sy_rsc, b + L->wait), sy_rd(sy_rsc, b + L->enable));
 +		goto fail;
 +	}
-+	sy_rsc_wr(b + L->control, 0);
 +	sy_rsc_wr(b + L->control, SY_RPMH_AMC);
 +	if (sy_rd(sy_rsc, b + L->control) != SY_RPMH_AMC) {
 +		printf("PANDORA WLAN: RPMh: TCS%u AMC readback failed\n", t);
 +		goto fail;
 +	}
 +	sy_rsc_wr(b + L->control, SY_RPMH_AMC | SY_RPMH_TRIGGER);
-+	for (unsigned us = 0; us < 100000 && !done; us++) {
-+		done = sy_rd(sy_rsc, b + L->status) != 0;
-+		for (c = 0; c < ncmd && done; c++) {
-+			uint32_t st = sy_rd(sy_rsc, b + c * L->cmd_stride + L->cmd_status);
-+			uint32_t mask = 0x100u | 0x10000u;
++	for (unsigned us = 0; us < 10000 && !done; us++) {
++		bool all = (sy_rd(sy_rsc, SY_TCS_OFF + 4) & bit) != 0;
 +
-+			if ((st & mask) != mask)
-+				done = false;
-+		}
++		for (c = 0; c < ncmd; c++)
++			cs[c] = sy_rd(sy_rsc, b + c * L->cmd_stride + L->cmd_status);
++		done = all && sy_rd(sy_rsc, b + L->status) != 0;
 +		if (!done)
 +			delay(1);
 +	}
-+	if (!done) {
-+		printf("PANDORA WLAN: RPMh: TCS%u timeout idle=%#x control=%#x irq=%#x\n",
-+		    t, sy_rd(sy_rsc, b + L->status), sy_rd(sy_rsc, b + L->control),
-+		    sy_rd(sy_rsc, SY_TCS_OFF + 4));
-+		for (c = 0; c < ncmd; c++)
-+			printf("PANDORA WLAN: RPMh: cmd %u status=%#x\n", c,
-+			    sy_rd(sy_rsc, b + c * L->cmd_stride + L->cmd_status));
++	printf("PANDORA WLAN: RPMh: %s %u mV/mode %u/enable on TCS%u done=%d irq=%#x "
++	    "status=%#x cmd-status=%#x/%#x/%#x\n", res, mv, mode, t, done,
++	    sy_rd(sy_rsc, SY_TCS_OFF + 4), sy_rd(sy_rsc, b + L->status),
++	    cs[0], cs[1], cs[2]);
++	if (!done)
 +		goto fail;
-+	}
 +	sy_rsc_wr(b + L->control, SY_RPMH_AMC);
 +	sy_rsc_wr(b + L->control, 0);
 +	sy_rsc_wr(b + L->enable, 0);
 +	sy_rsc_wr(b + L->wait, 0);
 +	sy_rsc_wr(SY_TCS_OFF + 8, bit);
-+	sy_rsc_wr(SY_TCS_OFF, (sy_rd(sy_rsc, SY_TCS_OFF) & ~bit) | (irq_en & bit));
++	sy_rsc_wr(SY_TCS_OFF, sy_rd(sy_rsc, SY_TCS_OFF) & ~bit);	/* our bit only */
 +	if (sy_rd(sy_rsc, b + L->control) || sy_rd(sy_rsc, b + L->enable) ||
 +	    sy_rd(sy_rsc, b + L->wait) || (sy_rd(sy_rsc, SY_TCS_OFF + 4) & bit) ||
 +	    sy_rd(sy_rsc, b + L->status) == 0) {
@@ -1067,12 +1070,8 @@
 +			    c, ncmd, SY_RPMH_WRITE, addr[c], data[c]);
 +		}
 +	}
-+	rc = sy_rsc_send(2, addr, data, ncmd);
-+	if (rc == 0) {
-+		printf("PANDORA WLAN: RPMh: %s %u mV/mode %u/enable voted on TCS2\n",
-+		    res, mv, mode);
-+		sy_log_sync();
-+	}
++	rc = sy_rsc_send(res, 2, addr, data, ncmd, mv, mode);
++	sy_log_sync();
 +	return rc;
 +}
 +
@@ -1129,6 +1128,10 @@
 +			return ENOMEM;
 +		}
 +	}
++	if (sy_rsc_poisoned) {
++		printf("PANDORA WLAN: RPMh: TCS quarantined; %s not voted\n", res);
++		return EIO;
++	}
 +	rc = sy_rpmh_lookup_clock(res, &address);
 +	if (rc) {
 +		return rc;
@@ -1137,11 +1140,8 @@
 +	d[0] = data;
 +	printf("PANDORA WLAN: RPMh: %s cmd msgid %#x addr %#x data %u\n",
 +	    res, SY_RPMH_WRITE, addr[0], d[0]);
-+	rc = sy_rsc_send(2, addr, d, 1);
-+	if (rc == 0) {
-+		printf("PANDORA WLAN: RPMh: %s voted on TCS2\n", res);
-+		sy_log_sync();
-+	}
++	rc = sy_rsc_send(res, 2, addr, d, 1, data, 0);
++	sy_log_sync();
 +	return rc;
 +}
 +
@@ -2499,6 +2499,7 @@
 +	}
 +
 +	printf("PANDORA WLAN: step %u: clocks\n", sy_step);
++	sy_log_sync();
 +	if (!sy_clocks_on()) {
 +		return;
 +	}
@@ -2508,16 +2509,19 @@
 +		(void)PE_parse_boot_argn("pandora_crm", &crm_on, sizeof(crm_on));
 +		if (crm_on) {
 +			printf("PANDORA WLAN: step %u: CRM D0 (power state vote)\n", sy_step);
++		sy_log_sync();
 +			if (!sy_crm_d0())
 +				printf("PANDORA WLAN: CRM D0 did not complete; the controller may stay off\n");
 +		}
 +	}
 +	printf("PANDORA WLAN: step %u: resets and PARF\n", sy_step);
++	sy_log_sync();
 +	sy_gcc_wr(GCC_BCR_PCIE, sy_gcc_rd(GCC_BCR_PCIE) | 1);
 +	sy_gcc_wr(GCC_BCR_PHY, sy_gcc_rd(GCC_BCR_PHY) | 1);
 +	sy_usleep(1000);
 +	sy_gcc_wr(GCC_BCR_PHY, sy_gcc_rd(GCC_BCR_PHY) & ~1UL);
 +	sy_gcc_wr(GCC_BCR_PCIE, sy_gcc_rd(GCC_BCR_PCIE) & ~1UL);
++	sy_log_sync();
 +	printf("PANDORA WLAN: resets released: core bcr %#x phy bcr %#x noc bcr %#x phy gdsc %#x\n",
 +	    sy_gcc_rd(GCC_BCR_PCIE), sy_gcc_rd(GCC_BCR_PHY), sy_gcc_rd(0x6c020),
 +	    sy_gcc_rd(GCC_GDSC_PHY));
@@ -2528,6 +2532,7 @@
 +	}
 +
 +	printf("PANDORA WLAN: step %u: the PHY\n", sy_step);
++	sy_log_sync();
 +	if (!sy_phy_start()) {
 +		return;
 +	}
@@ -2536,6 +2541,7 @@
 +	}
 +
 +	printf("PANDORA WLAN: step %u: the card's enable, root port, PERST release\n", sy_step);
++	sy_log_sync();
 +	sy_pin_level(PIN_WLAN_EN, IO_HIGH);
 +	delay_for_interval(1, NSEC_PER_MSEC);		/* cnss_power_on_device(): udelay(1000) */
 +	sy_pin_ctl(PIN_CLKREQ, CTL_CLKREQ_FUNC);
