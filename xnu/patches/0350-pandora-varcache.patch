@@ -456,7 +456,7 @@
  }
  
  static void
-@@ -51,21 +470,2134 @@
+@@ -51,21 +470,2162 @@
  		cv_sleep(100);
  	}
  	if (rootvnode == NULLVP) {
@@ -2066,6 +2066,10 @@
 +	new_s2cr = cb | (ext << 10);
 +	sctlr = sy_rd(cbp, 0x00);
 +	tcr2 = sy_rd(cbp, 0x10);
++	sy_smmu_slot = slot;
++	sy_smmu_cb = cb;
++	sy_cb_va = cbp;
++	sy_gr1_va = gr1;
 +	printf("PANDORA WLAN: SMMU install: start slot %u bank %u asid %#llx old sctlr %#x tcr2 %#x\n",
 +	    slot, cb, (unsigned long long)asid, sctlr, tcr2);
 +	sy_log_sync();
@@ -2216,6 +2220,30 @@
 +	}
 +	printf("PANDORA WLAN: BHI result: status %#x code %u ee %#x errcode %#x mhi %#x\n",
 +	    st, st >> 30, ee, sy_rd(sy_bar_va, bhio + 0x30), sy_rd(sy_bar_va, 0x48));
++	sy_log_sync();
++	/* Device-side error detail: distinguish an SMMU translation fault (the device
++	 * DMA never reached our buffer) from an image rejection (BHI errdbg set). */
++	if (sy_smmu_va) {
++		uint32_t gfsr = sy_rd(sy_smmu_va, 0x48);
++		uint32_t fsr = sy_cb_va ? sy_rd(sy_cb_va, 0x58) : 0xffffffffu;
++		uint32_t far_lo = sy_cb_va ? sy_rd(sy_cb_va, 0x60) : 0xffffffffu;
++		uint32_t far_hi = sy_cb_va ? sy_rd(sy_cb_va, 0x64) : 0xffffffffu;
++
++		printf("PANDORA WLAN: BHI diag: smr %#x s2cr %#x cbar %#x tlbstatus %#x cb_fsr %#x "
++		    "far %#x:%#x gfsr %#x gfsynr %#x/%#x/%#x\n",
++		    sy_rd(sy_smmu_va, 0x800 + 4 * sy_smmu_slot),
++		    sy_rd(sy_smmu_va, 0xc00 + 4 * sy_smmu_slot),
++		    sy_gr1_va ? sy_rd(sy_gr1_va, 4 * sy_smmu_cb) : 0xffffffffu,
++		    sy_cb_va ? sy_rd(sy_cb_va, 0x7f4) : 0xffffffffu, fsr, far_hi, far_lo, gfsr,
++		    sy_rd(sy_smmu_va, 0x50), sy_rd(sy_smmu_va, 0x54), sy_rd(sy_smmu_va, 0x58));
++		sy_log_sync();
++	}
++	printf("PANDORA WLAN: BHI diag: parf sid[0x2054] %#x [0x2074] %#x bypass %#x/%#x; "
++	    "errdbg %#x/%#x/%#x numseg %#x serial %#x; dbi80 %#x dbi0 %#x\n",
++	    sy_rd(parf, 0x2054), sy_rd(parf, 0x2074), sy_rd(parf, 0x2c00), sy_rd(parf, 0x2c04),
++	    sy_rd(sy_bar_va, bhio + 0x34), sy_rd(sy_bar_va, bhio + 0x38),
++	    sy_rd(sy_bar_va, bhio + 0x3c), sy_rd(sy_bar_va, bhio + 0x48),
++	    sy_rd(sy_bar_va, bhio + 0x40), sy_rd(dbi, 0x80), sy_rd(dbi, 0));
 +	sy_log_sync();
 +}
 +
