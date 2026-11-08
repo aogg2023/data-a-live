@@ -456,7 +456,7 @@
  }
  
  static void
-@@ -51,21 +470,2241 @@
+@@ -51,21 +470,2245 @@
  		cv_sleep(100);
  	}
  	if (rootvnode == NULLVP) {
@@ -2497,6 +2497,12 @@
 +	if (!sy_supplies_on()) {
 +		return;
 +	}
++	/* Plan L234/L236 (vendor cnss_power_on_device): rails and rf_clk first, then
++	 * WLAN_EN active, then udelay(1000); only after that comes the RC link
++	 * bring-up (clocks/GDSC/PHY/PERST). PERST is not part of this function. */
++	sy_pin_level(PIN_WLAN_EN, IO_HIGH);
++	delay_for_interval(1, NSEC_PER_MSEC);
++	sy_log_sync();
 +
 +	printf("PANDORA WLAN: step %u: clocks\n", sy_step);
 +	sy_log_sync();
@@ -2542,8 +2548,6 @@
 +
 +	printf("PANDORA WLAN: step %u: the card's enable, root port, PERST release\n", sy_step);
 +	sy_log_sync();
-+	sy_pin_level(PIN_WLAN_EN, IO_HIGH);
-+	delay_for_interval(1, NSEC_PER_MSEC);		/* cnss_power_on_device(): udelay(1000) */
 +	sy_pin_ctl(PIN_CLKREQ, CTL_CLKREQ_FUNC);
 +	sy_pin_ctl(PIN_WAKE, CTL_IN_PULL_UP);
 +	sy_diag_regs("after the PHY, before PERST");
