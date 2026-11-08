@@ -456,7 +456,7 @@
  }
  
  static void
-@@ -51,21 +470,2028 @@
+@@ -51,21 +470,2065 @@
  		cv_sleep(100);
  	}
  	if (rootvnode == NULLVP) {
@@ -2229,6 +2229,41 @@
 +	}
 +}
 +
++/* WCN7850 needs a clean power cycle. A fastboot reboot can leave WLAN_EN,
++ * PERST and the RC exactly as the previous OS left them; upstream documents
++ * that an enable GPIO which is already high means the chip is never reset
++ * ("later power-on only sets a GPIO that is already high... the link never
++ * comes up", LKML power: sequencing: qcom-wcn). Drive both low and hold them
++ * there before the documented M1 power-up starts. */
++static void
++sy_platform_reset(void)
++{
++	if (!tlmm_low || !tlmm) {
++		return;
++	}
++	sy_pin_out(PIN_WLAN_EN, CTL_OUT_LOW_8MA);
++	sy_pin_out(PIN_PERST, CTL_OUT_LOW_2MA);
++	sy_pin_level(PIN_WLAN_EN, 0);
++	sy_pin_level(PIN_PERST, 0);
++	sy_usleep(10000);	/* hold low 10 ms so the chip sees a real reset */
++	printf("PANDORA WLAN: platform reset: WLAN_EN/PERST low for 10 ms\n");
++}
++
++/* Leave the card in a known state when this boot gives up (or finishes a
++ * diagnostic step): both reset/enable pins low. Rails keep their last vote;
++ * that is recorded here so the next boot's platform reset is still a real
++ * chip reset (EN low then high). */
++static void
++sy_platform_poweroff(void)
++{
++	if (!tlmm_low || !tlmm) {
++		return;
++	}
++	sy_pin_level(PIN_WLAN_EN, 0);
++	sy_pin_level(PIN_PERST, 0);
++	printf("PANDORA WLAN: platform poweroff: WLAN_EN/PERST low\n");
++}
++
 +static void
 +sy_run(void)
 +{
@@ -2283,6 +2318,7 @@
 +		return;
 +	}
 +
++	sy_platform_reset();		/* clear the state a crashed/previous boot left */
 +	printf("PANDORA WLAN: step %u: PERST and WLAN_EN low, supplies\n", sy_step);
 +	sy_pin_out(PIN_PERST, CTL_OUT_LOW_2MA);
 +	sy_pin_level(PIN_PERST, 0);			/* vendor msm_pcie_config_perst: assert = raw 0 (low) */
@@ -2458,6 +2494,7 @@
 +	delay_for_interval(6000, NSEC_PER_MSEC);
 +	printf("PANDORA WLAN: thread: awake, entering sy_run\n");
 +	sy_run();
++	sy_platform_poweroff();
 +	printf("PANDORA WLAN: thread: sy_run returned\n");
 +	(void)thread_terminate(current_thread());
 +	thread_block(THREAD_CONTINUE_NULL);
