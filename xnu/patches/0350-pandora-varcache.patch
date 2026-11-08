@@ -456,7 +456,7 @@
  }
  
  static void
-@@ -51,21 +470,2218 @@
+@@ -51,21 +470,2235 @@
  		cv_sleep(100);
  	}
  	if (rootvnode == NULLVP) {
@@ -1144,6 +1144,23 @@
 +	}
 +	return rc;
 +}
++
++/* The card's seven rails: live DT vdd-wlan-*-supply -> rpmh-regulator node ->
++ * qcom,resource-name and qcom,init-voltage; min/max are the regulator's range. */
++struct sy_supply {
++	const char *name, *what;
++	uint32_t mv, min_uv, max_uv;
++	bool ldo;
++};
++static const struct sy_supply sy_supplies[] = {
++	{ "S1J_E1", "vdd-wlan-cx (S1J, pmh0104 S1)", 852, 400000, 1000000, false },
++	{ "S2J_E1", "vdd-wlan-dig (S2J, pmh0104 S2)", 852, 500000, 1100000, false },
++	{ "L3G_E0", "vdd-wlan-io12 (L3G, pmh0110 G L3)", 1200, 1200000, 1200000, true },
++	{ "L2G_E0", "vdd-wlan-aon (L2G, pmh0110 G L2)", 1800, 1800000, 1800000, true },
++	{ "S8F_E0", "vdd-wlan-rfa1 (S8F, pmh0110 F S8)", 1856, 1800000, 2000000, false },
++	{ "S7F_E0", "vdd-wlan-rfa2 (S7F, pmh0110 F S7)", 1256, 1224000, 1372000, false },
++	{ "L3K_E1", "vdd-wlan-ant-share (L3K, pmr735d L3)", 1200, 1200000, 1200000, true },
++};
 +
 +static bool
 +sy_supplies_on(void)
