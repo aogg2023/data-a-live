@@ -456,7 +456,7 @@
  }
  
  static void
-@@ -51,21 +470,2905 @@
+@@ -51,21 +470,2922 @@
  		cv_sleep(100);
  	}
  	if (rootvnode == NULLVP) {
@@ -2201,9 +2201,22 @@
 +		    (unsigned long)want[i], kr);
 +	}
 +	if (kr != KERN_SUCCESS || !sy_sbl_va) {
++		/* This port owns no RAM below 4 GiB: the ADT window starts at 0x1_00000000
++		 * (see docs REUSE-MATRIX/WIFI-2026-11-01). The 32-bit coherent limit is
++		 * satisfied through the translating CB instead (32-bit IOVA 0xB0000000,
++		 * SMMU OAS 36 bit), so fall back to any contiguous pages. */
 +		sy_sbl_va = 0;
-+		printf("PANDORA WLAN: BHI: no contiguous buffer below 4 GiB\n");
-+		return;
++		printf("PANDORA WLAN: BHI: no <4 GiB contig buffer (XNU RAM starts above 4 GiB); "
++		    "falling back to a translated IOVA over any pages\n");
++		sy_buf_size = SY_FW_BUF;
++		kr = kmem_alloc_contig(kernel_map, &sy_sbl_va, SY_FW_BUF, PAGE_MASK,
++		    0, 0, KMA_DATA | KMA_ZERO | KMA_PERMANENT, VM_KERN_MEMORY_IOKIT);
++		if (kr != KERN_SUCCESS || !sy_sbl_va) {
++			sy_sbl_va = 0;
++			sy_buf_size = 0;
++			printf("PANDORA WLAN: BHI: no contiguous buffer at all (%d)\n", kr);
++			return;
++		}
 +	}
 +	sy_sbl_pa = sy_pa(sy_sbl_va);
 +	printf("PANDORA WLAN: BHI: buffer va %#lx pa %#llx size %#x (%s 4 GiB)\n",
@@ -2321,6 +2334,10 @@
 +	sy_bhi_off = bhio;
 +	if (bhio < 0x40 || bhio > 0x3fc0 || (bhio & 3)) {
 +		printf("PANDORA WLAN: BHI: bad BHIOFF %#x\n", bhio);
++		return;
++	}
++	if (!sy_sbl_va || !sy_buf_size) {
++		printf("PANDORA WLAN: BHI: no buffer (allocation failed); skipping image load\n");
 +		return;
 +	}
 +	if (sy_fw_find("amss20.bin", &fo, &fs) || fs < SY_SBL_SIZE) {
