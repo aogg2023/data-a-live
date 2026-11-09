@@ -6232,7 +6232,7 @@ diff --git a/bsd/dev/pandora_cachevol.c b/bsd/dev/pandora_cachevol.c
  
  /* ---- windows (live DT /soc/pcie@1c00000 reg, reg-names) ---- */
  #define SY_PARF_PA	0x01c00000UL	/* "parf", 0x3000 */
-@@ -3229,6 +3230,7 @@
+@@ -3234,6 +3235,7 @@
  {
  	thread_t thread;
  	pandora_wlan_init();	/* M1: PCIe RC0 bring-up, boot-arg songyuan_wlan */
