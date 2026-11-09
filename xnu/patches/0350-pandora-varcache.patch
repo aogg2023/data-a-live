@@ -456,7 +456,7 @@
  }
  
  static void
-@@ -51,21 +470,2893 @@
+@@ -51,21 +470,2816 @@
  		cv_sleep(100);
  	}
  	if (rootvnode == NULLVP) {
@@ -2125,13 +2125,16 @@
 +	sy_wr(cbp, 0x00, 0);                                  /* SCTLR.M=0 while configuring */
 +	sy_wr(gr1, 0x800 + 4 * cb, 1);                        /* CBA2R: VA64 */
 +	sy_wr(gr1, 4 * cb, 0x1f300);                          /* CBAR: S1 trans/S2 bypass */
-+	sy_wr(cbp, 0x10, 0x38011u);                           /* TCR2: PS/ASID, no stale bits */
-+	sy_wr(cbp, 0x30, 0x803519u);                          /* TCR */
++	sy_wr(cbp, 0x10, 0x38011u);                           /* TCR2: SEP=7, AS=1, PASIZE=36 */
++	/* This phone's apps-smmu reports IAS/OAS = 36 bit (ID2 0x5211; the working GPU
++	 * context on the same SMMU uses T0SZ=32). The lemonade image's T0SZ=25 (39-bit
++	 * VA) exceeds the hardware input size; use the same shape as the GPU context. */
++	sy_wr(cbp, 0x30, 0x80802020u);                        /* TCR: EAE, EPD1, TG0=4K, SH0=2, T0SZ=32 */
 +	sy_wr(cbp, 0x24, (uint32_t)(ttbr >> 32));
 +	sy_wr(cbp, 0x20, (uint32_t)ttbr);
 +	sy_wr(cbp, 0x28, 0);
 +	sy_wr(cbp, 0x2c, 0);
-+	sy_wr(cbp, 0x38, 0xf404ff44u);                        /* MAIR0: idx0 NC, idx1 WB */
++	sy_wr(cbp, 0x38, 0xff44u);                            /* MAIR0: idx0 NC (0x44), idx1 WB (0xff) */
 +	sy_wr(cbp, 0x3c, 0);                                  /* MAIR1 */
 +	__asm__ volatile("dsb sy" ::: "memory");
 +	printf("PANDORA WLAN: SMMU install: cfg written sctlr %#x tcr %#x tcr2 %#x cbar %#x\n",
@@ -2148,7 +2151,7 @@
 +	}
 +	printf("PANDORA WLAN: SMMU install: sync %#x\n", sy_rd(cbp, 0x7f4));
 +	sy_log_sync();
-+	sy_wr(cbp, 0x00, 0x1127u);                            /* SCTLR.M=1 (lemonade image) */
++	sy_wr(cbp, 0x00, 0x167u);                             /* SCTLR: M|TRE|AFE|CFRE|CFIE|HUPCF (GPU context) */
 +	__asm__ volatile("dsb sy" ::: "memory");
 +	sy_wr(sy_smmu_va, 0xc00 + 4 * slot, new_s2cr);        /* S2CR: S1 translate */
 +	sy_wr(sy_smmu_va, 0x800 + 4 * slot, 0x1401u);         /* SMR raw */
@@ -2159,8 +2162,9 @@
 +	v = sy_rd(cbp, 0x58);
 +
 +	printf("PANDORA WLAN: SMMU installed: slot %u bank %u asid %#llx iova %#x sctlr %#x "
-+	    "tcr %#x cbar %#x smr %#x s2cr %#x fsr %#x\n", slot, cb, (unsigned long long)asid,
-+	    SY_IOVA_BASE, sy_rd(cbp, 0x00), sy_rd(cbp, 0x30), sy_rd(gr1, 4 * cb), smr,
++	    "tcr %#x tcr2 %#x mair0 %#x cbar %#x smr %#x s2cr %#x fsr %#x\n", slot, cb,
++	    (unsigned long long)asid, SY_IOVA_BASE, sy_rd(cbp, 0x00), sy_rd(cbp, 0x30),
++	    sy_rd(cbp, 0x10), sy_rd(cbp, 0x38), sy_rd(gr1, 4 * cb), smr,
 +	    sy_rd(sy_smmu_va, 0xc00 + 4 * slot), v);
 +	sy_log_sync();
 +	return 0;
@@ -2173,121 +2177,40 @@
 +static void
 +sy_buf_alloc(void)
 +{
-+	kern_return_t kr;
++	/* The WCN7850's BHI/coherent DMA path is a 32-bit-address client: the Android
++	 * ath12k driver sets dma_set_coherent_mask(DMA_BIT_MASK(32)) and the canoe WLAN
++	 * device tree reserves its DMA pool with alloc-ranges <0 0xffffffff>. Asking
++	 * kmem_alloc_contig for pages below 4 GiB (max_pnum = 0xfffff) is therefore
++	 * required, not optional: a buffer at 0x9_xxxxxxx makes the boot loader read a
++	 * truncated address and reject the image. Try the big pack first, then smaller
++	 * sizes, and verify the physical address before using it. */
++	static const vm_size_t want[] = { SY_FW_BUF, 0x400000, 0x200000, SY_SBL_SIZE };
++	kern_return_t kr = KERN_FAILURE;
++	unsigned i;
 +
 +	if (sy_sbl_va)
 +		return;
-+	kr = kmem_alloc_contig(kernel_map, &sy_sbl_va, SY_FW_BUF, PAGE_MASK, 0, 0,
-+	    KMA_DATA | KMA_ZERO | KMA_PERMANENT, VM_KERN_MEMORY_IOKIT);
-+	sy_buf_size = SY_FW_BUF;
++	for (i = 0; i < sizeof(want) / sizeof(want[0]); i++) {
++		sy_sbl_va = 0;
++		sy_buf_size = want[i];
++		kr = kmem_alloc_contig(kernel_map, &sy_sbl_va, want[i], PAGE_MASK,
++		    0, 0xfffff, KMA_DATA | KMA_ZERO | KMA_PERMANENT, VM_KERN_MEMORY_IOKIT);
++		if (kr == KERN_SUCCESS && sy_sbl_va)
++			break;
++		printf("PANDORA WLAN: BHI: %#lx-byte <4 GiB contig failed %d\n",
++		    (unsigned long)want[i], kr);
++	}
 +	if (kr != KERN_SUCCESS || !sy_sbl_va) {
-+		printf("PANDORA WLAN: BHI: %#lx-byte contig failed %d, retry %#lx\n",
-+		    (unsigned long)SY_FW_BUF, kr, (unsigned long)SY_SBL_SIZE);
-+		kr = kmem_alloc_contig(kernel_map, &sy_sbl_va, SY_SBL_SIZE, PAGE_MASK, 0, 0,
-+		    KMA_DATA | KMA_ZERO | KMA_PERMANENT, VM_KERN_MEMORY_IOKIT);
-+		sy_buf_size = SY_SBL_SIZE;
-+		if (kr != KERN_SUCCESS || !sy_sbl_va) {
-+			printf("PANDORA WLAN: BHI: SBL contig alloc failed %d\n", kr);
-+			return;
-+		}
++		sy_sbl_va = 0;
++		printf("PANDORA WLAN: BHI: no contiguous buffer below 4 GiB\n");
++		return;
 +	}
 +	sy_sbl_pa = sy_pa(sy_sbl_va);
-+	printf("PANDORA WLAN: BHI: buffer va %#lx pa %#llx size %#x\n",
-+	    (unsigned long)sy_sbl_va, (unsigned long long)sy_sbl_pa, sy_buf_size);
-+	sy_log_sync();
-+}
-+
-+
-+/* ---- experiment helpers (boot-arg songyuan_bhi2=1) -------------------------------
-+ * One boot tries the two remaining models for the endpoint's DMA stream instead of
-+ * one model per build:
-+ *   A: stream bypasses stage 1 (S2CR TYPE=BYPASS) and BHI is given the physical
-+ *      address of the contiguous SBL buffer (plan section 14a);
-+ *   B: translating CB as configured plus a non-zero BHI INTVEC (an MSI target the
-+ *      boot loader can use to report its ready event).
-+ */
-+static int sy_bhi2 = -1;
-+
-+static uint32_t
-+sy_bhi_try(uint32_t bhio, const char *tag, uint64_t addr, uint32_t ivec)
-+{
-+	uint32_t st = 0, ee = 0;
-+	unsigned i;
-+
-+	printf("PANDORA WLAN: EXP %s: addr %#llx ivec %#x\n", tag,
-+	    (unsigned long long)addr, ivec);
-+	sy_wr(sy_bar_va, bhio + 0x20, ivec);
-+	sy_wr(sy_bar_va, bhio + 0x2c, 0);
-+	sy_wr(sy_bar_va, bhio + 0x08, (uint32_t)addr);
-+	sy_wr(sy_bar_va, bhio + 0x0c, (uint32_t)(addr >> 32));
-+	sy_wr(sy_bar_va, bhio + 0x10, SY_SBL_SIZE);
-+	sy_wr(sy_bar_va, bhio + 0x18, 0x1a2b3c4d);
-+	__asm__ volatile("dsb sy" ::: "memory");
-+	printf("PANDORA WLAN: EXP %s: readback %#x:%08x size %#x txdb %#x\n", tag,
-+	    sy_rd(sy_bar_va, bhio + 0x0c), sy_rd(sy_bar_va, bhio + 0x08),
-+	    sy_rd(sy_bar_va, bhio + 0x10), sy_rd(sy_bar_va, bhio + 0x18));
-+	for (i = 0; i < 2000; i++) {
-+		st = sy_rd(sy_bar_va, bhio + 0x2c);
-+		ee = sy_rd(sy_bar_va, bhio + 0x28);
-+		if (i < 10 || i % 200 == 0)
-+			printf("PANDORA WLAN: EXP %s poll %u ms: status %#x ee %#x errcode %#x\n",
-+			    tag, i, st, ee, sy_rd(sy_bar_va, bhio + 0x30));
-+		if ((st >> 30) == 2 || ((st >> 30) == 3 && st != 0xffffffffu))
-+			break;
-+		delay(1000);
-+	}
-+	printf("PANDORA WLAN: EXP %s result: status %#x code %u ee %#x errcode %#x errdbg %#x/%#x/%#x\n",
-+	    tag, st, st >> 30, ee, sy_rd(sy_bar_va, bhio + 0x30),
-+	    sy_rd(sy_bar_va, bhio + 0x34), sy_rd(sy_bar_va, bhio + 0x38),
-+	    sy_rd(sy_bar_va, bhio + 0x3c));
-+	sy_log_sync();
-+	return st;
-+}
-+
-+static void
-+sy_mhi_reset(void)
-+{
-+	unsigned i;
-+
-+	sy_wr(sy_bar_va, 0x38, 2);		/* MHI_CTRL RESET */
-+	for (i = 0; i < 100 && (sy_rd(sy_bar_va, 0x38) & 2u); i++)
-+		delay(1000);
-+	printf("PANDORA WLAN: EXP: MHI reset done, ctrl %#x status %#x ee %#x\n",
-+	    sy_rd(sy_bar_va, 0x38), sy_rd(sy_bar_va, 0x48), sy_rd(sy_bar_va, sy_bhi_off + 0x28));
-+	sy_log_sync();
-+}
-+
-+static void
-+sy_pte_walk(void)
-+{
-+	uint64_t *l1, *l2, *l3, e1, e2, e3;
-+	uint32_t i, j;
-+
-+	if (!sy_l1 || !sy_l3 || !sy_sbl_va)
-+		return;
-+	l1 = (uint64_t *)sy_l1;
-+	l2 = (uint64_t *)sy_l2;
-+	e1 = l1[(SY_IOVA_BASE >> 30) & 511];
-+	l2 = (uint64_t *)sy_l2;
-+	e2 = ((uint64_t *)sy_l2)[(SY_IOVA_BASE >> 21) & 511];
-+	l3 = (uint64_t *)sy_l3;
-+	printf("PANDORA WLAN: PT walk: l1[%u] %#llx l2[%u] %#llx sbl pa %#llx\n",
-+	    (SY_IOVA_BASE >> 30) & 511, (unsigned long long)e1,
-+	    (SY_IOVA_BASE >> 21) & 511, (unsigned long long)e2,
-+	    (unsigned long long)sy_pa(sy_sbl_va));
-+	for (i = 0; i < 2; i++) {
-+		uint64_t idx = ((SY_IOVA_BASE & 0x1fffff) >> 12) + i;
-+
-+		e3 = l3[idx];
-+		printf("PANDORA WLAN: PT walk: l3[%u] %#llx -> pa %#llx (sbl va+%#x pa %#llx)\n",
-+		    (uint32_t)idx, (unsigned long long)e3,
-+		    (unsigned long long)(e3 & 0x0000fffffffff000ull), i * 0x1000,
-+		    (unsigned long long)sy_pa(sy_sbl_va + i * 0x1000));
-+	}
-+	j = ((SY_SBL_SIZE - 0x1000) >> 12);
-+	printf("PANDORA WLAN: PT walk: last l3[%u] %#llx -> pa %#llx (sbl va+%#x pa %#llx)\n",
-+	    j, (unsigned long long)l3[j], (unsigned long long)(l3[j] & 0x0000fffffffff000ull),
-+	    j * 0x1000, (unsigned long long)sy_pa(sy_sbl_va + ((vm_offset_t)j << 12)));
++	printf("PANDORA WLAN: BHI: buffer va %#lx pa %#llx size %#x (%s 4 GiB)\n",
++	    (unsigned long)sy_sbl_va, (unsigned long long)sy_sbl_pa, sy_buf_size,
++	    sy_sbl_pa < 0x100000000ull ? "below" : "ABOVE");
++	if (sy_sbl_pa >= 0x100000000ull)
++		printf("PANDORA WLAN: BHI: WARNING physical address outside the 32-bit range\n");
 +	sy_log_sync();
 +}
 +
