@@ -456,7 +456,7 @@
  }
  
  static void
-@@ -51,21 +470,2770 @@
+@@ -51,21 +470,2893 @@
  		cv_sleep(100);
  	}
  	if (rootvnode == NULLVP) {
@@ -733,6 +733,9 @@
 +static void sy_smmu_dump(void);
 +static void sy_cmddb_dump(void);
 +static void sy_icc_vote(void);
++static uint32_t sy_bhi_try(uint32_t, const char *, uint64_t, uint32_t);
++static void sy_mhi_reset(void);
++static void sy_pte_walk(void);
 +static void sy_smmu_bank_scan(void);
 +static void sy_bhi_sbl(void);
 +static void sy_buf_alloc(void);
@@ -2194,6 +2197,100 @@
 +	sy_log_sync();
 +}
 +
++
++/* ---- experiment helpers (boot-arg songyuan_bhi2=1) -------------------------------
++ * One boot tries the two remaining models for the endpoint's DMA stream instead of
++ * one model per build:
++ *   A: stream bypasses stage 1 (S2CR TYPE=BYPASS) and BHI is given the physical
++ *      address of the contiguous SBL buffer (plan section 14a);
++ *   B: translating CB as configured plus a non-zero BHI INTVEC (an MSI target the
++ *      boot loader can use to report its ready event).
++ */
++static int sy_bhi2 = -1;
++
++static uint32_t
++sy_bhi_try(uint32_t bhio, const char *tag, uint64_t addr, uint32_t ivec)
++{
++	uint32_t st = 0, ee = 0;
++	unsigned i;
++
++	printf("PANDORA WLAN: EXP %s: addr %#llx ivec %#x\n", tag,
++	    (unsigned long long)addr, ivec);
++	sy_wr(sy_bar_va, bhio + 0x20, ivec);
++	sy_wr(sy_bar_va, bhio + 0x2c, 0);
++	sy_wr(sy_bar_va, bhio + 0x08, (uint32_t)addr);
++	sy_wr(sy_bar_va, bhio + 0x0c, (uint32_t)(addr >> 32));
++	sy_wr(sy_bar_va, bhio + 0x10, SY_SBL_SIZE);
++	sy_wr(sy_bar_va, bhio + 0x18, 0x1a2b3c4d);
++	__asm__ volatile("dsb sy" ::: "memory");
++	printf("PANDORA WLAN: EXP %s: readback %#x:%08x size %#x txdb %#x\n", tag,
++	    sy_rd(sy_bar_va, bhio + 0x0c), sy_rd(sy_bar_va, bhio + 0x08),
++	    sy_rd(sy_bar_va, bhio + 0x10), sy_rd(sy_bar_va, bhio + 0x18));
++	for (i = 0; i < 2000; i++) {
++		st = sy_rd(sy_bar_va, bhio + 0x2c);
++		ee = sy_rd(sy_bar_va, bhio + 0x28);
++		if (i < 10 || i % 200 == 0)
++			printf("PANDORA WLAN: EXP %s poll %u ms: status %#x ee %#x errcode %#x\n",
++			    tag, i, st, ee, sy_rd(sy_bar_va, bhio + 0x30));
++		if ((st >> 30) == 2 || ((st >> 30) == 3 && st != 0xffffffffu))
++			break;
++		delay(1000);
++	}
++	printf("PANDORA WLAN: EXP %s result: status %#x code %u ee %#x errcode %#x errdbg %#x/%#x/%#x\n",
++	    tag, st, st >> 30, ee, sy_rd(sy_bar_va, bhio + 0x30),
++	    sy_rd(sy_bar_va, bhio + 0x34), sy_rd(sy_bar_va, bhio + 0x38),
++	    sy_rd(sy_bar_va, bhio + 0x3c));
++	sy_log_sync();
++	return st;
++}
++
++static void
++sy_mhi_reset(void)
++{
++	unsigned i;
++
++	sy_wr(sy_bar_va, 0x38, 2);		/* MHI_CTRL RESET */
++	for (i = 0; i < 100 && (sy_rd(sy_bar_va, 0x38) & 2u); i++)
++		delay(1000);
++	printf("PANDORA WLAN: EXP: MHI reset done, ctrl %#x status %#x ee %#x\n",
++	    sy_rd(sy_bar_va, 0x38), sy_rd(sy_bar_va, 0x48), sy_rd(sy_bar_va, sy_bhi_off + 0x28));
++	sy_log_sync();
++}
++
++static void
++sy_pte_walk(void)
++{
++	uint64_t *l1, *l2, *l3, e1, e2, e3;
++	uint32_t i, j;
++
++	if (!sy_l1 || !sy_l3 || !sy_sbl_va)
++		return;
++	l1 = (uint64_t *)sy_l1;
++	l2 = (uint64_t *)sy_l2;
++	e1 = l1[(SY_IOVA_BASE >> 30) & 511];
++	l2 = (uint64_t *)sy_l2;
++	e2 = ((uint64_t *)sy_l2)[(SY_IOVA_BASE >> 21) & 511];
++	l3 = (uint64_t *)sy_l3;
++	printf("PANDORA WLAN: PT walk: l1[%u] %#llx l2[%u] %#llx sbl pa %#llx\n",
++	    (SY_IOVA_BASE >> 30) & 511, (unsigned long long)e1,
++	    (SY_IOVA_BASE >> 21) & 511, (unsigned long long)e2,
++	    (unsigned long long)sy_pa(sy_sbl_va));
++	for (i = 0; i < 2; i++) {
++		uint64_t idx = ((SY_IOVA_BASE & 0x1fffff) >> 12) + i;
++
++		e3 = l3[idx];
++		printf("PANDORA WLAN: PT walk: l3[%u] %#llx -> pa %#llx (sbl va+%#x pa %#llx)\n",
++		    (uint32_t)idx, (unsigned long long)e3,
++		    (unsigned long long)(e3 & 0x0000fffffffff000ull), i * 0x1000,
++		    (unsigned long long)sy_pa(sy_sbl_va + i * 0x1000));
++	}
++	j = ((SY_SBL_SIZE - 0x1000) >> 12);
++	printf("PANDORA WLAN: PT walk: last l3[%u] %#llx -> pa %#llx (sbl va+%#x pa %#llx)\n",
++	    j, (unsigned long long)l3[j], (unsigned long long)(l3[j] & 0x0000fffffffff000ull),
++	    j * 0x1000, (unsigned long long)sy_pa(sy_sbl_va + ((vm_offset_t)j << 12)));
++	sy_log_sync();
++}
++
 +static void
 +sy_bhi_sbl(void)
 +{
@@ -2360,6 +2457,32 @@
 +	    sy_rd(parf, 0x224), sy_rd(parf, 0x22c), sy_rd(parf, 0x500), sy_rd(parf, 0x508),
 +	    sy_rd(parf, 0x3c0), sy_rd(parf, 0x630), sy_rd(parf, 0x230), sy_rd(parf, 0x028));
 +	sy_log_sync();
++	sy_pte_walk();
++	if (sy_bhi2 < 0)
++		(void)PE_parse_boot_argn("songyuan_bhi2", &sy_bhi2, sizeof(sy_bhi2));
++	if (sy_bhi2 > 0 && !sy_guard) {
++		uint32_t s2cr_slot = 0xc00u + 4u * sy_smmu_slot;
++
++		/* A: bypass the stage-1 CB and give BHI the physical address. */
++		sy_mhi_reset();
++		sy_wr(sy_smmu_va, s2cr_slot, (1u << 16) | 0u);
++		sy_wr(sy_cb_va, 0x610, 0xffffffffu);
++		sy_wr(sy_cb_va, 0x7f0, 0xffffffffu);
++		__asm__ volatile("dsb sy" ::: "memory");
++		printf("PANDORA WLAN: EXP A: s2cr now %#x (bypass)\n", sy_rd(sy_smmu_va, s2cr_slot));
++		sy_log_sync();
++		(void)sy_bhi_try(sy_bhi_off, "A-bypass-phys", sy_sbl_pa, 0);
++		/* B: back to translating CB, but with a real INTVEC target. */
++		sy_mhi_reset();
++		sy_wr(sy_smmu_va, s2cr_slot, sy_smmu_cb | 0u);
++		sy_wr(sy_cb_va, 0x610, 0xffffffffu);
++		sy_wr(sy_cb_va, 0x7f0, 0xffffffffu);
++		__asm__ volatile("dsb sy" ::: "memory");
++		printf("PANDORA WLAN: EXP B: s2cr now %#x (translate, cb %u), ivec %#x\n",
++		    sy_rd(sy_smmu_va, s2cr_slot), sy_smmu_cb, (uint32_t)sy_sbl_pa);
++		sy_log_sync();
++		(void)sy_bhi_try(sy_bhi_off, "B-translate-ivec", SY_IOVA_BASE, (uint32_t)sy_sbl_pa);
++	}
 +	sy_sbl_ok = ((st >> 30) == 2);
 +	sy_smmu_bank_scan();
 +	if (sy_smmu_va) {
