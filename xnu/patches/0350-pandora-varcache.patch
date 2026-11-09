@@ -456,7 +456,7 @@
  }
  
  static void
-@@ -51,21 +470,2728 @@
+@@ -51,21 +470,2662 @@
  		cv_sleep(100);
  	}
  	if (rootvnode == NULLVP) {
@@ -2710,114 +2710,63 @@
 +}
 +
 +
-+/* ---- PCIe0 ICC (BCM) votes: ported from the locally working fuxi WLAN port ----
-+ * Graph/aggregation/packet format: Linux icc-rpmh.c + bcm-voter.c. The BCM
-+ * metadata comes from cmd-db by name; the addresses are never guessed. The
-+ * ACTIVE TCS batch transport reuses the same RSC/TCS2 programming that already
-+ * carries this driver's rail votes. */
++/* ---- PCIe0 NoC (BCM) vote, exactly as the locally working sheng WCN7850 port ----
++ * UniXNU-sheng bsd/dev/WifiProbe.cpp: "The endpoint's DMA runs over the PCIe
++ * NoC, whose bus clock manager (SN7) the interconnect driver votes for when the
++ * link is brought up (pcie-mem path, always tag); nothing has done that here."
++ * Without this vote register access works but the device's DMA does not, which is
++ * exactly the failure this driver has been seeing (BHI error, no SMMU fault).
++ * cmd-db is parsed with the same structure as pandora_gpu.c cmddb_find(). */
 +struct sy_rh_cmd { uint32_t addr, data, wait; };
-+struct sy_bcm {
-+	const char *name;
-+	bool mask;
-+	uint32_t addr, unit, width, vcd, version, x, y, data;
-+};
-+#define SY_ICC_N 6u
-+static struct sy_bcm sy_bcms[SY_ICC_N] = {
-+	{ .name = "SN7" }, { .name = "SH1", .mask = true }, { .name = "SH0" },
-+	{ .name = "MC0" }, { .name = "ACV", .mask = true }, { .name = "CN0", .mask = true }
-+};
-+static int sy_icc_enabled = -1, sy_icc_failed, sy_icc_ready;
-+
-+static uint32_t
-+sy_cdb8(uint32_t off)
-+{
-+	return *(volatile uint8_t *)(sy_cmddb + off);
-+}
 +
 +static int
-+sy_bcm_lookup(struct sy_bcm *b)
++sy_cmddb_find(const char *name, uint32_t *addr, uint32_t *unit, uint32_t *width, uint32_t *levels)
 +{
-+	uint32_t i, h;
++	uint32_t key[2] = { 0, 0 };
++	uint32_t i, j;
 +
-+	if (!sy_cmddb || sy_rd(sy_cmddb, 0) != 1 || sy_rd(sy_cmddb, 4) != 0x0c0330db)
-+		return 1;
-+	for (h = 8; h < 136; h += 16) {
-+		uint32_t slave = sy_cmddb16(h);
-+		uint32_t at, aux, n;
++	if (!sy_cmddb)
++		return ENOENT;
++	for (i = 0; i < 8 && name[i]; i++)
++		key[i / 4] |= (uint32_t)(uint8_t)name[i] << (8u * (i % 4));
++	for (i = 0; i < 8; i++) {
++		uint32_t h = 8u + 16u * i, entries, data, count;
 +
-+		if (!slave)
++		if (!sy_cmddb16(h))
 +			break;
-+		at = 144 + sy_cmddb16(h + 2);
-+		aux = 144 + sy_cmddb16(h + 4);
-+		n = sy_cmddb16(h + 6);
-+		if (slave < 3 || slave > 5 || at + n * 24 > 0x20000)
-+			return 2;
-+		for (i = 0; i < n; i++) {
-+			uint32_t e = at + i * 24, j = 0;
++		entries = 144 + sy_cmddb16(h + 2);
++		data = 144 + sy_cmddb16(h + 4);
++		count = sy_cmddb16(h + 6);
++		for (j = 0; j < count && entries + 24 * (j + 1) <= 0x20000; j++) {
++			uint32_t e = entries + 24 * j;
 +
-+			for (; j < 8 && b->name[j]; j++)
-+				if (sy_cdb8(e + j) != (uint8_t)b->name[j])
-+					break;
-+			if (j < 8 && b->name[j])
++			if (sy_rd(sy_cmddb, e) != key[0] || sy_rd(sy_cmddb, e + 4) != key[1])
 +				continue;
-+			for (; j < 8 && !sy_cdb8(e + j); j++)
-+				;
-+			if (j != 8)
-+				continue;
++			*addr = sy_rd(sy_cmddb, e + 16);
 +			{
-+				uint32_t addr = sy_rd(sy_cmddb, e + 16);
-+				uint32_t len = sy_cmddb16(e + 20);
-+				uint32_t data = aux + sy_cmddb16(e + 22);
++				uint32_t auxlen = sy_cmddb16(e + 20);
++				uint32_t aux = data + sy_cmddb16(e + 22);
++				uint32_t k;
 +
-+				if (slave != 5 || (addr >> 16) != 5 || (addr & 3) || len < 8 ||
-+				    data + len > 0x20000)
-+					return 3;
-+				b->addr = addr; b->unit = sy_rd(sy_cmddb, data);
-+				b->width = sy_cmddb16(data + 4); b->vcd = sy_cdb8(data + 6);
-+				b->version = sy_cmddb16(h + 8);
-+				if (!b->mask && (!b->unit || !b->width))
-+					return 4;
-+				return 0;
++				*unit = 0; *width = 0;
++				for (k = 0; k < 16; k++)
++					levels[k] = 0;
++				for (k = 0; k + 2 <= auxlen && k < 32 && aux + k + 2 <= 0x20000; k += 2)
++					levels[k / 2] = sy_cmddb16(aux + k);
++				*unit = levels[0] | (uint32_t)levels[1] << 16;
++				*width = levels[2];
 +			}
++			return 0;
 +		}
 +	}
-+	return 5;
++	return ENOENT;
 +}
 +
-+static uint64_t
-+sy_bcm_div(uint64_t value, uint32_t divisor)
-+{
-+	return value && value < divisor ? 1 : value / divisor;
-+}
-+
-+static uint32_t
-+sy_bcm_encode(uint64_t x, uint64_t y, bool commit)
-+{
-+	uint32_t valid = !!(x || y);
-+
-+	if (x > 0x3fff) x = 0x3fff;
-+	if (y > 0x3fff) y = 0x3fff;
-+	return (commit ? 1u << 30 : 0) | valid << 29 | (uint32_t)x << 14 | (uint32_t)y;
-+}
-+
-+static void
-+sy_bcm_bw(struct sy_bcm *b, uint32_t avg, uint32_t peak, unsigned buswidth, unsigned channels)
-+{
-+	uint64_t x = sy_bcm_div((uint64_t)avg * b->width, buswidth * channels);
-+	uint64_t y = sy_bcm_div((uint64_t)peak * b->width, buswidth);
-+
-+	x = sy_bcm_div(x * 1000, b->unit);
-+	y = sy_bcm_div(y * 1000, b->unit);
-+	b->x = (uint32_t)(x > 0x3fff ? 0x3fff : x);
-+	b->y = (uint32_t)(y > 0x3fff ? 0x3fff : y);
-+}
-+
-+/* One ACTIVE TCS2 batch, same register protocol as sy_rpmh_vote_res(). */
 +static uint32_t
 +sy_rpmh_send_cmds(const struct sy_rh_cmd *cmds, unsigned n)
 +{
 +	const struct sy_rpmh_layout *L = &sy_rpmh_v3;
-+	uint32_t t = 2, b, bit, irq_en, wait = 0, done = 0;
++	uint32_t t = 2, b, bit, wait = 0, done = 0;
 +	unsigned c, us;
 +
 +	if (!sy_rsc || !n || n > 8)
@@ -2825,9 +2774,8 @@
 +	b = SY_TCS_OFF + t * SY_TCS_STRIDE;
 +	bit = 1u << t;
 +	if (sy_rd(sy_rsc, b + L->control) || sy_rd(sy_rsc, b + L->enable) ||
-+	    sy_rd(sy_rsc, b + L->wait) || sy_rd(sy_rsc, SY_TCS_OFF + 4) & bit)
++	    sy_rd(sy_rsc, b + L->wait) || (sy_rd(sy_rsc, SY_TCS_OFF + 4) & bit))
 +		return 1;
-+	irq_en = sy_rd(sy_rsc, SY_TCS_OFF);
 +	sy_wr(sy_rsc, b + L->control, 0);
 +	sy_wr(sy_rsc, SY_TCS_OFF + 8, bit);
 +	for (c = 0; c < n; c++) {
@@ -2863,62 +2811,48 @@
 +static void
 +sy_icc_vote(void)
 +{
-+	static const uint32_t cnss[][3] = {
-+		{ 0, 0, 0 }, { 2250, 1600000, 2188800 }, { 7500, 1600000, 2188800 },
-+		{ 30000, 1600000, 2188800 }, { 100000, 1600000, 2188800 },
-+		{ 175000, 6448000, 6220800 }, { 312500, 6448000, 8368000 },
-+		{ 587500, 8528000, 12800000 }, { 7500, 3200000, 2188800 }
-+	};
-+	struct sy_rh_cmd cmds[SY_ICC_N];
-+	uint32_t i, peak = 250000, avg, p1, p2, e;
++	static const char *const names[] = { "SN7", "SH0", "MC0", "ACV", "CN0", "SH1" };
++	static int enabled = -1, failed;
++	struct sy_rh_cmd cmd;
++	uint32_t levels[16], addr = 0, unit = 0, width = 0, vote = 0x400, i, e;
++	int found = -1;
 +
-+	if (sy_icc_enabled < 0) {
-+		(void)PE_parse_boot_argn("songyuan_icc", &sy_icc_enabled, sizeof(sy_icc_enabled));
-+		if (sy_icc_enabled < 0)
-+			sy_icc_enabled = 1;
-+		printf("PANDORA WLAN: ICC: songyuan_icc=%d (PCIe0 BCM votes)\n", sy_icc_enabled);
++	if (enabled < 0) {
++		(void)PE_parse_boot_argn("songyuan_icc", &enabled, sizeof(enabled));
++		if (enabled < 0)
++			enabled = 1;
++		printf("PANDORA WLAN: ICC: songyuan_icc=%d (PCIe0 NoC SN7 vote)\n", enabled);
 +	}
-+	if (!sy_icc_enabled || sy_icc_failed)
++	if (!enabled || failed)
 +		return;
-+	if (!sy_icc_ready) {
-+		for (i = 0; i < SY_ICC_N; i++) {
-+			int r = sy_bcm_lookup(&sy_bcms[i]);
-+
-+			printf("PANDORA WLAN: ICC %s cmd-db addr %#x unit %u width %u vcd %u lookup %d\n",
-+			    sy_bcms[i].name, sy_bcms[i].addr, sy_bcms[i].unit,
-+			    sy_bcms[i].width, sy_bcms[i].vcd, r);
-+			if (r) {
-+				sy_icc_failed = 1;
-+				printf("PANDORA WLAN: ICC: cmd-db lookup failed; no BCM vote sent\n");
-+				return;
-+			}
++	for (i = 0; i < sizeof(names) / sizeof(names[0]); i++) {
++		if (sy_cmddb_find(names[i], &addr, &unit, &width, levels) == 0) {
++			found = (int)i;
++			break;
 +		}
-+		sy_icc_ready = 1;
++		printf("PANDORA WLAN: ICC: cmd-db %s not found\n", names[i]);
 +	}
-+	avg = cnss[0][0];
-+	p1 = cnss[0][1] > peak ? cnss[0][1] : peak;
-+	p2 = cnss[0][2] > peak ? cnss[0][2] : peak;
-+	sy_bcm_bw(&sy_bcms[0], avg, p1, 16, 1);
-+	sy_bcms[1].x = 0; sy_bcms[1].y = 1;
-+	sy_bcm_bw(&sy_bcms[2], avg, p2, 16, 4);
-+	sy_bcm_bw(&sy_bcms[3], avg, p2, 4, 4);
-+	sy_bcms[4].x = 0; sy_bcms[4].y = 8;
-+	sy_bcms[5].x = 1; sy_bcms[5].y = 1;
-+	for (i = 0; i < SY_ICC_N; i++)
-+		sy_bcms[i].data = sy_bcm_encode(sy_bcms[i].x, sy_bcms[i].y, i + 1 == SY_ICC_N);
-+	for (i = 0; i < SY_ICC_N; i++) {
-+		cmds[i].addr = sy_bcms[i].addr;
-+		cmds[i].data = sy_bcms[i].data;
-+		cmds[i].wait = 1;
++	if (found < 0) {
++		failed = 1;
++		printf("PANDORA WLAN: ICC: no NoC BCM resource found; no vote sent\n");
++		return;
 +	}
-+	e = sy_rpmh_send_cmds(cmds, SY_ICC_N);
-+	for (i = 0; i < SY_ICC_N; i++)
-+		printf("PANDORA WLAN: ICC %s addr %#x vote %u/%u data %#x vcd %u\n",
-+		    sy_bcms[i].name, sy_bcms[i].addr, sy_bcms[i].x, sy_bcms[i].y,
-+		    sy_bcms[i].data, sy_bcms[i].vcd);
-+	printf("PANDORA WLAN: ICC vote batch result %u (0 = acknowledged)\n", e);
++	if (unit && width) {
++		const uint64_t kBps = 2000000;
++		uint64_t scaled = (kBps * width + 15) / 16;
++		uint64_t x = (scaled * 1000 + unit - 1) / unit;
++
++		vote = x < 1 ? 1 : x > 0x3fff ? 0x3fff : (uint32_t)x;
++	}
++	printf("PANDORA WLAN: ICC %s addr %#x unit %u width %u vote %u\n",
++	    names[found], addr, unit, width, vote);
++	cmd.addr = addr;
++	cmd.data = (1u << 30) | (1u << 29) | (vote << 14) | vote;
++	cmd.wait = 1;
++	e = sy_rpmh_send_cmds(&cmd, 1);
++	printf("PANDORA WLAN: ICC vote data %#x result %u (0 = acknowledged)\n", cmd.data, e);
 +	if (e)
-+		sy_icc_failed = 1;
++		failed = 1;
 +	sy_log_sync();
 +}
 +
