@@ -456,7 +456,7 @@
  }
  
  static void
-@@ -51,21 +470,2478 @@
+@@ -51,21 +470,2439 @@
  		cv_sleep(100);
  	}
  	if (rootvnode == NULLVP) {
@@ -730,7 +730,6 @@
 +static void sy_mhi_ready(void);
 +static void sy_mhi_init(void);
 +static void sy_smmu_dump(void);
-+static int sy_iatu_inbound_window(void);
 +static void sy_smmu_bank_scan(void);
 +static void sy_bhi_sbl(void);
 +static void sy_buf_alloc(void);
@@ -1785,7 +1784,6 @@
 +			sy_smmu_dump();
 +			(void)sy_smmu_install();
 +			sy_smmu_dump();
-+			(void)sy_iatu_inbound_window();
 +		}
 +		if (sy_step >= 15) {
 +			sy_bhi_sbl();
@@ -1947,7 +1945,7 @@
 +	for (i = 0; i < (sy_buf_size >> 12); i++) {
 +		pa = sy_pa(sy_sbl_va + ((vm_offset_t)i << 12));
 +		((uint64_t *)(sy_l3 + ((i >> 9) << 12)))[i & 0x1ff] =
-+		    (pa & 0x0000fffffffff000ull) | 0x0060000000000f43ull;
++		    (pa & 0x0000fffffffff000ull) | 0x0060000000000e43ull;
 +	}
 +	for (i = 0; i < (0x2000u >> 12); i++)
 +		flush_dcache64(sy_pa(sy_l1 + (i << 12)), (unsigned)PAGE_SIZE, TRUE);
@@ -2099,19 +2097,24 @@
 +	if (sy_pt_build())
 +		return 9;
 +	ttbr = sy_pa(sy_l1) | (asid << 48);
-+	printf("PANDORA WLAN: SMMU install: cfg start ttbr %#llx\n", (unsigned long long)ttbr);
++	printf("PANDORA WLAN: SMMU install: cfg start ttbr %#llx (lemonade-exact CB image)\n",
++	    (unsigned long long)ttbr);
 +	sy_log_sync();
++	/* Values copied from the locally proven WCN7850/QCA6490 port
++	 * (ref/hackios-xnu-kernel bsd/dev/lemonade_wifi.c): Normal non-cacheable
++	 * MAIR index0, outer-shareable, SCTLR 0x1127. The PCIe master rejects
++	 * cacheable transactions, and the earlier WB mapping was never proven. */
++	sy_wr(cbp, 0x00, 0);                                  /* SCTLR.M=0 while configuring */
 +	sy_wr(gr1, 0x800 + 4 * cb, 1);                        /* CBA2R: VA64 */
 +	sy_wr(gr1, 4 * cb, 0x1f300);                          /* CBAR: S1 trans/S2 bypass */
-+	sy_wr(cbp, 0x10, ((tcr2 & ~0x38017u) | 0x38010u | ps));
-+	sy_wr(cbp, 0x30, 0x803520u);
++	sy_wr(cbp, 0x10, 0x38011u);                           /* TCR2: PS/ASID, no stale bits */
++	sy_wr(cbp, 0x30, 0x803519u);                          /* TCR */
 +	sy_wr(cbp, 0x24, (uint32_t)(ttbr >> 32));
 +	sy_wr(cbp, 0x20, (uint32_t)ttbr);
-+	sy_wr(cbp, 0x2c, (uint32_t)(asid << 16));
 +	sy_wr(cbp, 0x28, 0);
-+	sy_wr(cbp, 0x38, 0xffu);
-+	sy_wr(cbp, 0x3c, 0);
-+	sy_wr(cbp, 0x34, 0);
++	sy_wr(cbp, 0x2c, 0);
++	sy_wr(cbp, 0x38, 0xf404ff44u);                        /* MAIR0: idx0 NC, idx1 WB */
++	sy_wr(cbp, 0x3c, 0);                                  /* MAIR1 */
 +	__asm__ volatile("dsb sy" ::: "memory");
 +	printf("PANDORA WLAN: SMMU install: cfg written sctlr %#x tcr %#x tcr2 %#x cbar %#x\n",
 +	    sy_rd(cbp, 0x00), sy_rd(cbp, 0x30), sy_rd(cbp, 0x10), sy_rd(gr1, 4 * cb));
@@ -2127,7 +2130,7 @@
 +	}
 +	printf("PANDORA WLAN: SMMU install: sync %#x\n", sy_rd(cbp, 0x7f4));
 +	sy_log_sync();
-+	sy_wr(cbp, 0x00, 0x27u);                              /* SCTLR enable */
++	sy_wr(cbp, 0x00, 0x1127u);                            /* SCTLR.M=1 (lemonade image) */
 +	__asm__ volatile("dsb sy" ::: "memory");
 +	sy_wr(sy_smmu_va, 0xc00 + 4 * slot, new_s2cr);        /* S2CR: S1 translate */
 +	sy_wr(sy_smmu_va, 0x800 + 4 * slot, 0x1401u);         /* SMR raw */
@@ -2211,16 +2214,6 @@
 +	    cmd, sy_rd(conf, SY_EP_CONF + 0x04) & 0xffff, bhio,
 +	    (unsigned long)SY_SBL_SIZE, SY_IOVA_BASE);
 +	sy_log_sync();
-+	/* kernel_69: the iATU inbound window is programmed (ctrl2 enable, lbar 0xb0000000,
-+	 * ltar = SBL PA) but the BHI had already been consumed by the failed S1 attempt.
-+	 * Route our SID with S2CR BYPASS so the iATU is the only translation stage. */
-+	if (sy_smmu_va && sy_smmu_slot <= 0x7f) {
-+		sy_wr(sy_smmu_va, 0xc00 + 4 * sy_smmu_slot, 0x10000u);
-+		__asm__ volatile("dsb sy" ::: "memory");
-+		printf("PANDORA WLAN: BHI path: SID 0x1401 S2CR set to bypass %#x (iATU does the translation)\n",
-+		    sy_rd(sy_smmu_va, 0xc00 + 4 * sy_smmu_slot));
-+		sy_log_sync();
-+	}
 +	sy_wr(sy_bar_va, bhio + 0x20, 0);          /* INTVEC */
 +	sy_wr(sy_bar_va, bhio + 0x2c, 0);          /* STATUS clear */
 +	sy_wr(sy_bar_va, bhio + 0x08, SY_IOVA_BASE);            /* IMGADDR lo (IOVA) */
@@ -2640,38 +2633,6 @@
 +	printf("PANDORA WLAN: MHI init done (M0 deferred to after BHIe)\n");
 +}
 +
-+
-+/* The BHI/PBL fetch does not reach apps-smmu (kernel_68: 81 banks, no fault), so
-+ * the device takes the 32-bit address as a PCIe/home address. Give it a real
-+ * translation: iATU inbound region 2 maps device address SY_IOVA_BASE .. +8 MiB
-+ * onto the physical SBL buffer. Region 0 (config) and 1 (BAR0) stay untouched. */
-+static int
-+sy_iatu_inbound_window(void)
-+{
-+	uint32_t c1, c2;
-+
-+	if (!iatu || !sy_sbl_pa || sy_buf_size < 0x1000)
-+		return -1;
-+	sy_wr(iatu, IATU_CTRL2(2), 0);
-+	c1 = sy_rd(iatu, IATU_CTRL1(2));
-+	c2 = sy_rd(iatu, IATU_CTRL2(2));
-+	sy_wr(iatu, IATU_CTRL1(2), IATU_TYPE_MEM);
-+	sy_wr(iatu, IATU_LBAR(2), (uint32_t)SY_IOVA_BASE);
-+	sy_wr(iatu, IATU_UBAR(2), (uint32_t)((uint64_t)SY_IOVA_BASE >> 32));
-+	sy_wr(iatu, IATU_LAR(2), (uint32_t)(SY_IOVA_BASE + sy_buf_size - 1));
-+	sy_wr(iatu, IATU_LTAR(2), (uint32_t)sy_sbl_pa);
-+	sy_wr(iatu, IATU_LTAR_HI(2), (uint32_t)(sy_sbl_pa >> 32));
-+	sy_wr(iatu, IATU_CTRL2(2), IATU_ENABLE);
-+	__asm__ volatile("dsb sy" ::: "memory");
-+	printf("PANDORA WLAN: iATU2 inbound: old ctrl1 %#x ctrl2 %#x -> dev %#x+%#x => pa %#llx; "
-+	    "readback ctrl1 %#x ctrl2 %#x lbar %#x ubar %#x lar %#x ltar %#x/%#x\n",
-+	    c1, c2, SY_IOVA_BASE, sy_buf_size, (unsigned long long)sy_sbl_pa,
-+	    sy_rd(iatu, IATU_CTRL1(2)), sy_rd(iatu, IATU_CTRL2(2)), sy_rd(iatu, IATU_LBAR(2)),
-+	    sy_rd(iatu, IATU_UBAR(2)), sy_rd(iatu, IATU_LAR(2)), sy_rd(iatu, IATU_LTAR(2)),
-+	    sy_rd(iatu, IATU_LTAR_HI(2)));
-+	sy_log_sync();
-+	return 0;
-+}
 +
 +static void
 +sy_run(void)
