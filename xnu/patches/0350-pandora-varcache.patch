@@ -456,7 +456,7 @@
  }
  
  static void
-@@ -51,21 +470,3060 @@
+@@ -51,21 +470,3118 @@
  		cv_sleep(100);
  	}
  	if (rootvnode == NULLVP) {
@@ -741,6 +741,7 @@
 +static void sy_mhi_reset(void);
 +static void sy_pte_walk(void);
 +static void sy_smmu_cfg_bank(uint32_t, uint32_t);
++static void sy_endpoint_link_setup(uint64_t);
 +static void sy_smmu_bank_scan(void);
 +static void sy_bhi_sbl(void);
 +static void sy_buf_alloc(void);
@@ -2381,6 +2382,61 @@
 +	sy_log_sync();
 +}
 +
++
++/* Endpoint PCIe/MSI setup before firmware load, copied from the locally working
++ * WCN7850 port (UniXNU-sheng WifiProbe.cpp, endpointLinkSetup):
++ *  - the PCI Express capability's link control ASPM bits are cleared, because the
++ *    load must not idle the link;
++ *  - the MSI capability is enabled with a valid DMA sink address, because the
++ *    endpoint raises its transfer-complete/ready events as MSI writes. With the
++ *    capability unprogrammed those writes have no target and the boot loader ends
++ *    in its fatal error state after reading the image (no SMMU fault at all). */
++static void
++sy_endpoint_link_setup(uint64_t sink)
++{
++	uint32_t cap, w, ctrl;
++	unsigned guard;
++
++	if (!conf)
++		return;
++	cap = (uint32_t)(*(volatile uint8_t *)(conf + SY_EP_CONF + 0x34) & 0xfc);
++	for (guard = 0; cap >= 0x40 && guard < 48; guard++) {
++		w = sy_rd(conf, SY_EP_CONF + cap);
++		{
++			uint32_t id = w & 0xff, next = (w >> 8) & 0xff;
++
++			if (id == 0x10) {
++				uint32_t lc = sy_rd(conf, SY_EP_CONF + cap + 0x10);
++
++				printf("PANDORA WLAN: endpoint PCIe cap %#x: link ctrl %#x -> %#x (ASPM off)\n",
++				    cap, lc, lc & ~3u);
++				sy_wr(conf, SY_EP_CONF + cap + 0x10, lc & ~3u);
++			} else if (id == 0x05) {
++				bool is64 = (w >> 16) & 0x80;
++
++				if (is64) {
++					sy_wr(conf, SY_EP_CONF + cap + 4, (uint32_t)sink);
++					sy_wr(conf, SY_EP_CONF + cap + 8, (uint32_t)(sink >> 32));
++					sy_wr(conf, SY_EP_CONF + cap + 0xc, 0);
++				} else {
++					sy_wr(conf, SY_EP_CONF + cap + 4, (uint32_t)sink);
++					sy_wr(conf, SY_EP_CONF + cap + 8, 0);
++				}
++				ctrl = (w & 0xffffu) | ((((w >> 16) & ~0x70u) | 0x20u | 1u) << 16);
++				sy_wr(conf, SY_EP_CONF + cap, ctrl);
++				printf("PANDORA WLAN: endpoint MSI cap %#x: addr %#llx/%u data 0 ctrl %#x -> %#x\n",
++				    cap, (unsigned long long)sink, is64 ? 64 : 32,
++				    w, sy_rd(conf, SY_EP_CONF + cap));
++			}
++			if (!next)
++				break;
++			cap = next;
++		}
++	}
++	__asm__ volatile("dsb sy" ::: "memory");
++	sy_log_sync();
++}
++
 +static void
 +sy_bhi_sbl(void)
 +{
@@ -2451,6 +2507,8 @@
 +		sy_log_sync();
 +	}
 +
++	sy_endpoint_link_setup((uint64_t)SY_IOVA_BASE + 0x1000);
++	/* the MSI sink page is inside the mapped window; device MSI writes land there */
 +	sy_wr(sy_bar_va, bhio + 0x20, 0);          /* INTVEC */
 +	sy_wr(sy_bar_va, bhio + 0x2c, 0);          /* STATUS clear */
 +	sy_wr(sy_bar_va, bhio + 0x08, SY_IOVA_BASE);            /* IMGADDR lo (IOVA) */
