@@ -456,7 +456,7 @@
  }
  
  static void
-@@ -51,21 +470,3679 @@
+@@ -51,21 +470,3952 @@
  		cv_sleep(100);
  	}
  	if (rootvnode == NULLVP) {
@@ -3660,80 +3660,353 @@
 +}
 +
 +
-+/* ---- M5a: QMI / QRTR framing with a boot-time self-test --------------------------
-+ * The interface data come from the phone's own service header
-+ * (E:\songyuan\work\wifi_m0\wlan_firmware_service_v01.h) and the transport framing
-+ * from net/qrtr (qrtr_hdr_v1) and net/qrtr/mhi.c ("IPCR" channel). Nothing here
-+ * talks to the device yet: with songyuan_qmi=1 the encoders run once against known
-+ * values and print PASS/FAIL, so the wire format is checked before MHI exists. */
-+#define SY_QRTR_VERSION 1u
++/* ---- M5a: QMI / QRTR / WLFW framing ---------------------------------------------
++ * Wire formats from the official sources now stored locally:
++ *  - QRTR v1 header (net/qrtr/af_qrtr.c): version, type, src_node, src_port,
++ *    confirm_rx, size, dst_node, dst_port - eight little-endian u32, 32 bytes;
++ *    type values and QRTR_PROTO_VER_1=1 from include/uapi/linux/qrtr.h.
++ *  - QMI header: type(1), transaction(2 LE), message id(2 LE), length(2 LE).
++ *  - WLFW message ids and TLV types/sizes from ath12k/qmi.c v6.6
++ *    (qmi_wlanfw_*_req_msg_v01_ei element tables, 31 of them) and the
++ *    builders ath12k_qmi_host_cap_send / ath12k_qmi_respond_fw_mem_request.
++ * Everything here is offline-testable (songyuan_qmi=1) before a transport exists. */
++#define SY_QRTR_PROTO_VER_1 1u
++#define SY_QRTR_TYPE_DATA 1u
++#define SY_QRTR_TYPE_HELLO 2u
++#define SY_QRTR_TYPE_NEW_SERVER 4u
++#define SY_QRTR_TYPE_NEW_LOOKUP 10u
++#define SY_QRTR_PORT_CTRL 0xfffffffeu
++#define SY_QRTR_NODE_BCAST 0xffffffffu
++
++#define SY_QMI_WLFW_IND_REGISTER_REQ 0x0020
++#define SY_QMI_WLFW_FW_READY_IND 0x0021
++#define SY_QMI_WLFW_BDF_DOWNLOAD_REQ 0x0025
++#define SY_QMI_WLFW_HOST_CAP_REQ 0x0034
++#define SY_QMI_WLFW_REQUEST_MEM_IND 0x0035
++#define SY_QMI_WLFW_RESPOND_MEM_REQ 0x0036
++#define SY_QMI_WLFW_FW_MEM_READY_IND 0x0037
++#define SY_QMI_WLFW_M3_INFO_REQ 0x003c
++
++#define SY_WLFW_MEM_TYPE_DDR 1u
++#define SY_WLFW_MEM_TYPE_BDF 2u
++#define SY_WLFW_MEM_TYPE_M3 3u
++#define SY_WLFW_MEM_TYPE_CAL 4u
++#define SY_WLFW_HOST_CSTATE_BIT 0x04u
++#define SY_WLFW_SLEEP_CLOCK_INTERNAL_BIT 0x02u
++#define SY_WLFW_PLATFORM_CAP_GLOBAL_RESET 0x08u
++#define SY_WLFW_FEATURE_LIST 0x18ull	/* BIT(CNSS_QDSS_CFG_MISS)|BIT(CNSS_PCIE_PERST_NO_PULL) */
 +
 +struct sy_qrtr_hdr {
-+	uint32_t version, src_node, src_port, confirm_rx, size, dst_node, dst_port;
++	uint32_t version, type, src_node, src_port, confirm_rx, size, dst_node, dst_port;
 +};
 +
-+static uint8_t sy_qmi_buf[512];
++struct sy_wlfw_seg {
++	uint64_t addr;
++	uint32_t size;
++	uint32_t type;
++};
++
++static uint8_t sy_qmi_tx[2048];
++static struct sy_wlfw_seg sy_wlfw_mem[52];
++static unsigned sy_wlfw_mem_n;
 +
 +static unsigned
-+sy_qmi_put_tlv(uint8_t *b, unsigned at, uint8_t type, const void *v, uint16_t len)
-+{
-+	unsigned i;
-+
-+	b[at] = type;
-+	b[at + 1] = (uint8_t)len;
-+	b[at + 2] = (uint8_t)(len >> 8);
-+	for (i = 0; i < len; i++)
-+		b[at + 3 + i] = ((const uint8_t *)v)[i];
-+	return at + 3 + len;
-+}
-+
-+static unsigned
-+sy_qmi_msg(uint8_t *b, uint8_t kind, uint16_t txn, uint16_t msgid, unsigned payload)
++sy_qmi_hdr(uint8_t *b, uint8_t kind, uint16_t txn, uint16_t msgid)
 +{
 +	b[0] = kind;
 +	b[1] = (uint8_t)txn; b[2] = (uint8_t)(txn >> 8);
 +	b[3] = (uint8_t)msgid; b[4] = (uint8_t)(msgid >> 8);
-+	b[5] = (uint8_t)payload; b[6] = (uint8_t)(payload >> 8);
++	b[5] = 0; b[6] = 0;
 +	return 7;
 +}
 +
++static unsigned
++sy_qmi_finish(uint8_t *b, unsigned at)
++{
++	b[5] = (uint8_t)(at - 7);
++	b[6] = (uint8_t)((at - 7) >> 8);
++	return at;
++}
++
++static unsigned
++sy_qmi_tlv_hdr(uint8_t *b, unsigned at, uint8_t type, uint16_t len)
++{
++	b[at] = type;
++	b[at + 1] = (uint8_t)len;
++	b[at + 2] = (uint8_t)(len >> 8);
++	return at + 3;
++}
++
++static unsigned
++sy_qmi_tlv_u8(uint8_t *b, unsigned at, uint8_t type, uint8_t v)
++{
++	at = sy_qmi_tlv_hdr(b, at, type, 1);
++	b[at++] = v;
++	return at;
++}
++
++static unsigned
++sy_qmi_tlv_u32(uint8_t *b, unsigned at, uint8_t type, uint32_t v)
++{
++	at = sy_qmi_tlv_hdr(b, at, type, 4);
++	b[at++] = (uint8_t)v; b[at++] = (uint8_t)(v >> 8);
++	b[at++] = (uint8_t)(v >> 16); b[at++] = (uint8_t)(v >> 24);
++	return at;
++}
++
++static unsigned
++sy_qmi_tlv_u64(uint8_t *b, unsigned at, uint8_t type, uint64_t v)
++{
++	unsigned i;
++
++	at = sy_qmi_tlv_hdr(b, at, type, 8);
++	for (i = 0; i < 8; i++)
++		b[at++] = (uint8_t)(v >> (8 * i));
++	return at;
++}
++
++/* host_cap: values from ath12k_qmi_host_cap_send for the WCN7850 hw params
++ * (internal_sleep_clock = true, qmi_cnss_feature_bitmap = BIT(3)|BIT(4)). */
++static unsigned
++sy_wlfw_host_cap(uint8_t *b, uint16_t txn)
++{
++	unsigned at = sy_qmi_hdr(b, 0x00, txn, SY_QMI_WLFW_HOST_CAP_REQ);
++
++	at = sy_qmi_tlv_u32(b, at, 0x10, 1);			/* num_clients */
++	at = sy_qmi_tlv_u8(b, at, 0x13,				/* nm_modem */
++	    SY_WLFW_HOST_CSTATE_BIT | SY_WLFW_SLEEP_CLOCK_INTERNAL_BIT |
++	    SY_WLFW_PLATFORM_CAP_GLOBAL_RESET);
++	at = sy_qmi_tlv_u8(b, at, 0x14, 1);			/* bdf_support */
++	at = sy_qmi_tlv_u8(b, at, 0x16, 1);			/* m3_support */
++	at = sy_qmi_tlv_u8(b, at, 0x17, 1);			/* m3_cache_support */
++	at = sy_qmi_tlv_u8(b, at, 0x1a, 0);			/* cal_done */
++	at = sy_qmi_tlv_u8(b, at, 0x1c, 0);			/* mem_cfg_mode: default */
++	at = sy_qmi_tlv_u64(b, at, 0x27, SY_WLFW_FEATURE_LIST);
++	return sy_qmi_finish(b, at);
++}
++
++/* ind_register: element table exists in ath12k/qmi.c; mainline v6.6 does not send
++ * it, kept for completeness so the sequence can be tried if firmware asks. */
++static unsigned
++sy_wlfw_ind_register(uint8_t *b, uint16_t txn)
++{
++	unsigned at = sy_qmi_hdr(b, 0x00, txn, SY_QMI_WLFW_IND_REGISTER_REQ);
++
++	at = sy_qmi_tlv_u8(b, at, 0x10, 1);	/* fw_ready */
++	at = sy_qmi_tlv_u8(b, at, 0x11, 1);	/* initiate cal download */
++	at = sy_qmi_tlv_u8(b, at, 0x12, 1);	/* initiate cal update */
++	at = sy_qmi_tlv_u8(b, at, 0x13, 1);	/* msa ready */
++	at = sy_qmi_tlv_u8(b, at, 0x14, 1);	/* pin connect result */
++	at = sy_qmi_tlv_u32(b, at, 0x15, 0x4b4e454c);	/* client id, QMI_WLANFW_CLIENT_ID */
++	at = sy_qmi_tlv_u8(b, at, 0x16, 1);	/* request mem */
++	at = sy_qmi_tlv_u8(b, at, 0x17, 1);	/* fw mem ready */
++	at = sy_qmi_tlv_u8(b, at, 0x18, 1);	/* fw init done */
++	at = sy_qmi_tlv_u8(b, at, 0x19, 0);	/* rejuvenate */
++	at = sy_qmi_tlv_u8(b, at, 0x1a, 1);	/* xo cal */
++	at = sy_qmi_tlv_u8(b, at, 0x1b, 1);	/* cal done */
++	return sy_qmi_finish(b, at);
++}
++
++/* respond_mem: TLV 0x01 is a 1-byte segment count followed by 17-byte records
++ * {addr u64, size u32, type u32, restore u8} (qmi_wlanfw_mem_seg_resp_s_v01). */
++static unsigned
++sy_wlfw_respond_mem(uint8_t *b, uint16_t txn, const struct sy_wlfw_seg *seg, unsigned n)
++{
++	unsigned at = sy_qmi_hdr(b, 0x00, txn, SY_QMI_WLFW_RESPOND_MEM_REQ);
++	unsigned i;
++
++	if (n > 255)
++		n = 255;
++	at = sy_qmi_tlv_hdr(b, at, 0x01, (uint16_t)(1 + 17 * n));
++	b[at++] = (uint8_t)n;
++	for (i = 0; i < n; i++) {
++		unsigned k;
++
++		for (k = 0; k < 8; k++)
++			b[at++] = (uint8_t)(seg[i].addr >> (8 * k));
++		for (k = 0; k < 4; k++)
++			b[at++] = (uint8_t)(seg[i].size >> (8 * k));
++		for (k = 0; k < 4; k++)
++			b[at++] = (uint8_t)(seg[i].type >> (8 * k));
++		b[at++] = 0;	/* restore */
++	}
++	return sy_qmi_finish(b, at);
++}
++
++static unsigned
++sy_wlfw_m3_info(uint8_t *b, uint16_t txn, uint64_t addr, uint32_t size)
++{
++	unsigned at = sy_qmi_hdr(b, 0x00, txn, SY_QMI_WLFW_M3_INFO_REQ);
++
++	at = sy_qmi_tlv_u64(b, at, 0x01, addr);
++	at = sy_qmi_tlv_u32(b, at, 0x02, size);
++	return sy_qmi_finish(b, at);
++}
++
++/* bdf_download: 0x01 valid, 0x10 file_id, 0x11 total_size, 0x12 seg_id,
++ * 0x13 length(u16)+bytes, 0x14 end, 0x15 bdf_type. */
++static unsigned
++sy_wlfw_bdf_download(uint8_t *b, uint16_t txn, uint8_t file_id, uint32_t total,
++    uint32_t seg_id, const uint8_t *data, uint16_t len, uint8_t end, uint8_t bdf_type)
++{
++	unsigned at = sy_qmi_hdr(b, 0x00, txn, SY_QMI_WLFW_BDF_DOWNLOAD_REQ);
++
++	at = sy_qmi_tlv_u8(b, at, 0x01, 1);
++	at = sy_qmi_tlv_hdr(b, at, 0x10, 4);
++	b[at++] = file_id; b[at++] = 0; b[at++] = 0; b[at++] = 0;
++	at = sy_qmi_tlv_u32(b, at, 0x11, total);
++	at = sy_qmi_tlv_u32(b, at, 0x12, seg_id);
++	if (len) {
++		unsigned i;
++
++		at = sy_qmi_tlv_hdr(b, at, 0x13, (uint16_t)(2 + len));
++		b[at++] = (uint8_t)len; b[at++] = (uint8_t)(len >> 8);
++		for (i = 0; i < len; i++)
++			b[at++] = data[i];
++	}
++	at = sy_qmi_tlv_u8(b, at, 0x14, end);
++	at = sy_qmi_tlv_u8(b, at, 0x15, bdf_type);
++	return sy_qmi_finish(b, at);
++}
++
++/* QRTR data frame: 32-byte v1 header (version, type, src/dst node and port). */
++static void
++sy_put32le(uint8_t *b, unsigned at, uint32_t v)
++{
++	b[at] = (uint8_t)v; b[at + 1] = (uint8_t)(v >> 8);
++	b[at + 2] = (uint8_t)(v >> 16); b[at + 3] = (uint8_t)(v >> 24);
++}
++
++/* QRTR v1 frame: eight little-endian u32 fields (version, type, src node/port,
++ * confirm_rx, size, dst node/port), then the payload. */
++static unsigned
++sy_qrtr_frame(uint8_t *b, uint32_t type, uint32_t src_node, uint32_t src_port,
++    uint32_t dst_node, uint32_t dst_port, const uint8_t *payload, unsigned len)
++{
++	sy_put32le(b, 0, SY_QRTR_PROTO_VER_1);
++	sy_put32le(b, 4, type);
++	sy_put32le(b, 8, src_node);
++	sy_put32le(b, 12, src_port);
++	sy_put32le(b, 16, 0);			/* confirm_rx */
++	sy_put32le(b, 20, len);
++	sy_put32le(b, 24, dst_node);
++	sy_put32le(b, 28, dst_port);
++	if (payload && len)
++		memcpy(b + 32, payload, len);
++	return 32 + len;
++}
++
++/* Parse request_mem_ind: TLV 0x01 = count then mem_seg_s records
++ * {size u32, type u32, mem_cfg_len u32, mem_cfg[2] {offset u64, size u32, secure u8}}. */
++static unsigned
++sy_wlfw_parse_request_mem(const uint8_t *b, unsigned len)
++{
++	unsigned at = 7, found = 0;
++
++	sy_wlfw_mem_n = 0;
++	while (at + 3 <= len) {
++		uint8_t type = b[at];
++		uint16_t tlen = (uint16_t)(b[at + 1] | (b[at + 2] << 8));
++		unsigned v = at + 3, i;
++
++		if (v + tlen > len)
++			break;
++		if (type == 0x01 && tlen >= 1) {
++			unsigned n = b[v];
++
++			v++;
++			for (i = 0; i < n && sy_wlfw_mem_n < (sizeof(sy_wlfw_mem) / sizeof(sy_wlfw_mem[0])); i++) {
++				uint32_t sz, mt, mc, k;
++
++				if (v + 12 > at + 3 + tlen)
++					break;
++				sz = (uint32_t)(b[v] | (b[v + 1] << 8) | (b[v + 2] << 16) | (b[v + 3] << 24));
++				v += 4;
++				mt = (uint32_t)(b[v] | (b[v + 1] << 8) | (b[v + 2] << 16) | (b[v + 3] << 24));
++				v += 4;
++				mc = (uint32_t)(b[v] | (b[v + 1] << 8) | (b[v + 2] << 16) | (b[v + 3] << 24));
++				v += 4;
++				for (k = 0; k < mc; k++)		/* mem_cfg records are 13 bytes */
++					v += 13;
++				if (v > at + 3 + tlen)
++					break;
++				sy_wlfw_mem[sy_wlfw_mem_n].addr = 0;
++				sy_wlfw_mem[sy_wlfw_mem_n].size = sz;
++				sy_wlfw_mem[sy_wlfw_mem_n].type = mt;
++				sy_wlfw_mem_n++;
++				found++;
++			}
++		}
++		at = (unsigned)(at + 3) + tlen;
++	}
++	return found;
++}
++
++/* Offline self-test: every encoder is checked against its expected byte layout and
++ * a synthetic request_mem_ind is decoded. */
 +static void
 +sy_m5a_selftest(void)
 +{
-+	static const uint32_t wlfw_ids[] = { 0x20, 0x21, 0x25, 0x34, 0x35, 0x36, 0x37, 0x38 };
-+	uint8_t qrtr[sizeof(struct sy_qrtr_hdr) + 512];
-+	unsigned i, total = 0, bad = 0;
++	unsigned total = 0, bad = 0, n;
++	uint8_t frame[256];
++	static const uint8_t bdf_data[4] = { 0x7f, 0x45, 0x4c, 0x46 };
 +
-+	for (i = 0; i < sizeof(wlfw_ids) / sizeof(wlfw_ids[0]); i++) {
-+		uint32_t v = 0x00000001;
-+		unsigned at = sy_qmi_msg(sy_qmi_buf, 0x00, (uint16_t)(0x100 + i), (uint16_t)wlfw_ids[i], 0);
-+		uint16_t got, glen;
-+		unsigned end;
-+
-+		end = sy_qmi_put_tlv(sy_qmi_buf, at, 0x10, &v, 4);
-+		sy_qmi_buf[5] = (uint8_t)(end - 7);	/* payload length, little endian */
-+		sy_qmi_buf[6] = (uint8_t)((end - 7) >> 8);
-+		got = (uint16_t)(sy_qmi_buf[3] | (sy_qmi_buf[4] << 8));
-+		glen = (uint16_t)(sy_qmi_buf[5] | (sy_qmi_buf[6] << 8));
-+		total++;
-+		if (got != (uint16_t)wlfw_ids[i] || glen != 7u || end != 14u ||
-+		    sy_qmi_buf[7] != 0x10 || (unsigned)(sy_qmi_buf[8] | (sy_qmi_buf[9] << 8)) != 4u ||
-+		    (uint32_t)(sy_qmi_buf[10] | (sy_qmi_buf[11] << 8) | (sy_qmi_buf[12] << 16) | (sy_qmi_buf[13] << 24)) != v)
-+			bad++;
-+	}
-+	/* QRTR v1 header + payload round trip. */
++	n = sy_wlfw_host_cap(sy_qmi_tx, 0x1234);
++	total++;
++	if (n < 7 || sy_qmi_tx[0] != 0 || sy_qmi_tx[3] != 0x34 || sy_qmi_tx[4] != 0 ||
++	    (sy_qmi_tx[5] | (sy_qmi_tx[6] << 8)) != n - 7 ||
++	    memcmp(sy_qmi_tx + 7, "\x10\x04\x00\x01\x00\x00", 6) != 0)
++		bad++;
++	n = sy_wlfw_ind_register(sy_qmi_tx, 0x1235);
++	total++;
++	if (n < 7 || sy_qmi_tx[3] != 0x20 || (sy_qmi_tx[5] | (sy_qmi_tx[6] << 8)) != n - 7)
++		bad++;
 +	{
-+		struct sy_qrtr_hdr *h = (struct sy_qrtr_hdr *)qrtr;
++		struct sy_wlfw_seg seg[2];
 +
-+		memcpy(qrtr + sizeof(struct sy_qrtr_hdr), sy_qmi_buf, 14);
-+		h->version = SY_QRTR_VERSION; h->src_node = 0; h->src_port = 0x1234;
-+		h->confirm_rx = 0; h->size = 14; h->dst_node = 7; h->dst_port = 0x5678;
++		seg[0].addr = 0x90d00000ull; seg[0].size = 0x100000; seg[0].type = SY_WLFW_MEM_TYPE_DDR;
++		seg[1].addr = 0x90e00000ull; seg[1].size = 0x200000; seg[1].type = SY_WLFW_MEM_TYPE_BDF;
++		n = sy_wlfw_respond_mem(sy_qmi_tx, 0x1236, seg, 2);
 +		total++;
-+		if (h->version != 1u || h->size != 14u || h->dst_node != 7u || h->src_port != 0x1234u ||
-+		    (unsigned)sizeof(struct sy_qrtr_hdr) != 28u)
++		if (n != 7 + 3 + 1 + 2 * 17 || sy_qmi_tx[7] != 0x01 ||
++		    sy_qmi_tx[8] != (uint8_t)(1 + 34) || sy_qmi_tx[10] != 2)
 +			bad++;
 +	}
-+	printf("PANDORA WLAN: QMI/QRTR self-test: %u checks, %u failed -> %s\n",
++	n = sy_wlfw_m3_info(sy_qmi_tx, 0x1237, 0x91000000ull, 0x4000);
++	total++;
++	if (n != 7 + (3 + 8) + (3 + 4) || sy_qmi_tx[3] != 0x3c)
++		bad++;
++	n = sy_wlfw_bdf_download(sy_qmi_tx, 0x1238, 0, 4, 0, bdf_data, 4, 1, 0);
++	total++;
++	if (n < 7 || sy_qmi_tx[3] != 0x25 || sy_qmi_tx[5] == 0)
++		bad++;
++	{
++		uint8_t ind[64];
++		unsigned at = sy_qmi_hdr(ind, 0x04, 0x1, SY_QMI_WLFW_REQUEST_MEM_IND);
++
++		at = sy_qmi_tlv_hdr(ind, at, 0x01, (uint16_t)(1 + 12 + 13));
++		ind[at++] = 1;					/* one segment */
++		ind[at++] = 0x00; ind[at++] = 0x00; ind[at++] = 0x10; ind[at++] = 0x00;	/* size 1 MiB */
++		ind[at++] = 1; ind[at++] = 0; ind[at++] = 0; ind[at++] = 0;		/* type DDR */
++		ind[at++] = 1; ind[at++] = 0; ind[at++] = 0; ind[at++] = 0;		/* mem_cfg_len 1 */
++		for (n = 0; n < 13; n++)
++			ind[at++] = 0;
++		sy_qmi_finish(ind, at);
++		total++;
++		if (sy_wlfw_parse_request_mem(ind, at) != 1 || sy_wlfw_mem_n != 1 ||
++		    sy_wlfw_mem[0].size != 0x100000 || sy_wlfw_mem[0].type != SY_WLFW_MEM_TYPE_DDR)
++			bad++;
++	}
++	total++;
++	if (sizeof(struct sy_qrtr_hdr) != 32) {
++		bad++;
++	} else {
++		n = sy_qrtr_frame(frame, SY_QRTR_TYPE_DATA, 0, 0x1234, 7, 0x5678, sy_qmi_tx, 16);
++		if (n != 48 || frame[0] != 1 || frame[4] != SY_QRTR_TYPE_DATA || frame[20] != 16 ||
++		    frame[12] != 0x34 || frame[13] != 0x12)
++			bad++;
++	}
++	printf("PANDORA WLAN: QMI/QRTR/WLFW self-test: %u checks, %u failed -> %s\n",
 +	    total, bad, bad ? "FAIL" : "PASS");
 +	sy_log_sync();
 +}
@@ -4144,7 +4417,7 @@ new file mode 100644
 index 0000000000000000000000000000000000000000..0000000000000000000000000000000000000000
 --- /dev/null
 +++ b/iokit/bsddev/pandora_80211.cpp
-@@ -0,0 +1,185 @@
+@@ -0,0 +1,188 @@
 +/*
 + * M6a-2: the IORegistry objects the wireless daemon and the network
 + * configuration in this OS look for. The open kernel has no IO80211 classes, so
@@ -4162,6 +4435,7 @@ index 0000000000000000000000000000000000000000..00000000000000000000000000000000
 +#include <IOKit/IOLib.h>
 +#include <IOKit/IOService.h>
 +#include <IOKit/IOUserClient.h>
++#include <IOKit/IOPlatformExpert.h>
 +#include <libkern/c++/OSData.h>
 +#include <libkern/c++/OSNumber.h>
 +#include <kern/task.h>
@@ -4260,11 +4534,13 @@ index 0000000000000000000000000000000000000000..00000000000000000000000000000000
 +	return service;
 +}
 +
++extern "C" int pandora_80211_publish(const unsigned char mac[6], const char *ifname);
++
 +extern "C" int
 +pandora_80211_publish(const unsigned char mac[6], const char *ifname)
 +{
 +	static int done;
-+	IOService *platform;
++	IOPlatformExpert *platform;
 +	IO80211Controller *controller;
 +	IO80211Interface *wlan;
 +	OSData *address;
