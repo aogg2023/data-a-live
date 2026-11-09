@@ -456,7 +456,7 @@
  }
  
  static void
-@@ -51,21 +470,3047 @@
+@@ -51,21 +470,3053 @@
  		cv_sleep(100);
  	}
  	if (rootvnode == NULLVP) {
@@ -496,6 +496,7 @@
 +#include <pexpert/pexpert.h>
 +#include <vm/vm_kern.h>
 +#include <vm/pmap.h>
++#include <vm/memory_types.h>
 +#include <arm/caches_internal.h>
 +
 +static const uint16_t sy_phy_seq[][2] = {
@@ -536,6 +537,7 @@
 +};
 +
 +extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++extern vm_offset_t ml_io_map_unmappable(vm_offset_t, vm_size_t, unsigned);
 +extern vm_offset_t ml_io_map_wcomb(vm_offset_t, vm_size_t);
 +extern kern_return_t thread_terminate(thread_t);
 +extern kern_return_t kernel_thread_start_priority(thread_continue_t, void *, integer_t, thread_t *);
@@ -2227,7 +2229,11 @@
 +	 * must read what a write-combined alias of the same physical pages holds; a
 +	 * cached write plus flush was never proven there and the boot loader kept
 +	 * rejecting the image with no SMMU fault. */
-+	sy_sbl_wc = ml_io_map_wcomb((vm_offset_t)sy_sbl_pa, sy_buf_size);
++	/* The permanent io_submap is only 8 MiB (lemonade_wifi.c:486): mapping this
++	 * alias with ml_io_map_wcomb made kmem_alloc(8 MiB) fail inside ml_io_map and
++	 * panicked. Use the kernel_map mapping the proven port uses, and only the bytes
++	 * the image actually needs. */
++	sy_sbl_wc = ml_io_map_unmappable((vm_offset_t)sy_sbl_pa, SY_SBL_SIZE, VM_WIMG_WCOMB);
 +	printf("PANDORA WLAN: BHI: write-combined alias %#lx of pa %#llx\n",
 +	    (unsigned long)sy_sbl_wc, (unsigned long long)sy_sbl_pa);
 +	printf("PANDORA WLAN: BHI: buffer va %#lx pa %#llx size %#x (%s 4 GiB)\n",
