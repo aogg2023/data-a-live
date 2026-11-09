@@ -456,7 +456,7 @@
  }
  
  static void
-@@ -51,21 +470,2739 @@
+@@ -51,21 +470,2765 @@
  		cv_sleep(100);
  	}
  	if (rootvnode == NULLVP) {
@@ -2317,18 +2317,44 @@
 +	sy_wr(sy_bar_va, bhio + 0x18, 0x1234567);
 +	printf("PANDORA WLAN: BHI: doorbell rung seq 0x1234567, polling\n");
 +	sy_log_sync();
-+	for (i = 0; i < 300; i++) {
-+		st = sy_rd(sy_bar_va, bhio + 0x2c);
-+		ee = sy_rd(sy_bar_va, bhio + 0x28);
-+		if ((st >> 30) == 2 || (st >> 30) == 3)
-+			break;
-+		sy_usleep(10000);
++	/* 0xffffffff is "the MHI block did not answer this read yet" (the device's boot
++	 * loader is starting / the block is not live), NOT an error status: sheng's
++	 * MhiBoot.c treats it exactly that way. Accepting it as code 3 made every earlier
++	 * run report an instant error; poll until a real status appears instead. */
++	{
++		uint32_t last_st = st, last_ee = ee, extra = 0;
++
++		for (i = 0; i < 3000; i++) {
++			st = sy_rd(sy_bar_va, bhio + 0x2c);
++			ee = sy_rd(sy_bar_va, bhio + 0x28);
++			if (st != last_st || ee != last_ee) {
++				if (extra < 40) {
++					printf("PANDORA WLAN: BHI poll %u ms: status %#x code %u ee %#x "
++					    "errcode %#x mhi %#x\n", i, st, st >> 30, ee,
++					    sy_rd(sy_bar_va, bhio + 0x30), sy_rd(sy_bar_va, 0x48));
++					sy_log_sync();
++				}
++				extra++;
++				last_st = st; last_ee = ee;
++			}
++			if ((st >> 30) == 2 || ((st >> 30) == 3 && st != 0xffffffffu))
++				break;
++			delay(1);
++		}
 +	}
 +	printf("PANDORA WLAN: BHI result: status %#x code %u ee %#x errcode %#x mhi %#x\n",
 +	    st, st >> 30, ee, sy_rd(sy_bar_va, bhio + 0x30), sy_rd(sy_bar_va, 0x48));
 +	sy_log_sync();
 +	/* Device-side error detail: distinguish an SMMU translation fault (the device
 +	 * DMA never reached our buffer) from an image rejection (BHI errdbg set). */
++	/* Hardware-level PCIe/ANOC error visibility (vendor pci-msm.c register names):
++	 * INT_ALL_STATUS/INT_ALL_2_STATUS and CORE_ERRORS show NoC/AXI faults that the
++	 * SMMU never sees because the transaction dies in the controller. */
++	printf("PANDORA WLAN: PARF diag: int_all %#x/%#x int_all2 %#x/%#x core_errors %#x "
++	    "ecam_block %#x parf_status %#x pm_stts %#x\n",
++	    sy_rd(parf, 0x224), sy_rd(parf, 0x22c), sy_rd(parf, 0x500), sy_rd(parf, 0x508),
++	    sy_rd(parf, 0x3c0), sy_rd(parf, 0x630), sy_rd(parf, 0x230), sy_rd(parf, 0x028));
++	sy_log_sync();
 +	sy_sbl_ok = ((st >> 30) == 2);
 +	sy_smmu_bank_scan();
 +	if (sy_smmu_va) {
