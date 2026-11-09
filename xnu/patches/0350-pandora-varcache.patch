@@ -456,7 +456,7 @@
  }
  
  static void
-@@ -51,21 +470,2439 @@
+@@ -51,21 +470,2477 @@
  		cv_sleep(100);
  	}
  	if (rootvnode == NULLVP) {
@@ -694,7 +694,8 @@
 +static unsigned sy_buf_size;
 +static uint32_t sy_bhi_off;	/* BHIOFF read by the SBL stage, used again by BHIe */
 +static uint64_t sy_sbl_pa;
-+static int sy_sbl_ok;	/* SBL reached BHI code 2; gates stages 16-18 */
++static int sy_sbl_ok;
++static unsigned sy_guard;	/* songyuan_guard=1: BHI fetch one unmapped guard page, verify SMMU fault */	/* SBL reached BHI code 2; gates stages 16-18 */
 +static vm_offset_t sy_cb_va;
 +#define SY_DMA_SIZE	0x2000000UL
 +#define SY_IOVA_BASE	0xB0000000UL	/* DT cnss_pci0 partition window 2 */
@@ -2191,6 +2192,8 @@
 +		printf("PANDORA WLAN: BHI: missing BAR0 mapping\n");
 +		return;
 +	}
++	if (!sy_guard)
++		(void)PE_parse_boot_argn("songyuan_guard", &sy_guard, sizeof(sy_guard));
 +	bhio = sy_rd(sy_bar_va, 0x28);
 +	sy_bhi_off = bhio;
 +	if (bhio < 0x40 || bhio > 0x3fc0 || (bhio & 3)) {
@@ -2226,6 +2229,41 @@
 +	printf("PANDORA WLAN: BHI preflight: %#x:%08x size %#x ivec %#x status %#x ee %#x\n",
 +	    hi, lo, size, ivec, st, ee);
 +	sy_log_sync();
++	if (sy_guard) {
++		uint64_t guard = SY_IOVA_BASE + sy_buf_size;
++		uint32_t v = 0, fsr = 0, far_lo = 0, far_hi = 0, gfsr = 0, sid = 0;
++		unsigned t, hit = 0;
++
++		sy_wr(sy_bar_va, bhio + 0x2c, 0);
++		sy_wr(sy_bar_va, bhio + 0x08, (uint32_t)guard);
++		sy_wr(sy_bar_va, bhio + 0x0c, (uint32_t)(guard >> 32));
++		sy_wr(sy_bar_va, bhio + 0x10, 0x1000);
++		sy_wr(sy_bar_va, bhio + 0x14, 0);
++		__asm__ volatile("dsb sy" ::: "memory");
++		printf("PANDORA WLAN: GUARD: asking PBL to read unmapped %#llx, 4096 bytes (mapping is %#x bytes)\n",
++		    (unsigned long long)guard, sy_buf_size);
++		sy_log_sync();
++		sy_wr(sy_bar_va, bhio + 0x18, 0x0badf00d);
++		for (t = 0; t < 400; t++) {
++			if (sy_cb_va)
++				fsr = sy_rd(sy_cb_va, 0x58);
++			gfsr = sy_rd(sy_smmu_va, 0x48);
++			v = sy_rd(sy_bar_va, bhio + 0x2c);
++			if ((fsr & 0xc00001feu) || gfsr || (v >> 30) == 3)
++				break;
++			sy_usleep(5000);
++		}
++		if (sy_cb_va) {
++			far_lo = sy_rd(sy_cb_va, 0x60);
++			far_hi = sy_rd(sy_cb_va, 0x64);
++		}
++		sid = sy_rd(sy_smmu_va, 0x1400 + 4 * sy_smmu_cb) & 0xffffu;
++		hit = (fsr & 0xc00001feu) ? 1 : 0;
++		printf("PANDORA WLAN: GUARD result: fault %u cb_fsr %#x far %#x:%#x gfsr %#x sid %#x bhi %#x\n",
++		    hit, fsr, far_hi, far_lo, gfsr, sid, v);
++		sy_log_sync();
++		return;
++	}
 +	if (hi != 0 || lo != SY_IOVA_BASE ||
 +	    size != SY_SBL_SIZE || ivec || st || ee) {
 +		printf("PANDORA WLAN: BHI: preflight mismatch, doorbell not rung\n");
