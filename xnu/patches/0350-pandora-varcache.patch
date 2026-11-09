@@ -456,7 +456,7 @@
  }
  
  static void
-@@ -51,21 +470,2501 @@
+@@ -51,21 +470,2478 @@
  		cv_sleep(100);
  	}
  	if (rootvnode == NULLVP) {
@@ -2211,6 +2211,16 @@
 +	    cmd, sy_rd(conf, SY_EP_CONF + 0x04) & 0xffff, bhio,
 +	    (unsigned long)SY_SBL_SIZE, SY_IOVA_BASE);
 +	sy_log_sync();
++	/* kernel_69: the iATU inbound window is programmed (ctrl2 enable, lbar 0xb0000000,
++	 * ltar = SBL PA) but the BHI had already been consumed by the failed S1 attempt.
++	 * Route our SID with S2CR BYPASS so the iATU is the only translation stage. */
++	if (sy_smmu_va && sy_smmu_slot <= 0x7f) {
++		sy_wr(sy_smmu_va, 0xc00 + 4 * sy_smmu_slot, 0x10000u);
++		__asm__ volatile("dsb sy" ::: "memory");
++		printf("PANDORA WLAN: BHI path: SID 0x1401 S2CR set to bypass %#x (iATU does the translation)\n",
++		    sy_rd(sy_smmu_va, 0xc00 + 4 * sy_smmu_slot));
++		sy_log_sync();
++	}
 +	sy_wr(sy_bar_va, bhio + 0x20, 0);          /* INTVEC */
 +	sy_wr(sy_bar_va, bhio + 0x2c, 0);          /* STATUS clear */
 +	sy_wr(sy_bar_va, bhio + 0x08, SY_IOVA_BASE);            /* IMGADDR lo (IOVA) */
@@ -2255,39 +2265,6 @@
 +	/* Device-side error detail: distinguish an SMMU translation fault (the device
 +	 * DMA never reached our buffer) from an image rejection (BHI errdbg set). */
 +	sy_sbl_ok = ((st >> 30) == 2);
-+	/* Second in-boot attempt: the device locks BHI after a fatal error, so clear
-+	 * STATUS first; route SID 0x1401 with S2CR BYPASS (the iATU inbound region 2
-+	 * now maps the 32-bit device address onto our buffer) and ring again. */
-+	{
-+		uint32_t v2 = 0;
-+		unsigned t2;
-+
-+		if (sy_smmu_va && sy_smmu_slot <= 0x7f)
-+			sy_wr(sy_smmu_va, 0xc00 + 4 * sy_smmu_slot, 0x10000u);	/* S2CR: BYPASS */
-+		sy_wr(sy_bar_va, bhio + 0x2c, 0);
-+		sy_wr(sy_bar_va, bhio + 0x30, 0);
-+		sy_wr(sy_bar_va, bhio + 0x08, SY_IOVA_BASE);
-+		sy_wr(sy_bar_va, bhio + 0x0c, 0);
-+		sy_wr(sy_bar_va, bhio + 0x10, SY_SBL_SIZE);
-+		__asm__ volatile("dsb sy" ::: "memory");
-+		printf("PANDORA WLAN: BHI try2 (iATU inbound + SID bypass): status %#x s2cr %#x\n",
-+		    sy_rd(sy_bar_va, bhio + 0x2c),
-+		    sy_smmu_va ? sy_rd(sy_smmu_va, 0xc00 + 4 * sy_smmu_slot) : 0xffffffffu);
-+		sy_log_sync();
-+		sy_wr(sy_bar_va, bhio + 0x18, 0x0badc0de);
-+		for (t2 = 0; t2 < 300; t2++) {
-+			v2 = sy_rd(sy_bar_va, bhio + 0x2c);
-+			if ((v2 >> 30) == 2 || (v2 >> 30) == 3)
-+				break;
-+			sy_usleep(10000);
-+		}
-+		printf("PANDORA WLAN: BHI try2 result: status %#x code %u errcode %#x errdbg %#x/%#x/%#x\n",
-+		    v2, v2 >> 30, sy_rd(sy_bar_va, bhio + 0x30), sy_rd(sy_bar_va, bhio + 0x34),
-+		    sy_rd(sy_bar_va, bhio + 0x38), sy_rd(sy_bar_va, bhio + 0x3c));
-+		sy_log_sync();
-+		if ((v2 >> 30) == 2)
-+			st = v2;
-+	}
 +	sy_smmu_bank_scan();
 +	if (sy_smmu_va) {
 +		uint32_t gfsr = sy_rd(sy_smmu_va, 0x48);
