@@ -456,7 +456,7 @@
  }
  
  static void
-@@ -51,21 +470,2513 @@
+@@ -51,21 +470,2728 @@
  		cv_sleep(100);
  	}
  	if (rootvnode == NULLVP) {
@@ -732,6 +732,7 @@
 +static void sy_mhi_init(void);
 +static void sy_smmu_dump(void);
 +static void sy_cmddb_dump(void);
++static void sy_icc_vote(void);
 +static void sy_smmu_bank_scan(void);
 +static void sy_bhi_sbl(void);
 +static void sy_buf_alloc(void);
@@ -1786,6 +1787,7 @@
 +			sy_smmu_dump();
 +			(void)sy_smmu_install();
 +			sy_smmu_dump();
++			sy_icc_vote();
 +		}
 +		if (sy_step >= 15) {
 +			sy_bhi_sbl();
@@ -2704,6 +2706,219 @@
 +		printf("PANDORA WLAN: cmd-db[%u]: %-8s addr %#x len %#x\n", i / 16, name, addr, len);
 +		shown++;
 +	}
++	sy_log_sync();
++}
++
++
++/* ---- PCIe0 ICC (BCM) votes: ported from the locally working fuxi WLAN port ----
++ * Graph/aggregation/packet format: Linux icc-rpmh.c + bcm-voter.c. The BCM
++ * metadata comes from cmd-db by name; the addresses are never guessed. The
++ * ACTIVE TCS batch transport reuses the same RSC/TCS2 programming that already
++ * carries this driver's rail votes. */
++struct sy_rh_cmd { uint32_t addr, data, wait; };
++struct sy_bcm {
++	const char *name;
++	bool mask;
++	uint32_t addr, unit, width, vcd, version, x, y, data;
++};
++#define SY_ICC_N 6u
++static struct sy_bcm sy_bcms[SY_ICC_N] = {
++	{ .name = "SN7" }, { .name = "SH1", .mask = true }, { .name = "SH0" },
++	{ .name = "MC0" }, { .name = "ACV", .mask = true }, { .name = "CN0", .mask = true }
++};
++static int sy_icc_enabled = -1, sy_icc_failed, sy_icc_ready;
++
++static uint32_t
++sy_cdb8(uint32_t off)
++{
++	return *(volatile uint8_t *)(sy_cmddb + off);
++}
++
++static int
++sy_bcm_lookup(struct sy_bcm *b)
++{
++	uint32_t i, h;
++
++	if (!sy_cmddb || sy_rd(sy_cmddb, 0) != 1 || sy_rd(sy_cmddb, 4) != 0x0c0330db)
++		return 1;
++	for (h = 8; h < 136; h += 16) {
++		uint32_t slave = sy_cmddb16(h);
++		uint32_t at, aux, n;
++
++		if (!slave)
++			break;
++		at = 144 + sy_cmddb16(h + 2);
++		aux = 144 + sy_cmddb16(h + 4);
++		n = sy_cmddb16(h + 6);
++		if (slave < 3 || slave > 5 || at + n * 24 > 0x20000)
++			return 2;
++		for (i = 0; i < n; i++) {
++			uint32_t e = at + i * 24, j = 0;
++
++			for (; j < 8 && b->name[j]; j++)
++				if (sy_cdb8(e + j) != (uint8_t)b->name[j])
++					break;
++			if (j < 8 && b->name[j])
++				continue;
++			for (; j < 8 && !sy_cdb8(e + j); j++)
++				;
++			if (j != 8)
++				continue;
++			{
++				uint32_t addr = sy_rd(sy_cmddb, e + 16);
++				uint32_t len = sy_cmddb16(e + 20);
++				uint32_t data = aux + sy_cmddb16(e + 22);
++
++				if (slave != 5 || (addr >> 16) != 5 || (addr & 3) || len < 8 ||
++				    data + len > 0x20000)
++					return 3;
++				b->addr = addr; b->unit = sy_rd(sy_cmddb, data);
++				b->width = sy_cmddb16(data + 4); b->vcd = sy_cdb8(data + 6);
++				b->version = sy_cmddb16(h + 8);
++				if (!b->mask && (!b->unit || !b->width))
++					return 4;
++				return 0;
++			}
++		}
++	}
++	return 5;
++}
++
++static uint64_t
++sy_bcm_div(uint64_t value, uint32_t divisor)
++{
++	return value && value < divisor ? 1 : value / divisor;
++}
++
++static uint32_t
++sy_bcm_encode(uint64_t x, uint64_t y, bool commit)
++{
++	uint32_t valid = !!(x || y);
++
++	if (x > 0x3fff) x = 0x3fff;
++	if (y > 0x3fff) y = 0x3fff;
++	return (commit ? 1u << 30 : 0) | valid << 29 | (uint32_t)x << 14 | (uint32_t)y;
++}
++
++static void
++sy_bcm_bw(struct sy_bcm *b, uint32_t avg, uint32_t peak, unsigned buswidth, unsigned channels)
++{
++	uint64_t x = sy_bcm_div((uint64_t)avg * b->width, buswidth * channels);
++	uint64_t y = sy_bcm_div((uint64_t)peak * b->width, buswidth);
++
++	x = sy_bcm_div(x * 1000, b->unit);
++	y = sy_bcm_div(y * 1000, b->unit);
++	b->x = (uint32_t)(x > 0x3fff ? 0x3fff : x);
++	b->y = (uint32_t)(y > 0x3fff ? 0x3fff : y);
++}
++
++/* One ACTIVE TCS2 batch, same register protocol as sy_rpmh_vote_res(). */
++static uint32_t
++sy_rpmh_send_cmds(const struct sy_rh_cmd *cmds, unsigned n)
++{
++	const struct sy_rpmh_layout *L = &sy_rpmh_v3;
++	uint32_t t = 2, b, bit, irq_en, wait = 0, done = 0;
++	unsigned c, us;
++
++	if (!sy_rsc || !n || n > 8)
++		return 1;
++	b = SY_TCS_OFF + t * SY_TCS_STRIDE;
++	bit = 1u << t;
++	if (sy_rd(sy_rsc, b + L->control) || sy_rd(sy_rsc, b + L->enable) ||
++	    sy_rd(sy_rsc, b + L->wait) || sy_rd(sy_rsc, SY_TCS_OFF + 4) & bit)
++		return 1;
++	irq_en = sy_rd(sy_rsc, SY_TCS_OFF);
++	sy_wr(sy_rsc, b + L->control, 0);
++	sy_wr(sy_rsc, SY_TCS_OFF + 8, bit);
++	for (c = 0; c < n; c++) {
++		uint32_t q = b + c * L->cmd_stride;
++
++		sy_wr(sy_rsc, q + L->msgid, 8u | (1u << 16) | (1u << 8));
++		sy_wr(sy_rsc, q + L->addr, cmds[c].addr);
++		sy_wr(sy_rsc, q + L->data, cmds[c].data);
++		if (cmds[c].wait)
++			wait |= 1u << c;
++	}
++	sy_wr(sy_rsc, b + L->wait, wait);
++	sy_wr(sy_rsc, b + L->enable, (1u << n) - 1u);
++	sy_wr(sy_rsc, SY_TCS_OFF, sy_rd(sy_rsc, SY_TCS_OFF) | bit);
++	sy_wr(sy_rsc, b + L->control, SY_RPMH_AMC);
++	sy_wr(sy_rsc, b + L->control, SY_RPMH_AMC | SY_RPMH_TRIGGER);
++	for (us = 0; us < 10000 && !done; us++) {
++		bool all = (sy_rd(sy_rsc, SY_TCS_OFF + 4) & bit) != 0;
++
++		done = all && sy_rd(sy_rsc, b + L->status) != 0;
++		if (!done)
++			delay(1);
++	}
++	(void)sy_rpmh_sync(b + L->control, SY_RPMH_AMC);
++	(void)sy_rpmh_sync(b + L->control, 0);
++	(void)sy_rpmh_sync(b + L->enable, 0);
++	(void)sy_rpmh_sync(b + L->wait, 0);
++	sy_wr(sy_rsc, SY_TCS_OFF + 8, bit);
++	sy_wr(sy_rsc, SY_TCS_OFF, sy_rd(sy_rsc, SY_TCS_OFF) & ~bit);
++	return done ? 0 : 2;
++}
++
++static void
++sy_icc_vote(void)
++{
++	static const uint32_t cnss[][3] = {
++		{ 0, 0, 0 }, { 2250, 1600000, 2188800 }, { 7500, 1600000, 2188800 },
++		{ 30000, 1600000, 2188800 }, { 100000, 1600000, 2188800 },
++		{ 175000, 6448000, 6220800 }, { 312500, 6448000, 8368000 },
++		{ 587500, 8528000, 12800000 }, { 7500, 3200000, 2188800 }
++	};
++	struct sy_rh_cmd cmds[SY_ICC_N];
++	uint32_t i, peak = 250000, avg, p1, p2, e;
++
++	if (sy_icc_enabled < 0) {
++		(void)PE_parse_boot_argn("songyuan_icc", &sy_icc_enabled, sizeof(sy_icc_enabled));
++		if (sy_icc_enabled < 0)
++			sy_icc_enabled = 1;
++		printf("PANDORA WLAN: ICC: songyuan_icc=%d (PCIe0 BCM votes)\n", sy_icc_enabled);
++	}
++	if (!sy_icc_enabled || sy_icc_failed)
++		return;
++	if (!sy_icc_ready) {
++		for (i = 0; i < SY_ICC_N; i++) {
++			int r = sy_bcm_lookup(&sy_bcms[i]);
++
++			printf("PANDORA WLAN: ICC %s cmd-db addr %#x unit %u width %u vcd %u lookup %d\n",
++			    sy_bcms[i].name, sy_bcms[i].addr, sy_bcms[i].unit,
++			    sy_bcms[i].width, sy_bcms[i].vcd, r);
++			if (r) {
++				sy_icc_failed = 1;
++				printf("PANDORA WLAN: ICC: cmd-db lookup failed; no BCM vote sent\n");
++				return;
++			}
++		}
++		sy_icc_ready = 1;
++	}
++	avg = cnss[0][0];
++	p1 = cnss[0][1] > peak ? cnss[0][1] : peak;
++	p2 = cnss[0][2] > peak ? cnss[0][2] : peak;
++	sy_bcm_bw(&sy_bcms[0], avg, p1, 16, 1);
++	sy_bcms[1].x = 0; sy_bcms[1].y = 1;
++	sy_bcm_bw(&sy_bcms[2], avg, p2, 16, 4);
++	sy_bcm_bw(&sy_bcms[3], avg, p2, 4, 4);
++	sy_bcms[4].x = 0; sy_bcms[4].y = 8;
++	sy_bcms[5].x = 1; sy_bcms[5].y = 1;
++	for (i = 0; i < SY_ICC_N; i++)
++		sy_bcms[i].data = sy_bcm_encode(sy_bcms[i].x, sy_bcms[i].y, i + 1 == SY_ICC_N);
++	for (i = 0; i < SY_ICC_N; i++) {
++		cmds[i].addr = sy_bcms[i].addr;
++		cmds[i].data = sy_bcms[i].data;
++		cmds[i].wait = 1;
++	}
++	e = sy_rpmh_send_cmds(cmds, SY_ICC_N);
++	for (i = 0; i < SY_ICC_N; i++)
++		printf("PANDORA WLAN: ICC %s addr %#x vote %u/%u data %#x vcd %u\n",
++		    sy_bcms[i].name, sy_bcms[i].addr, sy_bcms[i].x, sy_bcms[i].y,
++		    sy_bcms[i].data, sy_bcms[i].vcd);
++	printf("PANDORA WLAN: ICC vote batch result %u (0 = acknowledged)\n", e);
++	if (e)
++		sy_icc_failed = 1;
 +	sy_log_sync();
 +}
 +
