@@ -456,7 +456,7 @@
  }
  
  static void
-@@ -51,21 +470,3053 @@
+@@ -51,21 +470,3060 @@
  		cv_sleep(100);
  	}
  	if (rootvnode == NULLVP) {
@@ -2514,39 +2514,46 @@
 +		    w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7], fsum);
 +		sy_log_sync();
 +	}
-+	/* One-boot matrix, step 1: ask PBL to read an unmapped IOVA. A CB fault proves
-+	 * that the endpoint's DMA is translated by our CB; silence means the stream never
-+	 * reaches it. The MHI block is reset afterwards and the image registers restored. */
 +	{
-+		uint64_t g = SY_IOVA_BASE + sy_buf_size + 0x4000;
-+		uint32_t f = 0, gg = 0, v = 0;
-+		unsigned t;
++		int guard2 = 0;
 +
-+		sy_wr(sy_bar_va, bhio + 0x20, 0);
-+		sy_wr(sy_bar_va, bhio + 0x2c, 0);
-+		sy_wr(sy_bar_va, bhio + 0x08, (uint32_t)g);
-+		sy_wr(sy_bar_va, bhio + 0x0c, (uint32_t)(g >> 32));
-+		sy_wr(sy_bar_va, bhio + 0x10, 0x1000);
-+		__asm__ volatile("dsb sy" ::: "memory");
-+		sy_wr(sy_bar_va, bhio + 0x18, 0x0badf00d);
-+		for (t = 0; t < 200; t++) {
-+			f = sy_cb_va ? sy_rd(sy_cb_va, 0x58) : 0;
-+			gg = sy_smmu_va ? sy_rd(sy_smmu_va, 0x48) : 0;
-+			v = sy_rd(sy_bar_va, bhio + 0x2c);
-+			if ((f & 0xc00001feu) || gg || (v >> 30) == 3)
-+				break;
-+			delay(1000);
++		(void)PE_parse_boot_argn("songyuan_guard2", &guard2, sizeof(guard2));
++		if (guard2 > 0) {
++		/* One-boot matrix, step 1: ask PBL to read an unmapped IOVA. A CB fault proves
++		 * that the endpoint's DMA is translated by our CB; silence means the stream never
++		 * reaches it. The MHI block is reset afterwards and the image registers restored. */
++		{
++			uint64_t g = SY_IOVA_BASE + sy_buf_size + 0x4000;
++			uint32_t f = 0, gg = 0, v = 0;
++			unsigned t;
++
++			sy_wr(sy_bar_va, bhio + 0x20, 0);
++			sy_wr(sy_bar_va, bhio + 0x2c, 0);
++			sy_wr(sy_bar_va, bhio + 0x08, (uint32_t)g);
++			sy_wr(sy_bar_va, bhio + 0x0c, (uint32_t)(g >> 32));
++			sy_wr(sy_bar_va, bhio + 0x10, 0x1000);
++			__asm__ volatile("dsb sy" ::: "memory");
++			sy_wr(sy_bar_va, bhio + 0x18, 0x0badf00d);
++			for (t = 0; t < 200; t++) {
++				f = sy_cb_va ? sy_rd(sy_cb_va, 0x58) : 0;
++				gg = sy_smmu_va ? sy_rd(sy_smmu_va, 0x48) : 0;
++				v = sy_rd(sy_bar_va, bhio + 0x2c);
++				if ((f & 0xc00001feu) || gg || (v >> 30) == 3)
++					break;
++				delay(1000);
++			}
++			printf("PANDORA WLAN: GUARD: unmapped %#llx -> cb_fsr %#x gfsr %#x bhi %#x after %u ms\n",
++			    (unsigned long long)g, f, gg, v, t);
++			sy_log_sync();
++			sy_mhi_reset();
++			sy_wr(sy_bar_va, bhio + 0x20, 0);
++			sy_wr(sy_bar_va, bhio + 0x2c, 0);
++			sy_wr(sy_bar_va, bhio + 0x08, SY_IOVA_BASE);
++			sy_wr(sy_bar_va, bhio + 0x0c, 0);
++			sy_wr(sy_bar_va, bhio + 0x10, SY_SBL_SIZE);
++			__asm__ volatile("dsb sy" ::: "memory");
 +		}
-+		printf("PANDORA WLAN: GUARD: unmapped %#llx -> cb_fsr %#x gfsr %#x bhi %#x after %u ms\n",
-+		    (unsigned long long)g, f, gg, v, t);
-+		sy_log_sync();
-+		sy_mhi_reset();
-+		sy_wr(sy_bar_va, bhio + 0x20, 0);
-+		sy_wr(sy_bar_va, bhio + 0x2c, 0);
-+		sy_wr(sy_bar_va, bhio + 0x08, SY_IOVA_BASE);
-+		sy_wr(sy_bar_va, bhio + 0x0c, 0);
-+		sy_wr(sy_bar_va, bhio + 0x10, SY_SBL_SIZE);
-+		__asm__ volatile("dsb sy" ::: "memory");
++		}
 +	}
 +	sy_wr(sy_bar_va, bhio + 0x18, 0x1234567);
 +	printf("PANDORA WLAN: BHI: doorbell rung seq 0x1234567, polling\n");
