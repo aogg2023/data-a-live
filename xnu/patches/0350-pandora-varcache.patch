@@ -456,7 +456,7 @@
  }
  
  static void
-@@ -51,21 +470,3030 @@
+@@ -51,21 +470,3047 @@
  		cv_sleep(100);
  	}
  	if (rootvnode == NULLVP) {
@@ -692,6 +692,7 @@
 +static vm_offset_t sy_l1, sy_l2, sy_l3;
 +static uint32_t sy_pages;
 +static vm_offset_t sy_sbl_va;
++static vm_offset_t sy_sbl_wc;	/* write-combined alias of the same physical pages */
 +static unsigned sy_buf_size;
 +static uint32_t sy_bhi_off;	/* BHIOFF read by the SBL stage, used again by BHIe */
 +static uint64_t sy_sbl_pa;
@@ -2222,6 +2223,13 @@
 +		}
 +	}
 +	sy_sbl_pa = sy_pa(sy_sbl_va);
++	/* Proven pattern from the locally working WCN port (lemonade_wifi.c): the device
++	 * must read what a write-combined alias of the same physical pages holds; a
++	 * cached write plus flush was never proven there and the boot loader kept
++	 * rejecting the image with no SMMU fault. */
++	sy_sbl_wc = ml_io_map_wcomb((vm_offset_t)sy_sbl_pa, sy_buf_size);
++	printf("PANDORA WLAN: BHI: write-combined alias %#lx of pa %#llx\n",
++	    (unsigned long)sy_sbl_wc, (unsigned long long)sy_sbl_pa);
 +	printf("PANDORA WLAN: BHI: buffer va %#lx pa %#llx size %#x (%s 4 GiB)\n",
 +	    (unsigned long)sy_sbl_va, (unsigned long long)sy_sbl_pa, sy_buf_size,
 +	    sy_sbl_pa < 0x100000000ull ? "below" : "ABOVE");
@@ -2395,13 +2403,22 @@
 +		printf("PANDORA WLAN: BHI: firmware not usable (size %#llx)\n", (unsigned long long)fs);
 +		return;
 +	}
-+	if (pandora_fw_read(fo, (void *)sy_sbl_va, SY_SBL_SIZE)) {
-+		printf("PANDORA WLAN: BHI: SBL read failed\n");
-+		return;
++	if (sy_sbl_wc) {
++		if (pandora_fw_read(fo, (void *)sy_sbl_wc, SY_SBL_SIZE)) {
++			printf("PANDORA WLAN: BHI: SBL read (WC alias) failed\n");
++			return;
++		}
++		__asm__ volatile("dsb sy" ::: "memory");
++		printf("PANDORA WLAN: BHI: image written through the write-combined alias\n");
++	} else {
++		if (pandora_fw_read(fo, (void *)sy_sbl_va, SY_SBL_SIZE)) {
++			printf("PANDORA WLAN: BHI: SBL read failed\n");
++			return;
++		}
++		for (off = 0; off < SY_SBL_SIZE; off += PAGE_SIZE)
++			flush_dcache64(sy_pa(sy_sbl_va + off), (unsigned)PAGE_SIZE, TRUE);
++		__asm__ volatile("dsb sy" ::: "memory");
 +	}
-+	for (off = 0; off < SY_SBL_SIZE; off += PAGE_SIZE)
-+		flush_dcache64(sy_pa(sy_sbl_va + off), (unsigned)PAGE_SIZE, TRUE);
-+	__asm__ volatile("dsb sy" ::: "memory");
 +	cmd = sy_rd(conf, SY_EP_CONF + 0x04) & 0xffff;
 +	sy_wr(conf, SY_EP_CONF + 0x04, cmd | 0x404);
 +	printf("PANDORA WLAN: BHI: ep cmd %#x -> %#x; bhio %#x sbl %#lx iova %#x\n",
@@ -2481,7 +2498,7 @@
 +		return;
 +	}
 +	{
-+		volatile uint32_t *w = (volatile uint32_t *)sy_sbl_va;
++		volatile uint32_t *w = (volatile uint32_t *)(sy_sbl_wc ? sy_sbl_wc : sy_sbl_va);
 +		uint32_t fsum = 0;
 +		unsigned fi;
 +
