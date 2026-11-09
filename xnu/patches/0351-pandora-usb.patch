@@ -6224,7 +6224,7 @@ index 0000000000000000000000000000000000000000..00000000000000000000000000000000
 diff --git a/bsd/dev/pandora_cachevol.c b/bsd/dev/pandora_cachevol.c
 --- a/bsd/dev/pandora_cachevol.c
 +++ b/bsd/dev/pandora_cachevol.c
-@@ -547,6 +547,7 @@
+@@ -549,6 +549,7 @@
  extern kern_return_t thread_terminate(thread_t);
  extern kern_return_t kernel_thread_start_priority(thread_continue_t, void *, integer_t, thread_t *);
  void pandora_wlan_init(void);
@@ -6232,7 +6232,7 @@ diff --git a/bsd/dev/pandora_cachevol.c b/bsd/dev/pandora_cachevol.c
  
  /* ---- windows (live DT /soc/pcie@1c00000 reg, reg-names) ---- */
  #define SY_PARF_PA	0x01c00000UL	/* "parf", 0x3000 */
-@@ -3511,6 +3512,7 @@
+@@ -3517,6 +3518,7 @@
  {
  	thread_t thread;
  	pandora_wlan_init();	/* M1: PCIe RC0 bring-up, boot-arg songyuan_wlan */
