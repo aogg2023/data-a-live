@@ -456,7 +456,7 @@
  }
  
  static void
-@@ -51,21 +470,2713 @@
+@@ -51,21 +470,2739 @@
  		cv_sleep(100);
  	}
  	if (rootvnode == NULLVP) {
@@ -1308,6 +1308,12 @@
 +			return false;
 +		}
 +	}
++	/* Completeness audit: print the exact masks this driver relies on so a missing
++	 * clock bit is visible in every boot log (the 2026-11-09 ANOC AHB omission was
++	 * invisible for 20+ builds because only "domains on" was printed). */
++	printf("PANDORA WLAN: clock audit: GCC 0x52008 %#x (want bits 0-3,5,6; pipe 4 with the PHY) "
++	    "0x52000 %#x (want bits 12,19,20,22) 0x52018 %#x (want bit 31)\n",
++	    sy_gcc_rd(GCC_VOTE_BRANCH), sy_gcc_rd(GCC_VOTE_BRANCH2), sy_gcc_rd(0x52018));
 +	printf("PANDORA WLAN: domains on; aux, reference and branch clocks running\n");
 +	return true;
 +}
@@ -2225,6 +2231,26 @@
 +	    cmd, sy_rd(conf, SY_EP_CONF + 0x04) & 0xffff, bhio,
 +	    (unsigned long)SY_SBL_SIZE, SY_IOVA_BASE);
 +	sy_log_sync();
++
++	/* Vendor pci-msm.c link-enable order, checked against the live DT:
++	 *  - the root port's command register gets memory + bus-master (the endpoint's
++	 *    own command register is set below);
++	 *  - PARF 0x4A0 bit0 (AXI_MSTR_WR_NS_BDF_HALT) is cleared because the DT has no
++	 *    qcom,bdf-change-halt-en; if a boot chain left it set, the endpoint's
++	 *    writes are halted silently (exactly our "no SMMU fault" signature).
++	 */
++	{
++		uint32_t rp = sy_rd(dbi, 0x04);
++		uint32_t bdf = sy_rd(parf, 0x4a0);
++
++		sy_wr(dbi, 0x04, rp | 0x6);		/* MEM | MASTER */
++		sy_wr(parf, 0x4a0, bdf & ~1u);		/* NS BDF halt off (vendor default) */
++		printf("PANDORA WLAN: BHI: root port cmd %#x -> %#x; parf 0x4a0 %#x -> %#x; "
++		    "0x1a8 %#x 0x174 %#x\n", rp, sy_rd(dbi, 0x04), bdf, sy_rd(parf, 0x4a0),
++		    sy_rd(parf, 0x1a8), sy_rd(parf, 0x174));
++		sy_log_sync();
++	}
++
 +	sy_wr(sy_bar_va, bhio + 0x20, 0);          /* INTVEC */
 +	sy_wr(sy_bar_va, bhio + 0x2c, 0);          /* STATUS clear */
 +	sy_wr(sy_bar_va, bhio + 0x08, SY_IOVA_BASE);            /* IMGADDR lo (IOVA) */
