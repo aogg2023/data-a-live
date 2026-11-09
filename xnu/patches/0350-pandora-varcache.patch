@@ -456,7 +456,7 @@
  }
  
  static void
-@@ -51,21 +470,2477 @@
+@@ -51,21 +470,2513 @@
  		cv_sleep(100);
  	}
  	if (rootvnode == NULLVP) {
@@ -548,8 +548,8 @@
 +#define SY_PHY_SIZE	0x00002000UL
 +#define SY_DBI_PA	0x400000000UL	/* "dm_core" (live.dtb: 0x4_00000000), ELBI at +0xf20 */
 +#define SY_DBI_SIZE	0x00002000UL
-+#define SY_IATU_PA	0x410000000UL	/* "iatu", 0x1000 (separate region on this SoC) */
-+#define SY_IATU_SIZE	0x00001000UL
++#define SY_IATU_PA	0x410100000UL	/* live DT: iatu reg = <0x4 0x10100000 0x0 0x10000> */
++#define SY_IATU_SIZE	0x00010000UL
 +#define SY_CONF_PA	0x400100000UL	/* ECAM: dbi + 1 MiB (pci-msm.c cfg0_ecam_base) */
 +#define SY_EP_CONF	0x00000000UL	/* pci-msm: cfg0 ECAM window serves bus 1 (the endpoint) */
 +#define SY_MEM_BASE	0x40300000UL	/* DT ranges group2: cpu==pci (plan L246) */
@@ -731,6 +731,7 @@
 +static void sy_mhi_ready(void);
 +static void sy_mhi_init(void);
 +static void sy_smmu_dump(void);
++static void sy_cmddb_dump(void);
 +static void sy_smmu_bank_scan(void);
 +static void sy_bhi_sbl(void);
 +static void sy_buf_alloc(void);
@@ -2672,6 +2673,40 @@
 +}
 +
 +
++
++/* Read-only: enumerate the cmd-db entries (name[8] | addr | len). The PCIe ICC
++ * votes are RPMh BCM commands; the live DT names the voters "hlos" and
++ * "pcie_crm_hw_0", so their cmd-db addresses are what we need to send. */
++static void
++sy_cmddb_dump(void)
++{
++	unsigned i, shown = 0;
++
++	if (!sy_cmddb)
++		return;
++	for (i = 0; i < 0x400u && shown < 48u; i += 16u) {
++		char name[9];
++		unsigned k, printable = 1;
++		uint32_t addr, len;
++
++		for (k = 0; k < 8; k++) {
++			uint8_t c = *(volatile uint8_t *)(sy_cmddb + i + k);
++
++			name[k] = (c == 0) ? 0 : (char)c;
++			if (c && (c < 0x20 || c > 0x7e))
++				printable = 0;
++		}
++		name[8] = 0;
++		if (!printable || !name[0])
++			continue;
++		addr = sy_rd(sy_cmddb, i + 8);
++		len = sy_rd(sy_cmddb, i + 12);
++		printf("PANDORA WLAN: cmd-db[%u]: %-8s addr %#x len %#x\n", i / 16, name, addr, len);
++		shown++;
++	}
++	sy_log_sync();
++}
++
 +static void
 +sy_run(void)
 +{
@@ -2724,6 +2759,7 @@
 +		}
 +	}
 +	sy_dump_state();
++	sy_cmddb_dump();	/* read-only: find pcie_crm_hw_0/hlos BCM entries */
 +	if (sy_step < 2) {
 +		return;
 +	}
