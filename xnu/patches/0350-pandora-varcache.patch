@@ -456,7 +456,7 @@
  }
  
  static void
-@@ -51,21 +470,7152 @@
+@@ -51,21 +470,7978 @@
  		cv_sleep(100);
  	}
  	if (rootvnode == NULLVP) {
@@ -764,6 +764,7 @@
 +static void sy_mhi_ready(void);
 +static void sy_mhi_init(void);
 +static void sy_mhi_chan_start(void);
++static int sy_mhi_ipcr_start(void);
 +static void sy_mhi_poll(void);
 +static void sy_mhi_map_uc(vm_offset_t);
 +static void sy_mhi_ev_walk(unsigned, unsigned *);
@@ -795,6 +796,9 @@
 +static void sy_d3_on_mgmt(const uint8_t *f, unsigned flen);
 +static void sy_d3_run(void);
 +static void sy_e_run(void);	/* stage 24: HTT rings, TCL/REO, buffers */
++static errno_t sy_f_output(ifnet_t ifp, mbuf_t m);
++static errno_t sy_f_ioctl(ifnet_t ifp, unsigned long cmd, void *data);
++static void sy_f_service(void);	/* stage 25: Apple80211 replies, HTT rx/tx */
 +
 +static vm_offset_t parf, phy, dbi, iatu, conf, pcism, gcc_low, gcc, tlmm_low, tlmm, tcsr, rsc, cmddb, crm;
 +#define SY_PHY_ROWS (sizeof(sy_phy_seq) / sizeof(sy_phy_seq[0]))
@@ -1907,6 +1911,9 @@
 +		    (sy_mhi_m0_ok || sy_chan_force)) {
 +			sy_e_run();
 +		}
++		/* stage 25 is sy_f_service() in sy_thread, after en0 is attached.
++		 * sy_run() returns before sy_net_attach(), so the data loop cannot
++		 * start here. */
 +			if (smmu) {
 +				printf("PANDORA WLAN: SMMU IDR0 %#x IDR1 %#x IDR2 %#x CR0 %#x\n",
 +				    sy_rd(smmu, 0x00), sy_rd(smmu, 0x04), sy_rd(smmu, 0x08), sy_rd(smmu, 0x20));
@@ -3348,8 +3355,12 @@
 +	printf("PANDORA WLAN: MHI init done (contexts + channels; M0 before BHIe)\n");
 +}
 +
-+/* Post the receive buffers and ring the channel doorbells: this is where the device
-+ * learns that the host is ready for QRTR/QMI. Only valid once AMSS runs (M0). */
++/* START channels 20 and 21 before any channel doorbell. Linux
++ * mhi_prepare_channel (ref_mhi_main.c:1433-1455) sends MHI_CMD_START_CHAN
++ * and waits for completion code 1. The phone QRTR client
++ * (q_net_qrtr_mhi.c:109-136) prepares IPCR before queueing DL buffers.
++ * ioslog_k9 rang CHDB for channels 1 and 21 with no START; 32 ms later
++ * ring 0 posted state 255. Channel 1 is LOOPBACK and is not doorbell'd. */
 +static void
 +sy_mhi_chan_start(void)
 +{
@@ -3368,13 +3379,18 @@
 +	}
 +	pg_va = sy_sbl_va + 0x7C0000;
 +	pg = SY_IOVA_MAP + 0x7C0000;
++	if (!sy_mhi_ipcr_start()) {
++		printf("PANDORA WLAN: MHI chan: START failed, no CHDB\n");
++		sy_log_sync();
++		return;
++	}
 +	for (i = 0, dl = 0; i < sizeof(sy_mhi_desc) / sizeof(sy_mhi_desc[0]); i++) {
 +		const struct sy_mhi_chan_desc *d = &sy_mhi_desc[i];
 +		uint32_t ring = d->ring;
 +		uint64_t wp;
 +
-+		if (d->dir != SY_DMA_FROM_DEV)
-+			continue;			/* DL channels take host buffers */
++		if (d->num != 21)
++			continue;			/* only IPCR DL; not LOOPBACK ch 1 */
 +		for (n = 0; n < SY_MHI_DL_NBUF; n++) {
 +			buf = pg + SY_MHI_DL_BUF + ((uint64_t)(dl * SY_MHI_DL_NBUF + n) << 11);
 +			tre = pg_va + ring + (n << 4);
@@ -3417,6 +3433,14 @@
 +static uint32_t sy_mhi_wp_off[2] = {
 +	SY_MHI_ER0_LEN - 16u, SY_MHI_ER1_LEN - 16u
 +};
++/* Command ring cursor. sy_mhi_init leaves the command wp at the ring base and
++ * is called once, so this starts at 0. MHI_CMD_START_CHAN is 0x12
++ * (ref_mhi_common.h:137-142). Completion code 1 is MHI_EV_CC_SUCCESS. */
++static uint32_t sy_mhi_cmd_hi;
++static uint32_t sy_mhi_cmd_wait_ch = 0xffffffffu;
++static uint64_t sy_mhi_cmd_wait_tre;
++static int sy_mhi_cmd_code;
++static int sy_mhi_ipcr_ok;
 +
 +static void
 +sy_mhi_ev_walk(unsigned idx, unsigned *shown)
@@ -3451,7 +3475,15 @@
 +		ptr = (uint64_t)sy_rd(e, 0) | ((uint64_t)sy_rd(e, 4) << 32);
 +		d0 = sy_rd(e, 8); d1 = sy_rd(e, 12);
 +		type = (d1 >> 16) & 0xffu;
-+		if (*shown < 24) {
++		if (type == 0x21) {		/* command completion; not under the print cap */
++			uint32_t ch = d1 >> 24, code = d0 >> 24;
++
++			printf("PANDORA WLAN: MHI cmd completion ch %u code %u tre %#llx\n",
++			    ch, code, (unsigned long long)ptr);
++			if (sy_mhi_cmd_code < 0 && ch == sy_mhi_cmd_wait_ch &&
++			    ptr == sy_mhi_cmd_wait_tre)
++				sy_mhi_cmd_code = (int)code;
++		} else if (*shown < 24) {
 +			if (type == 2) {		/* transfer event */
 +				uint32_t ch = d1 >> 24, code = d0 >> 24, len = d0 & 0xffffu;
 +
@@ -3527,6 +3559,71 @@
 +		printf("PANDORA WLAN: MHI ERDB recycle ring %u dev %#x wp %#llx\n",
 +		    idx, dev, (unsigned long long)wp);
 +	}
++}
++
++/* One MHI_CMD_START_CHAN (0x12) on the primary command ring, then CRDB
++ * at BAR+0x70. ref_mhi_main.c:1294-1308 writes the TRE; :124-132 rings
++ * the doorbell with the command-context wp. Timeout is ath12k's 2000 ms. */
++static int
++sy_mhi_cmd_start(uint32_t chan)
++{
++	vm_offset_t pg_va, tre, ctx;
++	uint64_t pg, tre_iova, wp;
++	uint32_t i, els;
++
++	if (!sy_bar_va || !sy_sbl_va)
++		return 0;
++	pg_va = sy_sbl_va + 0x7C0000;
++	pg = SY_IOVA_MAP + 0x7C0000;
++	els = SY_MHI_CMD_LEN / 16u;
++	tre_iova = pg + SY_MHI_CMD_R + (uint64_t)sy_mhi_cmd_hi * 16u;
++	tre = pg_va + SY_MHI_CMD_R + (vm_offset_t)sy_mhi_cmd_hi * 16u;
++	sy_wr(tre, 0, 0);
++	sy_wr(tre, 4, 0);
++	sy_wr(tre, 8, 0);
++	sy_wr(tre, 12, (chan << 24) | (0x12u << 16));
++	sy_mhi_cmd_hi = (sy_mhi_cmd_hi + 1u) % els;
++	wp = pg + SY_MHI_CMD_R + (uint64_t)sy_mhi_cmd_hi * 16u;
++	ctx = pg_va + SY_MHI_CMD_CTX;
++	sy_wr(ctx, 0x24, (uint32_t)wp);
++	sy_wr(ctx, 0x28, (uint32_t)(wp >> 32));
++	flush_dcache64(sy_pa(tre & ~(vm_offset_t)(PAGE_SIZE - 1)), (unsigned)PAGE_SIZE, TRUE);
++	flush_dcache64(sy_pa(ctx), (unsigned)PAGE_SIZE, TRUE);
++	__asm__ volatile("dsb sy" ::: "memory");
++	sy_mhi_cmd_wait_ch = chan;
++	sy_mhi_cmd_wait_tre = tre_iova;
++	sy_mhi_cmd_code = -1;
++	sy_wr(sy_bar_va, 0x70, (uint32_t)wp);
++	sy_wr(sy_bar_va, 0x74, (uint32_t)(wp >> 32));
++	__asm__ volatile("dsb sy" ::: "memory");
++	for (i = 0; i < 2000 && sy_mhi_cmd_code < 0; i++) {
++		unsigned shown = 0;
++		uint32_t st = sy_rd(sy_bar_va, 0x48);
++
++		sy_mhi_ev_walk(0, &shown);
++		sy_mhi_ev_walk(1, &shown);
++		if (((st >> 8) & 0xffu) == 255)
++			break;
++		if (sy_mhi_cmd_code < 0)
++			delay(1000);
++	}
++	printf("PANDORA WLAN: MHI START ch %u code %d after %u ms status %#x\n",
++	    chan, sy_mhi_cmd_code, i, sy_rd(sy_bar_va, 0x48));
++	sy_mhi_cmd_wait_ch = 0xffffffffu;
++	sy_mhi_cmd_wait_tre = 0;
++	sy_log_sync();
++	return sy_mhi_cmd_code == 1;
++}
++
++static int
++sy_mhi_ipcr_start(void)
++{
++	if (!sy_mhi_cmd_start(20))
++		return 0;
++	if (!sy_mhi_cmd_start(21))
++		return 0;
++	sy_mhi_ipcr_ok = 1;
++	return 1;
 +}
 +
 +static void
@@ -3980,24 +4077,19 @@
 +	return sy_qmi_finish(b, at);
 +}
 +
-+/* ind_register: element table exists in ath12k/qmi.c; mainline v6.6 does not send
-+ * it, kept for completeness so the sequence can be tried if firmware asks. */
++/* ath12k_qmi_fw_ind_register_send (ath12k_v66/qmi.c:1999-2028) marks only
++ * these fields valid. ath12k_qmi_event_server_arrive (qmi.c:2784-2795)
++ * sends this before host_cap. */
 +static unsigned
 +sy_wlfw_ind_register(uint8_t *b, uint16_t txn)
 +{
 +	unsigned at = sy_qmi_hdr(b, 0x00, txn, SY_QMI_WLFW_IND_REGISTER_REQ);
 +
 +	at = sy_qmi_tlv_u8(b, at, 0x10, 1);	/* fw_ready */
-+	at = sy_qmi_tlv_u8(b, at, 0x11, 1);	/* initiate cal download */
-+	at = sy_qmi_tlv_u8(b, at, 0x12, 1);	/* initiate cal update */
-+	at = sy_qmi_tlv_u8(b, at, 0x13, 1);	/* msa ready */
-+	at = sy_qmi_tlv_u8(b, at, 0x14, 1);	/* pin connect result */
-+	at = sy_qmi_tlv_u32(b, at, 0x15, 0x4b4e454c);	/* client id, QMI_WLANFW_CLIENT_ID */
++	at = sy_qmi_tlv_u32(b, at, 0x15, 0x4b4e454c);	/* client id */
 +	at = sy_qmi_tlv_u8(b, at, 0x16, 1);	/* request mem */
 +	at = sy_qmi_tlv_u8(b, at, 0x17, 1);	/* fw mem ready */
 +	at = sy_qmi_tlv_u8(b, at, 0x18, 1);	/* fw init done */
-+	at = sy_qmi_tlv_u8(b, at, 0x19, 0);	/* rejuvenate */
-+	at = sy_qmi_tlv_u8(b, at, 0x1a, 1);	/* xo cal */
 +	at = sy_qmi_tlv_u8(b, at, 0x1b, 1);	/* cal done */
 +	return sy_qmi_finish(b, at);
 +}
@@ -4230,6 +4322,7 @@
 +static uint32_t sy_wlfw_ul_wp;
 +static uint32_t sy_wlfw_node, sy_wlfw_port;
 +static unsigned sy_wlfw_state;
++static int sy_wlfw_cap_sent;
 +static uint8_t sy_wlfw_txbuf[SY_WLFW_TX_MAX];
 +static uint8_t sy_bdf_buf[6144];
 +static uint8_t sy_bdf_msg[7168];
@@ -4237,7 +4330,7 @@
 +static void sy_wlfw_m3_send(void);
 +/* sy_wlfw_rx() calls this before its definition; C99 rejects implicit
 + * declarations (CI run 42737773853 hit exactly this in pandora_cachevol.c). */
-+static void sy_wlfw_response(const uint8_t *, unsigned, uint16_t);
++static int sy_wlfw_response(const uint8_t *, unsigned, uint16_t);
 +
 +static void
 +sy_mhi_ctx_publish(uint32_t chan, uint32_t ring_off, uint32_t wp_idx)
@@ -4268,6 +4361,10 @@
 +
 +	if (!sy_bar_va || !sy_sbl_va || len == 0 || len > SY_WLFW_TX_MAX)
 +		return -1;
++	if (!sy_mhi_ipcr_ok) {
++		printf("PANDORA WLAN: MHI tx ch %u deferred, IPCR not started\n", chan);
++		return -1;
++	}
 +	for (i = 0; i < sizeof(sy_mhi_desc) / sizeof(sy_mhi_desc[0]); i++) {
 +		if (sy_mhi_desc[i].num == chan) {
 +			els = sy_mhi_desc[i].els;
@@ -4337,7 +4434,7 @@
 +		if (service == SY_WLFW_SERVICE_ID && !sy_wlfw_node) {
 +			sy_wlfw_node = node;
 +			sy_wlfw_port = port;
-+			at = sy_wlfw_host_cap(sy_wlfw_txbuf, sy_wlfw_txn++);
++			at = sy_wlfw_ind_register(sy_wlfw_txbuf, sy_wlfw_txn++);
 +			{
 +				uint8_t frame[2048];
 +				unsigned fl = sy_qrtr_frame(frame, SY_QRTR_TYPE_DATA, 0,
@@ -4345,7 +4442,6 @@
 +				    sy_wlfw_txbuf, at);
 +				(void)sy_mhi_send(20, frame, fl);
 +			}
-+			sy_wlfw_state = 1;
 +		}
 +		return;
 +	}
@@ -4404,6 +4500,20 @@
 +		} else if (msgid == SY_QMI_WLFW_FW_READY_IND) {
 +			printf("PANDORA WLAN: WLFW FW READY (state %u)\n", sy_wlfw_state);
 +			sy_wlfw_state = 3;
++		} else if (msgid == SY_QMI_WLFW_IND_REGISTER_REQ) {
++			if (sy_wlfw_response(b + q, (unsigned)qlen + 7, msgid) == 0 &&
++			    !sy_wlfw_cap_sent) {
++				uint8_t frame[2048];
++				unsigned fl;
++
++				sy_wlfw_cap_sent = 1;
++				at = sy_wlfw_host_cap(sy_wlfw_txbuf, sy_wlfw_txn++);
++				fl = sy_qrtr_frame(frame, SY_QRTR_TYPE_DATA, 0,
++				    SY_WLFW_QRTR_PORT, src_node, src_port,
++				    sy_wlfw_txbuf, at);
++				(void)sy_mhi_send(20, frame, fl);
++				sy_wlfw_state = 1;
++			}
 +		} else if (msgid == SY_QMI_WLFW_HOST_CAP_REQ || msgid == SY_QMI_WLFW_BDF_DOWNLOAD_REQ ||
 +		    msgid == SY_QMI_WLFW_M3_INFO_REQ) {
 +			sy_wlfw_response(b + q, (unsigned)qlen + 7, msgid);
@@ -4426,6 +4536,11 @@
 +
 +	if (!sy_bar_va || !sy_sbl_va)
 +		return;
++	if (!sy_mhi_ipcr_ok) {
++		printf("PANDORA WLAN: WLFW: deferred, IPCR START did not complete\n");
++		sy_log_sync();
++		return;
++	}
 +	fl = sy_qrtr_ctrl(frame, SY_QRTR_CMD_HELLO, 0, 0, 1, SY_QRTR_PORT_CTRL, 0, 0, 0, 0);
 +	(void)sy_mhi_send(20, frame, fl);
 +	fl = sy_qrtr_ctrl(frame, SY_QRTR_CMD_NEW_LOOKUP, 0, SY_WLFW_QRTR_PORT, 1,
@@ -4501,7 +4616,7 @@
 +}
 +
 +/* QMI response: TLV 0x02 carries result (u16) and error (u16). */
-+static void
++static int
 +sy_wlfw_response(const uint8_t *b, unsigned len, uint16_t msgid)
 +{
 +	unsigned at = 7;
@@ -4518,18 +4633,22 @@
 +			    msgid, result, error);
 +			if (msgid == SY_QMI_WLFW_HOST_CAP_REQ && result == 0)
 +				printf("PANDORA WLAN: WLFW host_cap accepted\n");
-+			return;
++			if (msgid == SY_QMI_WLFW_IND_REGISTER_REQ && result == 0)
++				printf("PANDORA WLAN: WLFW ind_register accepted\n");
++			return (int)result;
 +		}
 +		at = at + 3 + tl;
 +	}
 +	printf("PANDORA WLAN: WLFW resp msg %#x: no result TLV\n", msgid);
++	return -1;
 +}
 +
 +/* ---- M6a: en0 (ifnet + Apple80211 ioctl surface) --------------------------------
 + * Ported from the locally working UniXNU-sheng WifiNet.cpp (same ifnet KPI, same
 + * Apple80211 command numbers). Off by default (songyuan_net=1): it publishes an
 + * interface so the system side can be checked while the radio stack is still being
-+ * brought up, and answers nothing that needs firmware yet (M6b). */
++ * brought up.  The request table and the HTT data path are sy_f_ioctl() /
++ * sy_f_output() / sy_f_service() (stage 25). */
 +#define SY_SIOCSA80211 0x802869c8UL
 +#define SY_SIOCGA80211 0xc02869c9UL
 +
@@ -4544,30 +4663,14 @@
 +static errno_t
 +sy_net_output(ifnet_t ifp, mbuf_t m)
 +{
-+	(void)ifp;
-+	sy_net_out++;
-+	if (m)
-+		mbuf_freem(m);
-+	return 0;
++	return sy_f_output(ifp, m);
 +}
 +
 +static errno_t
 +sy_net_ioctl(ifnet_t ifp, unsigned long cmd, void *data)
 +{
 +	(void)ifp;
-+	sy_net_ioctls++;
-+	if (cmd == SY_SIOCGA80211 || cmd == SY_SIOCSA80211) {
-+		struct sy_apple80211req *rq = (struct sy_apple80211req *)data;
-+
-+		if (rq) {
-+			printf("PANDORA WLAN: net: Apple80211 %s type %d val %d len %u\n",
-+			    cmd == SY_SIOCGA80211 ? "get" : "set", rq->type, rq->val, rq->len);
-+			/* M6b fills real data once M5 works; the reply length is left
-+			 * untouched here, the request's data pointer is a user address. */
-+		}
-+		return 0;
-+	}
-+	return EOPNOTSUPP;
++	return sy_f_ioctl(ifp, cmd, data);
 +}
 +
 +static void
@@ -4894,6 +4997,10 @@
 +	sy_log_sync();
 +	sy_run();
 +	sy_m5_m6_if_asked();
++	/* stage 25: F keeps this thread to drain REO into ifnet_input.
++	 * sy_e_ran is declared further down; sy_f_service() checks it. */
++	if (sy_step >= 25 && sy_ifp)
++		sy_f_service();
 +	if (!sy_keep_alive)
 +		sy_platform_poweroff();
 +	printf("PANDORA WLAN: thread: sy_run returned\n");
@@ -7376,8 +7483,8 @@
 + *
 + * RX_RING_SELECTION_CFG is not sent.  ath12k's wcn7850 filter carries
 + * hal_rx_desc_wcn7850 offsets (dp_rx.c:3976-3983).  This module's RX TLV
-+ * parsers are hal_rx_*_peach, and those qword offsets were not counted out
-+ * of the ko.
++ * parsers are hal_rx_*_peach.  The three getters stage 25 uses are counted
++ * in the F comment below.
 + *
 + * target_ce_config_wlan in the same ko (9 x 6 words, 216 bytes) is not what
 + * D1's WLAN_CFG sends.  hif_ce_prepare_config picks a table from the target
@@ -7498,7 +7605,8 @@
 +	next = (sy_e_tcl_hp + dw) % ring_dw;
 +	if (next == tp)
 +		return -1;
-+	memcpy((void *)(sy_ce_va + SY_E_OFF_TXBUF), frame, len);
++	if (frame != (const void *)(sy_ce_va + SY_E_OFF_TXBUF))
++		memcpy((void *)(sy_ce_va + SY_E_OFF_TXBUF), frame, len);
 +	flush_dcache64(sy_pa(sy_ce_va + SY_E_OFF_TXBUF), len, TRUE);
 +	iova = SY_CE_IOVA + SY_E_OFF_TXBUF;
 +	d = (uint32_t *)(sy_ce_va + SY_E_OFF_TCL) + sy_e_tcl_hp;
@@ -7602,6 +7710,724 @@
 +	    "reo r2 %#x\n", SY_E_N_TCL, SY_E_N_REO, SY_E_N_WBM, sy_e_idle_hp,
 +	    sy_e_rx_hp, sy_ce_rd(SY_E_REO_R2));
 +	sy_log_sync();
++}
++
++/* ---- F: Apple80211 request table and HTT data (stage 25) ------------------
++ *
++ * Request numbers and struct sizes are the iOS 16.5 layout in
++ * ref/hackios-xnu-kernel/.../redwood_apple80211.c (lines 89-196, 301-314,
++ * 398).  Plan WIFI-2026-11-01.md section 13.33 lists types 19, 13, 15, 2,
++ * 12, 14, 1, 9, 4, 16, 17, 8, 7, 10, 11, 20, 22.  Type 21 is the GET that
++ * wifid polls after SET 20 (redwood line 367).  Channel lists 27/207/254
++ * are not in the plan and this driver has no measured channel table.
++ *
++ * Peach RX, from this phone's qca_cld3_peach_v2.ko:
++ *   hal_rx_pkt_hdr_get_be            text 0x43ffc0  add x0, x0, #0x78
++ *   hal_rx_msdu_start_msdu_len_get_be text 0x444f90  ldr [x0, #0x28]; and #0x3fff
++ *   hal_rx_tlv_decap_format_get_be   text 0x444f1c  ldr [x0, #0x2c]; ubfx #8, #2
++ * ath12k dp_rx.h: decap 2 is ETHERNET2_DIX.  Only that value is given to
++ * ifnet_input.  The REO dest descriptor is the 32-byte hal_reo_dest_ring
++ * (hal_desc.h:838).  RX_RING_SELECTION_CFG stays unsent.  The TCL bank
++ * register was not in the peach ring table, so a frame is posted with the
++ * bank-0 descriptor E already writes.  Keys and EAPOL are not programmed.
++ */
++#define SY_F_SSID		1
++#define SY_F_AUTH		2
++#define SY_F_CHANNEL		4
++#define SY_F_TXPOWER		7
++#define SY_F_RATE		8
++#define SY_F_BSSID		9
++#define SY_F_SCAN		10
++#define SY_F_RESULT		11
++#define SY_F_CAPS		12
++#define SY_F_STATE		13
++#define SY_F_PHY		14
++#define SY_F_OPMODE		15
++#define SY_F_RSSI		16
++#define SY_F_NOISE		17
++#define SY_F_POWER		19
++#define SY_F_ASSOC		20
++#define SY_F_ASSOC_RES		21
++#define SY_F_DISASSOC		22
++#define SY_F_EV_POWER		1u
++#define SY_F_EV_LINK		4u
++#define SY_F_EV_ASSOC		9u
++#define SY_F_EV_SCAN		10u
++
++struct sy_f_channel {
++	uint32_t version, channel, flags;
++};
++
++struct sy_f_scan {
++	uint32_t version;
++	struct sy_f_channel channel;
++	uint16_t noise_known;
++	int16_t noise, snr, rssi;
++	uint16_t beacon_interval, capability;
++	uint8_t bssid[6];
++	uint8_t rate_count, unused_0;
++	uint32_t rates[15];
++	uint8_t ssid_length, ssid[32], unused_1[3];
++	uint32_t age_ms;
++	uint8_t flags, unused_2;
++	uint16_t elements_length;
++	uint8_t elements[1024];
++};
++
++struct sy_f_assoc {
++	uint32_t version;
++	uint16_t mode, auth_lower, auth_upper, unused_0;
++	uint32_t ssid_length;
++	uint8_t ssid[32];
++	uint8_t bssid[6], unused_1[2];
++	uint32_t key_version, key_length, key_cipher;
++	uint16_t key_flags, key_index;
++	uint8_t key[64];
++};
++
++struct sy_f_link {
++	uint8_t down, unused_0[3];
++	int32_t rssi;
++	uint16_t snr, noise;
++	uint8_t unused_1[4];
++	uint8_t involuntary, unused_2[3];
++	uint32_t reason, subreason;
++	uint8_t unused_3[4];
++};
++
++_Static_assert(sizeof(struct sy_f_scan) == 1164, "scan result");
++_Static_assert(offsetof(struct sy_f_scan, ssid_length) == 0x60, "ssid");
++_Static_assert(offsetof(struct sy_f_scan, age_ms) == 0x84, "age");
++_Static_assert(offsetof(struct sy_f_scan, elements) == 0x8c, "ie");
++_Static_assert(sizeof(struct sy_f_assoc) == 0x88, "assoc prefix");
++_Static_assert(offsetof(struct sy_f_assoc, key) == 0x48, "key");
++_Static_assert(sizeof(struct sy_f_link) == 32, "link event");
++
++static unsigned sy_f_power = 1;
++static unsigned sy_f_running;
++static unsigned sy_f_scan_at;
++static unsigned sy_f_scan_said;
++static uint32_t sy_f_assoc_result;
++static uint32_t sy_f_reo_tp;
++static uint8_t sy_f_rx_free[SY_E_N_RX];
++static unsigned sy_f_rx_nfree;
++static unsigned sy_f_rx_said;
++static unsigned sy_f_rx_skip_said;
++static uint32_t sy_f_seen[8];
++static struct sy_f_scan sy_f_one;
++
++static int
++sy_f_phase(void)
++{
++	if (!sy_f_power || !sy_d2_ran)
++		return 0;
++	if (sy_d3_assoc_done && sy_d3_assoc_status == 0u && sy_d2_conn_valid)
++		return 4;
++	if (sy_d2_conn_valid)
++		return 2;
++	if (sy_d2_scan_started && !sy_d2_scan_completed)
++		return 1;
++	return 0;
++}
++
++static int
++sy_f_joined(void)
++{
++	if (sy_f_phase() != 4 || sy_d2_conn_idx >= sy_d2_results)
++		return -1;
++	return (int)sy_d2_conn_idx;
++}
++
++static int
++sy_f_out(struct sy_apple80211req *rq, const void *src, uint32_t n)
++{
++	uint32_t c;
++
++	if (!rq->data || rq->len == 0)
++		return EINVAL;
++	c = rq->len < n ? rq->len : n;
++	return copyout(src, (user_addr_t)rq->data, c);
++}
++
++static int
++sy_f_value(struct sy_apple80211req *rq, uint32_t v)
++{
++	uint32_t w[2];
++
++	if (!rq->len || !rq->data) {
++		rq->val = (int32_t)v;
++		return 0;
++	}
++	w[0] = 1;
++	w[1] = v;
++	return sy_f_out(rq, w, sizeof(w));
++}
++
++static void
++sy_f_event(uint32_t code, const void *data, uint32_t len)
++{
++	struct kev_msg m;
++	char name[16];
++
++	memset(&m, 0, sizeof(m));
++	memset(name, 0, sizeof(name));
++	memcpy(name, "en0", 3);
++	m.vendor_code = KEV_VENDOR_APPLE;
++	m.kev_class = KEV_IEEE80211_CLASS;
++	m.kev_subclass = 1;
++	m.event_code = code;
++	m.dv[0].data_length = sizeof(name);
++	m.dv[0].data_ptr = name;
++	if (data && len) {
++		m.dv[1].data_length = len;
++		m.dv[1].data_ptr = (void *)data;
++	}
++	(void)kev_post_msg(&m);
++}
++
++static void
++sy_f_note(void)
++{
++	struct sy_f_link ev;
++	int phase;
++
++	if (!sy_ifp)
++		return;
++	phase = sy_f_phase();
++	if (phase == 4 && !sy_f_running) {
++		ifnet_set_flags(sy_ifp, IFF_RUNNING, IFF_RUNNING);
++		sy_f_running = 1;
++		memset(&ev, 0, sizeof(ev));
++		if (sy_d2_conn_idx < sy_d2_results)
++			ev.rssi = sy_d2_rssi[sy_d2_conn_idx];
++		sy_f_event(SY_F_EV_ASSOC, NULL, 0);
++		sy_f_event(SY_F_EV_LINK, &ev, sizeof(ev));
++		printf("PANDORA WLAN: F: link up\n");
++		sy_log_sync();
++	} else if (phase != 4 && sy_f_running) {
++		ifnet_set_flags(sy_ifp, 0, IFF_RUNNING);
++		sy_f_running = 0;
++		memset(&ev, 0, sizeof(ev));
++		ev.down = 1;
++		sy_f_event(SY_F_EV_LINK, &ev, sizeof(ev));
++		printf("PANDORA WLAN: F: link down\n");
++		sy_log_sync();
++	}
++}
++
++static void
++sy_f_fill(struct sy_f_scan *r, unsigned idx)
++{
++	unsigned i, n, sl;
++	uint32_t mhz = sy_d2_freq[idx];
++
++	memset(r, 0, sizeof(*r));
++	r->version = 1;
++	r->channel.version = 1;
++	if (mhz >= 2400u && mhz < 4000u) {
++		r->channel.channel = mhz == 2484u ? 14u : (mhz - 2407u) / 5u;
++		r->channel.flags = 0x2u | 0x8u;
++	} else if (mhz >= 4900u) {
++		r->channel.channel = (mhz - 5000u) / 5u;
++		r->channel.flags = 0x2u | 0x10u;
++	}
++	r->rssi = (int16_t)sy_d2_rssi[idx];
++	r->capability = sy_d2_cap[idx];
++	memcpy(r->bssid, sy_d2_bssid[idx], 6);
++	n = sy_d2_nrates[idx];
++	if (n > 15u)
++		n = 15u;
++	r->rate_count = (uint8_t)n;
++	for (i = 0; i < n; i++)
++		r->rates[i] = (sy_d2_rates[idx][i] & 0x7fu) / 2u;
++	sl = sy_d2_ssid_len[idx];
++	if (sl > 32u)
++		sl = 32u;
++	r->ssid_length = (uint8_t)sl;
++	if (sl)
++		memcpy(r->ssid, sy_d2_ssid[idx], sl);
++}
++
++static uint32_t
++sy_f_mbps(unsigned idx)
++{
++	unsigned i, n, best = 0;
++
++	if (idx >= sy_d2_results)
++		return 0;
++	n = sy_d2_nrates[idx];
++	if (n > 16u)
++		n = 16u;
++	for (i = 0; i < n; i++) {
++		unsigned mbps = (sy_d2_rates[idx][i] & 0x7fu) / 2u;
++
++		if (mbps > best)
++			best = mbps;
++	}
++	return best;
++}
++
++static int
++sy_f_match(const uint8_t *ssid, uint32_t slen, const uint8_t *bssid)
++{
++	unsigned i;
++	int want_bssid = 0;
++
++	for (i = 0; i < 6u; i++)
++		if (bssid[i])
++			want_bssid = 1;
++	for (i = 0; i < sy_d2_results; i++) {
++		if (want_bssid && memcmp(sy_d2_bssid[i], bssid, 6))
++			continue;
++		if (slen != sy_d2_ssid_len[i] ||
++		    memcmp(sy_d2_ssid[i], ssid, slen))
++			continue;
++		return (int)i;
++	}
++	return -1;
++}
++
++static int
++sy_f_log(int set, int type, int err, int32_t val)
++{
++	unsigned t = (unsigned)type;
++
++	if (t < 256u && !(sy_f_seen[t / 32u] & (1u << (t % 32u)))) {
++		sy_f_seen[t / 32u] |= 1u << (t % 32u);
++		printf("PANDORA WLAN: F: %s type %d -> %d val %d\n",
++		    set ? "set" : "get", type, err, val);
++		sy_log_sync();
++	}
++	return err;
++}
++
++static int
++sy_f_get(struct sy_apple80211req *rq)
++{
++	int j = sy_f_joined();
++
++	switch (rq->type) {
++	case SY_F_POWER: {
++		uint32_t w[6];
++
++		memset(w, 0, sizeof(w));
++		w[0] = 1;
++		w[1] = 1;
++		w[2] = sy_f_power ? 1u : 0u;
++		return sy_f_out(rq, w, sizeof(w));
++	}
++	case SY_F_STATE:
++		return sy_f_value(rq, (uint32_t)sy_f_phase());
++	case SY_F_OPMODE:
++		return sy_f_value(rq, 1);
++	case SY_F_AUTH: {
++		uint32_t w[4];
++
++		if (j < 0)
++			return ENXIO;
++		w[0] = 1;
++		w[1] = 1;	/* open system: this driver never installed a key */
++		w[2] = 0;
++		w[3] = 0;
++		return sy_f_out(rq, w, sizeof(w));
++	}
++	case SY_F_CAPS: {
++		/* redwood_apple80211.c:301-314.  wifid will not build a WPA2
++		 * join unless these bits are set.  The key is still not programmed. */
++		uint8_t bits[13];
++		static const uint8_t has[] = { 2, 3, 6, 9, 10, 14, 17, 19 };
++		unsigned i;
++
++		memset(bits, 0, sizeof(bits));
++		for (i = 0; i < sizeof(has); i++)
++			bits[has[i] / 8u] |= (uint8_t)(1u << (has[i] % 8u));
++		return sy_f_out(rq, bits, sizeof(bits));
++	}
++	case SY_F_PHY: {
++		uint32_t w[3];
++
++		w[0] = 1;
++		w[1] = 0x2u | 0x4u | 0x8u;	/* 11a, 11b, 11g.  D3 left HT/VHT/HE at 0 */
++		w[2] = 0;
++		if (j >= 0)
++			w[2] = sy_d2_freq[j] < 2500u ? 0x8u : 0x2u;
++		return sy_f_out(rq, w, sizeof(w));
++	}
++	case SY_F_SSID: {
++		unsigned sl;
++		int e;
++
++		if (j < 0)
++			return ENXIO;
++		sl = sy_d2_ssid_len[j];
++		if (sl > 32u)
++			sl = 32u;
++		e = sy_f_out(rq, sy_d2_ssid[j], sl);
++		if (!e)
++			rq->len = sl;
++		return e;
++	}
++	case SY_F_BSSID:
++		if (j < 0)
++			return ENXIO;
++		return sy_f_out(rq, sy_d2_bssid[j], 6);
++	case SY_F_CHANNEL: {
++		struct {
++			uint32_t version;
++			struct sy_f_channel channel;
++		} a;
++
++		if (j < 0)
++			return ENXIO;
++		memset(&a, 0, sizeof(a));
++		a.version = 1;
++		sy_f_fill(&sy_f_one, (unsigned)j);
++		a.channel = sy_f_one.channel;
++		return sy_f_out(rq, &a, sizeof(a));
++	}
++	case SY_F_RSSI: {
++		uint32_t w[13];
++		int32_t rssi;
++
++		if (j < 0)
++			return ENXIO;
++		rssi = sy_d2_rssi[j];
++		memset(w, 0, sizeof(w));
++		w[0] = 1;
++		w[1] = 1;
++		w[3] = (uint32_t)rssi;
++		w[7] = (uint32_t)rssi;
++		w[8] = (uint32_t)rssi;
++		w[12] = (uint32_t)rssi;
++		return sy_f_out(rq, w, sizeof(w));
++	}
++	case SY_F_NOISE:
++	case SY_F_TXPOWER:
++		/* No noise floor and no tx-power measurement on this phone. */
++		return ENXIO;
++	case SY_F_RATE:
++		if (j < 0)
++			return ENXIO;
++		return sy_f_value(rq, sy_f_mbps((unsigned)j));
++	case SY_F_RESULT:
++		if (sy_f_scan_at >= sy_d2_results) {
++			sy_f_scan_at = 0;
++			return EIO;
++		}
++		sy_f_fill(&sy_f_one, sy_f_scan_at);
++		if (sy_f_scan_said < 8u) {
++			sy_f_scan_said++;
++			printf("PANDORA WLAN: F: scan result %u freq %u rssi %d\n",
++			    sy_f_scan_at, sy_d2_freq[sy_f_scan_at],
++			    sy_d2_rssi[sy_f_scan_at]);
++			sy_log_sync();
++		}
++		sy_f_scan_at++;
++		return sy_f_out(rq, &sy_f_one, sizeof(sy_f_one));
++	case SY_F_ASSOC_RES:
++		return sy_f_value(rq, sy_f_assoc_result);
++	default:
++		return EOPNOTSUPP;
++	}
++}
++
++static int
++sy_f_set(struct sy_apple80211req *rq)
++{
++	switch (rq->type) {
++	case SY_F_POWER: {
++		uint32_t in[6];
++		uint32_t n;
++
++		if (rq->len < 12u || !rq->data)
++			return EINVAL;
++		memset(in, 0, sizeof(in));
++		n = rq->len < sizeof(in) ? rq->len : (uint32_t)sizeof(in);
++		if (copyin((user_addr_t)rq->data, in, n))
++			return EFAULT;
++		sy_f_power = in[2] != 0;
++		sy_f_note();
++		sy_f_event(SY_F_EV_POWER, NULL, 0);
++		printf("PANDORA WLAN: F: power %u\n", sy_f_power);
++		sy_log_sync();
++		return 0;
++	}
++	case SY_F_SCAN:
++		/* D2 already scanned.  Do not send a second WMI scan. */
++		if (rq->len < 20u)
++			return EINVAL;
++		if (!sy_d2_scan_completed && sy_d2_results == 0u)
++			return EBUSY;
++		sy_f_scan_at = 0;
++		sy_f_event(SY_F_EV_SCAN, NULL, 0);
++		return 0;
++	case SY_F_ASSOC: {
++		struct sy_f_assoc a;
++		uint32_t klen, kcipher;
++		int idx;
++
++		if (rq->len < sizeof(a) || !rq->data)
++			return EINVAL;
++		memset(&a, 0, sizeof(a));
++		if (copyin((user_addr_t)rq->data, &a, sizeof(a)))
++			return EFAULT;
++		klen = a.key_length;
++		kcipher = a.key_cipher;
++		if (a.ssid_length == 0 || a.ssid_length > 32u) {
++			memset(&a, 0, sizeof(a));
++			return EINVAL;
++		}
++		idx = sy_f_match(a.ssid, a.ssid_length, a.bssid);
++		memset(&a, 0, sizeof(a));
++		if (klen != 0) {
++			sy_f_assoc_result = 2;
++			printf("PANDORA WLAN: F: associate key %u bytes cipher %u not installed\n",
++			    klen, kcipher);
++		} else if (idx >= 0 && (unsigned)idx == sy_d2_conn_idx &&
++		    sy_d2_conn_valid && sy_d3_assoc_done &&
++		    sy_d3_assoc_status == 0u) {
++			sy_f_assoc_result = 1;
++		} else if (idx >= 0 && (unsigned)idx == sy_d2_conn_idx &&
++		    sy_d2_conn_valid && !sy_d3_assoc_done) {
++			sy_f_assoc_result = 0;
++		} else {
++			sy_f_assoc_result = 2;
++			printf("PANDORA WLAN: F: associate does not match the joined BSS\n");
++		}
++		sy_log_sync();
++		return 0;
++	}
++	case SY_F_DISASSOC:
++		/* No measured WMI vdev-down command in this tree. */
++		sy_d2_conn_valid = 0;
++		sy_f_assoc_result = 0;
++		sy_f_note();
++		printf("PANDORA WLAN: F: disassociate\n");
++		sy_log_sync();
++		return 0;
++	default:
++		return EOPNOTSUPP;
++	}
++}
++
++static errno_t
++sy_f_output(ifnet_t ifp, mbuf_t m)
++{
++	size_t len;
++
++	sy_net_out++;
++	if (!m)
++		return 0;
++	len = mbuf_pkthdr_len(m);
++	/* One TX buffer.  Post only after the previous descriptor is consumed. */
++	if (sy_e_ran && sy_ce_va && len >= 14u && len <= SY_E_RX_BUF &&
++	    sy_e_tcl_hp == sy_ce_rdp(SY_E_TCL_ID)) {
++		void *dst = (void *)(sy_ce_va + SY_E_OFF_TXBUF);
++
++		if (mbuf_copydata(m, 0, len, dst) == 0 &&
++		    sy_e_tx(dst, (uint32_t)len) == 0)
++			(void)ifnet_stat_increment_out(ifp, 1, (uint32_t)len, 0);
++	}
++	mbuf_freem(m);
++	return 0;
++}
++
++static errno_t
++sy_f_ioctl(ifnet_t ifp, unsigned long cmd, void *data)
++{
++	struct sy_apple80211req *rq;
++	int set, err;
++
++	(void)ifp;
++	sy_net_ioctls++;
++	switch (cmd) {
++	case SY_SIOCGA80211:
++	case SY_SIOCSA80211:
++		break;
++	case SIOCSIFADDR:
++	case SIOCSIFFLAGS:
++	case SIOCSIFMTU:
++	case SIOCADDMULTI:
++	case SIOCDELMULTI:
++	case SIOCSIFMEDIA:
++		return 0;
++	default:
++		return EOPNOTSUPP;
++	}
++	rq = (struct sy_apple80211req *)data;
++	if (!rq)
++		return EINVAL;
++	set = cmd == SY_SIOCSA80211;
++	err = set ? sy_f_set(rq) : sy_f_get(rq);
++	return sy_f_log(set, rq->type, err, rq->val);
++}
++
++static void
++sy_f_input(const uint8_t *eth, uint32_t length)
++{
++	mbuf_t m = NULL;
++	mbuf_t n;
++	size_t done = 0;
++	int first = 1;
++	struct ifnet_stat_increment_param inc;
++
++	if (!sy_ifp || length < 14u)
++		return;
++	if (mbuf_allocpacket(MBUF_DONTWAIT, (size_t)length + 2u, NULL, &m) || !m)
++		return;
++	for (n = m; n; n = mbuf_next(n)) {
++		size_t room = mbuf_maxlen(n) - mbuf_leadingspace(n);
++		size_t take;
++
++		if (first) {
++			if (room < 16u)
++				break;
++			mbuf_setdata(n, (uint8_t *)mbuf_datastart(n) +
++			    mbuf_leadingspace(n) + 2u, 0);
++			room -= 2u;
++		}
++		take = (size_t)length - done < room ? (size_t)length - done : room;
++		memcpy(mbuf_data(n), eth + done, take);
++		mbuf_setlen(n, take);
++		done += take;
++		first = 0;
++	}
++	if (done != length) {
++		mbuf_freem(m);
++		return;
++	}
++	mbuf_pkthdr_setlen(m, length);
++	(void)mbuf_pkthdr_setrcvif(m, sy_ifp);
++	mbuf_pkthdr_setheader(m, mbuf_data(m));
++	mbuf_adj(m, 14);
++	memset(&inc, 0, sizeof(inc));
++	inc.packets_in = 1;
++	inc.bytes_in = length;
++	(void)ifnet_input(sy_ifp, m, &inc);
++}
++
++static void
++sy_f_rx_hold(uint32_t cookie)
++{
++	unsigned i;
++
++	if (cookie >= SY_E_N_RX || sy_f_rx_nfree >= SY_E_N_RX)
++		return;
++	for (i = 0; i < sy_f_rx_nfree; i++)
++		if (sy_f_rx_free[i] == (uint8_t)cookie)
++			return;
++	sy_f_rx_free[sy_f_rx_nfree++] = (uint8_t)cookie;
++}
++
++static void
++sy_f_rx_refill(void)
++{
++	volatile uint32_t *sh = (volatile uint32_t *)(sy_ce_wc + SY_E_OFF_RXHP);
++	uint32_t ring_dw = 2u * SY_E_N_RX;
++
++	while (sy_f_rx_nfree) {
++		uint32_t fw = sh[1] & (ring_dw - 1u);
++		uint32_t next = (sy_e_rx_hp + 2u) % ring_dw;
++		uint32_t cookie;
++		uint32_t *e;
++
++		if (next == fw)
++			return;
++		cookie = sy_f_rx_free[--sy_f_rx_nfree];
++		e = (uint32_t *)(sy_ce_va + SY_E_OFF_RXRING) + sy_e_rx_hp;
++		sy_e_bufaddr(e,
++		    SY_CE_IOVA + SY_E_OFF_RXBUF + (uint64_t)cookie * SY_E_RX_BUF,
++		    SY_E_RBM_SW0, cookie);
++		flush_dcache64(sy_pa((vm_offset_t)e), SY_E_DESC8, TRUE);
++		__asm__ volatile("dsb sy" ::: "memory");
++		sy_e_rx_hp = next;
++		sh[0] = next;
++		__asm__ volatile("dsb sy" ::: "memory");
++	}
++}
++
++static void
++sy_f_rx(void)
++{
++	uint32_t ring_dw = (SY_E_DESC32 / 4u) * SY_E_N_REO;
++	uint32_t hp = sy_ce_rdp(SY_E_REO_ID) & (ring_dw - 1u);
++	unsigned n = 0;
++
++	if ((hp & 7u) || (sy_f_reo_tp & 7u) || sy_f_reo_tp >= ring_dw) {
++		static unsigned said;
++
++		if (hp && said < 4u) {
++			said++;
++			printf("PANDORA WLAN: F: reo hp %#x tp %#x not a descriptor index\n",
++			    hp, sy_f_reo_tp);
++			sy_log_sync();
++		}
++		return;
++	}
++	while (sy_f_reo_tp != hp && n < 16u) {
++		const uint32_t *d =
++		    (const uint32_t *)(sy_ce_wc + SY_E_OFF_REO) + sy_f_reo_tp;
++		uint32_t cookie = d[1] >> 12;
++		uint32_t msdu = d[4];
++		uint32_t info = d[7];
++		const uint8_t *buf;
++		uint32_t len = 0, decap = 0;
++
++		sy_f_reo_tp = (sy_f_reo_tp + 8u) % ring_dw;
++		n++;
++		if (cookie < SY_E_N_RX) {
++			buf = (const uint8_t *)(sy_ce_wc + SY_E_OFF_RXBUF) +
++			    cookie * SY_E_RX_BUF;
++			len = *(const uint32_t *)(buf + 0x28) & 0x3fffu;
++			decap = (*(const uint32_t *)(buf + 0x2c) >> 8) & 3u;
++			/* Push reason 0 is an error.  One buffer: first+last,
++			 * no continuation, not dropped.  Decap 2 is ethernet. */
++			if ((info & 6u) != 0u && (msdu & 7u) == 3u &&
++			    (msdu & (1u << 17)) == 0u && decap == 2u &&
++			    len >= 14u && 0x78u + len <= SY_E_RX_BUF) {
++				if (sy_f_rx_said < 8u) {
++					sy_f_rx_said++;
++					printf("PANDORA WLAN: F: rx len %u decap %u cookie %u\n",
++					    len, decap, cookie);
++					sy_log_sync();
++				}
++				sy_f_input(buf + 0x78, len);
++			} else if (sy_f_rx_skip_said < 8u) {
++				sy_f_rx_skip_said++;
++				printf("PANDORA WLAN: F: rx skip len %u decap %u\n",
++				    len, decap);
++				sy_log_sync();
++			}
++			sy_f_rx_hold(cookie);
++		}
++		hp = sy_ce_rdp(SY_E_REO_ID) & (ring_dw - 1u);
++	}
++	if (n) {
++		sy_ce_wr(SY_E_REO_R2 + 4u, sy_f_reo_tp);
++		sy_f_rx_refill();
++	}
++}
++
++static void
++sy_f_service(void)
++{
++	unsigned i, any = 0;
++
++	if (!sy_e_ran || !sy_ce_va || !sy_ce_wc || !sy_ifp)
++		return;
++	for (i = 0; i < 6u; i++)
++		if (sy_d2_our_mac[i])
++			any = 1;
++	if (any)
++		(void)ifnet_set_lladdr(sy_ifp, sy_d2_our_mac, 6);
++	printf("PANDORA WLAN: F: service\n");
++	sy_log_sync();
++	for (;;) {
++		sy_ce_pump();
++		sy_f_rx();
++		sy_f_note();
++		delay_for_interval(10, NSEC_PER_MSEC);
++	}
 +}
 +
  void
