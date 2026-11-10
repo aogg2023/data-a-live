@@ -456,7 +456,7 @@
  }
  
  static void
-@@ -51,21 +470,5367 @@
+@@ -51,21 +470,6274 @@
  		cv_sleep(100);
  	}
  	if (rootvnode == NULLVP) {
@@ -789,6 +789,7 @@
 +static void sy_bhi_sbl(void);
 +static void sy_buf_alloc(void);
 +static void sy_ce_run(void);	/* stage 21: D1 CE transport + HTC + WMI */
++static void sy_d2_run(void);	/* stage 22: D2 WMI after READY */
 +
 +static vm_offset_t parf, phy, dbi, iatu, conf, pcism, gcc_low, gcc, tlmm_low, tlmm, tcsr, rsc, cmddb, crm;
 +#define SY_PHY_ROWS (sizeof(sy_phy_seq) / sizeof(sy_phy_seq[0]))
@@ -1879,6 +1880,14 @@
 +		if (sy_step >= 21 && sy_sbl_ok && sy_keep_alive && sy_wlfw_on &&
 +		    (sy_mhi_m0_ok || sy_chan_force)) {
 +			sy_ce_run();	/* D1: CE + HTC + WMI */
++		}
++
++		/* stage 22: D2 - WMI after READY: hw mode, pdev params, vdev, scan,
++		 * and the connection commands up to VDEV_START.  sy_d2_run() checks
++		 * sy_wmi_ready itself because that flag is declared further down. */
++		if (sy_step >= 22 && sy_sbl_ok && sy_keep_alive && sy_wlfw_on &&
++		    (sy_mhi_m0_ok || sy_chan_force)) {
++			sy_d2_run();	/* D2: WMI after READY */
 +		}
 +			if (smmu) {
 +				printf("PANDORA WLAN: SMMU IDR0 %#x IDR1 %#x IDR2 %#x CR0 %#x\n",
@@ -5050,6 +5059,8 @@
 +static unsigned sy_wlfw_wlan_cfg(uint8_t *b, uint16_t txn);
 +static unsigned sy_wlfw_wlan_mode(uint8_t *b, uint16_t txn, uint32_t mode);
 +static int sy_d1_qmi_send(uint16_t msgid, const uint8_t *qmi, unsigned qlen);
++static void sy_htc_trailer(const uint8_t *b, uint32_t len);
++static int sy_d2_event(uint32_t cmd, const uint8_t *b, uint32_t len);
 +static unsigned sy_wmi_init_frame(uint8_t *b);
 +
 +/* Select the BAR0 window that contains a device register offset (pci.c:146-165). */
@@ -5299,6 +5310,8 @@
 +		return;
 +	cmd = (uint32_t)(b[0] | (b[1] << 8) | (b[2] << 16)) & 0xffffffu;
 +	printf("PANDORA WLAN: WMI event %#x (%u B)\n", cmd, len - 4u);
++	if (sy_d2_event(cmd, b, len))
++		return;
 +	if (cmd == SY_WMI_SERVICE_READY_EVENTID ||
 +	    cmd == SY_WMI_SERVICE_READY_EXT_EVENTID ||
 +	    cmd == SY_WMI_SERVICE_READY_EXT2_EVENTID) {
@@ -5369,8 +5382,10 @@
 +	if (b[1] & SY_HTC_FLAG_TRAILER) {
 +		uint32_t tlen = b[4];
 +
-+		if (tlen <= plen)
++		if (tlen <= plen) {
++			sy_htc_trailer(b + 8u + plen - tlen, tlen);
 +			plen -= tlen;
++		}
 +	}
 +	p = b + 8u;
 +	printf("PANDORA WLAN: HTC rx: eid %u flags %#x len %u\n", eid, b[1], plen);
@@ -5444,7 +5459,9 @@
 +	*idxp = (*idxp + 1u) & 1u;
 +	frame = (uint8_t *)(sy_ce_va + off);
 +	frame[0] = (uint8_t)eid;
-+	frame[1] = 0;
++	/* htc.c:65-67: every credit-controlled frame sets NEED_CREDIT_UPDATE;
++	 * the real phone returns only 1 TX credit, so D2 needs the report. */
++	frame[1] = (eid == sy_htc_wmi_eid) ? 0x01u : 0u;
 +	frame[2] = (uint8_t)len;
 +	frame[3] = (uint8_t)(len >> 8);
 +	frame[4] = 0;
@@ -5816,6 +5833,896 @@
 +	} else {
 +		printf("PANDORA WLAN: D1: WMI READY did not arrive (5 s)\n");
 +	}
++	sy_log_sync();
++}
++
++/* ---- D2: WMI after WMI_READY (stage 22) --------------------------------------
++ *
++ * Scope agreed for D2: everything that is reachable over WMI without HTT, plus the
++ * connection commands up to VDEV_START.  Sources (local snapshot
++ * E:\songyuan\work\ath12k_v66, all values re-derived from the enum text, see
++ * d2_dossier/D2_ENUM_CHECK.txt):
++ *  - one local pdev is created by WMI_INIT + WMI_PDEV_SET_HW_MODE; there is no
++ *    PDEV_CREATE command in this WMI generation (wmi.h:300-672 has none);
++ *  - "pdev start" is a set of WMI_PDEV_SET_PARAM plus WMI_SCAN_CHAN_LIST
++ *    (mac.c:4988-5109); the channel list must precede any scan;
++ *  - the STA vdev is WMI_VDEV_CREATE + WMI_VDEV_SET_PARAM (mac.c:5309-5541);
++ *  - the scan itself is WMI_START_SCAN (wmi.c:2213-2394); results arrive as
++ *    WMI_MGMT_RX frames, not over HTT (wmi.c:5728);
++ *  - the connection chain is WMI_MGMT_TX_SEND -> WMI_PEER_CREATE -> WMI_VDEV_START
++ *    (mac.c:2264-2357, 2933-3023, 4777-4829).  PEER_CREATE has no WMI response:
++ *    the official driver waits for the HTT peer-map event, which is D3 territory,
++ *    so D2 sends it without waiting (documented boundary, d2_dossier/OFFICIAL.md 5.4).
++ *
++ * Board facts taken from the real phone's Android dmesg (d2_dossier/DEVICE.md):
++ * device is 17cb:110e (peach / WCN786x, not WCN7850), firmware WLAN.GNG.2.0,
++ * HTC credit count 1 / credit size 2176, 2x2 chains, hw_mode aux cap id 0.
++ * The WCN7850 tables used by D1 stay in place as "shape borrowed" and are the
++ * first thing to replace if the on-device D1 handshake fails.
++ */
++#define SY_D2_HW_MODE_CMD	0x00401eu
++#define SY_D2_PDEV_SET_PARAM_CMD 0x004003u
++#define SY_D2_SCAN_CHAN_LIST_CMD 0x003003u
++#define SY_D2_START_SCAN_CMD	0x003001u
++#define SY_D2_VDEV_CREATE_CMD	0x005001u
++#define SY_D2_VDEV_SET_PARAM_CMD 0x005008u
++#define SY_D2_VDEV_START_CMD	0x005003u
++#define SY_D2_MGMT_TX_SEND_CMD	0x007008u
++#define SY_D2_PEER_CREATE_CMD	0x006001u
++
++#define SY_D2_EVT_SCAN		0x003001u
++#define SY_D2_EVT_MGMT_RX	0x007001u
++#define SY_D2_EVT_MGMT_TX_COMPL	0x007006u
++#define SY_D2_EVT_VDEV_START	0x005001u
++
++#define SY_D2_TAG_ARRAY_UINT32	16u
++#define SY_D2_TAG_ARRAY_BYTE	17u
++#define SY_D2_TAG_ARRAY_STRUCT	18u
++#define SY_D2_TAG_ARRAY_FIXED	19u
++#define SY_D2_TAG_SCAN_EVENT	36u	/* WMI_TAG_SCAN_EVENT */
++#define SY_D2_TAG_MGMT_RX_HDR	44u	/* WMI_TAG_MGMT_RX_HDR */
++#define SY_D2_TAG_VDEV_START_RESP 40u	/* WMI_TAG_VDEV_START_RESPONSE_EVENT */
++#define SY_D2_TAG_START_SCAN	77u	/* WMI_TAG_START_SCAN_CMD */
++#define SY_D2_TAG_SCAN_CHAN_LIST 79u	/* WMI_TAG_SCAN_CHAN_LIST_CMD */
++#define SY_D2_TAG_CHANNEL	80u	/* WMI_TAG_CHANNEL */
++#define SY_D2_TAG_PDEV_SET_PARAM 82u	/* WMI_TAG_PDEV_SET_PARAM_CMD */
++#define SY_D2_TAG_VDEV_CREATE	86u	/* WMI_TAG_VDEV_CREATE_CMD */
++#define SY_D2_TAG_VDEV_START	88u	/* WMI_TAG_VDEV_START_REQUEST_CMD */
++#define SY_D2_TAG_VDEV_SET_PARAM 95u	/* WMI_TAG_VDEV_SET_PARAM_CMD */
++#define SY_D2_TAG_PEER_CREATE	97u	/* WMI_TAG_PEER_CREATE_CMD */
++#define SY_D2_TAG_VDEV_TXRX	411u	/* WMI_TAG_VDEV_TXRX_STREAMS */
++#define SY_D2_TAG_MGMT_TX_SEND	422u	/* WMI_TAG_MGMT_TX_SEND_CMD */
++#define SY_D2_TAG_MGMT_TX_COMPL	423u	/* WMI_TAG_MGMT_TX_COMPL_EVENT */
++#define SY_D2_TAG_HW_MODE	515u	/* WMI_TAG_PDEV_SET_HW_MODE_CMD */
++
++/* enums re-derived from the local wmi.h (D2_ENUM_CHECK.txt) */
++#define SY_D2_HW_MODE_SINGLE	0u
++#define SY_D2_HW_MODE_DBS	1u
++#define SY_D2_PDEV_PARAM_TX_CHAIN_MASK 1u
++#define SY_D2_PDEV_PARAM_RX_CHAIN_MASK 2u
++#define SY_D2_PDEV_PARAM_DYNAMIC_BW 10u
++#define SY_D2_PDEV_PARAM_PMF_QOS 34u
++#define SY_D2_PDEV_PARAM_ARP_AC_OVERRIDE 35u
++#define SY_D2_PDEV_PARAM_IDLE_PS 44u
++#define SY_D2_PDEV_PARAM_MESH_MCAST 143u
++#define SY_D2_VDEV_PARAM_RTS_THRESHOLD 1u
++#define SY_D2_VDEV_PARAM_NSS 34u
++#define SY_D2_VDEV_PARAM_TX_ENCAP 48u
++#define SY_D2_VDEV_PARAM_RX_DECAP 91u
++#define SY_D2_VDEV_TYPE_STA	2u
++#define SY_D2_VDEV_SUBTYPE_NONE	0u
++#define SY_D2_PEER_TYPE_DEFAULT	0u
++#define SY_D2_MODE_11AX_HE20_2G	21u	/* wmi.h:2833 */
++#define SY_D2_MODE_11AX_HE20	16u	/* wmi.h:2828 */
++#define SY_D2_CHAN_FLAG_ALLOW_HE 0x00020000u	/* WMI_CHAN_INFO_ALLOW_HE BIT(17) */
++#define SY_D2_CHAN_MODE_11G	1u	/* MODE_11G */
++#define SY_D2_SCAN_ID		0xA000u	/* ATH12K_SCAN_ID */
++#define SY_D2_SCAN_REQ_ID	1u
++#define SY_D2_SCAN_PASSIVE	0x1u	/* WMI_SCAN_FLAG_PASSIVE */
++#define SY_D2_SCAN_CHAN_STAT	0x10u	/* WMI_SCAN_CHAN_STAT_EVENT */
++#define SY_D2_SCAN_NOTIFY	31u	/* STARTED|COMPLETED|BSS|FOREIGN|DEQUEUED */
++#define SY_D2_CHAN_FIRST	2412u	/* channel 1 */
++#define SY_D2_CHAN_STEP	5u
++#define SY_D2_CHAN_COUNT	13u	/* 1..13 */
++#define SY_D2_VDEV_ID		0u
++#define SY_D2_PDEV_ID		0u
++#define SY_D2_REG_INFO1		0x001a0000u	/* real phone vdev_start ch6 */
++#define SY_D2_REG_INFO2		0x00001a00u
++#define SY_D2_VDEV_START_LDPC	8u
++#define SY_D2_OFF_FRAME		0x001b0000UL	/* 512-byte auth frame inside CE region */
++#define SY_D2_FRAME_MAX		512u
++#define SY_D2_MGMT_TX_MAX	64u	/* WMI_MGMT_SEND_DOWNLD_LEN */
++#define SY_D2_MAX_RESULTS	16u
++#define SY_D2_MAX_TX_CREDITS	8u
++
++static unsigned sy_d2_ran;		/* stage 22 entered */
++static unsigned sy_d2_hw_mode_done;
++static unsigned sy_d2_vdev_done;
++static unsigned sy_d2_scan_started;
++static unsigned sy_d2_scan_completed;
++static uint32_t sy_d2_scan_reason;
++static unsigned sy_d2_mgmt_tx_done;
++static uint32_t sy_d2_mgmt_tx_status;
++static unsigned sy_d2_vdev_start_done;
++static uint32_t sy_d2_vdev_start_status;
++static unsigned sy_d2_results;
++static uint32_t sy_d2_desc_id;
++static uint8_t sy_d2_tx[1024];		/* one WMI command (cmd hdr + TLVs) */
++static uint8_t sy_d2_frame[SY_D2_FRAME_MAX];	/* mgmt frame, also its DMA copy */
++static uint8_t sy_d2_bssid[SY_D2_MAX_RESULTS][6];
++static uint8_t sy_d2_ssid[SY_D2_MAX_RESULTS][33];
++static unsigned sy_d2_ssid_len[SY_D2_MAX_RESULTS];
++static uint32_t sy_d2_freq[SY_D2_MAX_RESULTS];
++static int sy_d2_rssi[SY_D2_MAX_RESULTS];
++static uint8_t sy_d2_our_mac[6];
++
++static unsigned sy_d2_le32(uint8_t *b, unsigned at, uint32_t v);
++static unsigned sy_d2_tlv(uint8_t *b, unsigned at, uint32_t tag, uint32_t len);
++static unsigned sy_d2_chan(uint8_t *b, unsigned at, uint32_t freq, uint32_t info);
++static int sy_d2_send(uint32_t cmd, unsigned end);
++static int sy_d2_wait_credit(unsigned need, unsigned ms);
++static void sy_d2_settle(unsigned ms);
++static unsigned sy_d2_build_hw_mode(uint8_t *b, uint32_t mode);
++static unsigned sy_d2_build_pdev_param(uint8_t *b, uint32_t param, uint32_t value);
++static unsigned sy_d2_build_chan_list(uint8_t *b);
++static unsigned sy_d2_build_vdev_create(uint8_t *b);
++static unsigned sy_d2_build_vdev_param(uint8_t *b, uint32_t param, uint32_t value);
++static unsigned sy_d2_build_start_scan(uint8_t *b);
++static unsigned sy_d2_build_mgmt_tx(uint8_t *b, uint32_t frame_len, uint32_t buf_len);
++static unsigned sy_d2_build_peer_create(uint8_t *b, const uint8_t *mac);
++static unsigned sy_d2_build_vdev_start(uint8_t *b, uint32_t freq);
++static void sy_d2_parse_mgmt(uint32_t freq, int rssi, const uint8_t *f, unsigned flen);
++static int sy_d2_connect_attempt(void);
++static void sy_d2_run(void);
++
++static unsigned
++sy_d2_le32(uint8_t *b, unsigned at, uint32_t v)
++{
++	b[at++] = (uint8_t)v;
++	b[at++] = (uint8_t)(v >> 8);
++	b[at++] = (uint8_t)(v >> 16);
++	b[at++] = (uint8_t)(v >> 24);
++	return at;
++}
++
++static unsigned
++sy_d2_tlv(uint8_t *b, unsigned at, uint32_t tag, uint32_t len)
++{
++	uint32_t v = (tag << 16) | (len & 0xffffu);
++
++	b[at++] = (uint8_t)v;
++	b[at++] = (uint8_t)(v >> 8);
++	b[at++] = (uint8_t)(v >> 16);
++	b[at++] = (uint8_t)(v >> 24);
++	return at;
++}
++
++/* 28-byte WMI channel record (wmi.h:3441-3449, filled as wmi.c:2493-2545). */
++static unsigned
++sy_d2_chan(uint8_t *b, unsigned at, uint32_t freq, uint32_t info)
++{
++	at = sy_d2_tlv(b, at, SY_D2_TAG_CHANNEL, 24);
++	at = sy_d2_le32(b, at, freq);
++	at = sy_d2_le32(b, at, freq);
++	at = sy_d2_le32(b, at, 0);
++	at = sy_d2_le32(b, at, info);
++	at = sy_d2_le32(b, at, SY_D2_REG_INFO1);
++	at = sy_d2_le32(b, at, SY_D2_REG_INFO2);
++	return at;
++}
++
++/* Wait until the firmware returned enough TX credits (real phone: 1 credit). */
++static int
++sy_d2_wait_credit(unsigned need, unsigned ms)
++{
++	unsigned i;
++
++	for (i = 0; i < ms / 10u; i++) {
++		if (sy_htc_tx_credits >= need)
++			return 0;
++		sy_ce_pump();
++		sy_usleep(10000);
++	}
++	printf("PANDORA WLAN: D2: credit wait timeout (need %u have %u)\n", need,
++	    sy_htc_tx_credits);
++	return (sy_htc_tx_credits >= need) ? 0 : -1;
++}
++
++/* Put the command header in front of the TLVs the builder wrote and send it. */
++static int
++sy_d2_send(uint32_t cmd, unsigned end)
++{
++	unsigned need = 1;
++
++	if (end + 4u > sizeof(sy_d2_tx))
++		return -1;
++	sy_d2_tx[0] = (uint8_t)cmd;
++	sy_d2_tx[1] = (uint8_t)(cmd >> 8);
++	sy_d2_tx[2] = (uint8_t)(cmd >> 16);
++	sy_d2_tx[3] = 0;
++	if (sy_htc_credit_size)
++		need = (8u + end + sy_htc_credit_size - 1u) / sy_htc_credit_size;
++	if (sy_d2_wait_credit(need, 1000u))
++		return -1;
++	if (sy_htc_send(sy_htc_wmi_eid, sy_d2_tx, end))
++		return -1;
++	printf("PANDORA WLAN: D2: cmd %#x sent (%u B)\n", cmd, end);
++	sy_log_sync();
++	return 0;
++}
++
++/* Bounded pump after a fire-and-forget command, mostly to collect the credit
++ * report the firmware returns in the HTC trailer (htc.c:65-67 asks for it). */
++static void
++sy_d2_settle(unsigned ms)
++{
++	unsigned i;
++
++	for (i = 0; i < ms / 10u; i++) {
++		sy_ce_pump();
++		sy_usleep(10000);
++	}
++}
++
++/* WMI_PDEV_SET_HW_MODE (wmi.c:3438-3468; 16-byte struct). */
++static unsigned
++sy_d2_build_hw_mode(uint8_t *b, uint32_t mode)
++{
++	unsigned at = 4;
++
++	at = sy_d2_tlv(b, at, SY_D2_TAG_HW_MODE, 12);
++	at = sy_d2_le32(b, at, SY_D2_PDEV_ID);	/* WMI_PDEV_ID_SOC is 0 */
++	at = sy_d2_le32(b, at, mode);
++	at = sy_d2_le32(b, at, 0);		/* num_band_to_mac */
++	return at;
++}
++
++/* WMI_PDEV_SET_PARAM (wmi.c:1360-1390; 16-byte struct). */
++static unsigned
++sy_d2_build_pdev_param(uint8_t *b, uint32_t param, uint32_t value)
++{
++	unsigned at = 4;
++
++	at = sy_d2_tlv(b, at, SY_D2_TAG_PDEV_SET_PARAM, 12);
++	at = sy_d2_le32(b, at, SY_D2_PDEV_ID);
++	at = sy_d2_le32(b, at, param);
++	at = sy_d2_le32(b, at, value);
++	return at;
++}
++
++/* WMI_SCAN_CHAN_LIST (wmi.c:2444-2559).  The upstream builder passes the array
++ * payload size through the "command header" helper, so the ARRAY_STRUCT length
++ * field is 28*N-4; reproduced verbatim because the firmware tolerates it. */
++static unsigned
++sy_d2_build_chan_list(uint8_t *b)
++{
++	unsigned at = 4;
++	unsigned i;
++	uint32_t n = SY_D2_CHAN_COUNT;
++
++	at = sy_d2_tlv(b, at, SY_D2_TAG_SCAN_CHAN_LIST, 12);
++	at = sy_d2_le32(b, at, n);
++	at = sy_d2_le32(b, at, 0);		/* flags */
++	at = sy_d2_le32(b, at, SY_D2_PDEV_ID);
++	at = sy_d2_tlv(b, at, SY_D2_TAG_ARRAY_STRUCT, (28u * n) - 4u);
++	for (i = 0; i < n; i++)
++		at = sy_d2_chan(b, at, SY_D2_CHAN_FIRST + i * SY_D2_CHAN_STEP,
++		    SY_D2_CHAN_MODE_11G | SY_D2_CHAN_FLAG_ALLOW_HE);
++	return at;
++}
++
++/* WMI_VDEV_CREATE (wmi.c:793-866) for the single STA vdev. */
++static unsigned
++sy_d2_build_vdev_create(uint8_t *b)
++{
++	unsigned at = 4;
++	unsigned i;
++	uint32_t streams = 2;	/* 2.4G and 5G groups are always sent (wmi.c:838-851) */
++	uint32_t chains = (sy_wmi_rf_chains >= 1u && sy_wmi_rf_chains <= 4u) ?
++	    sy_wmi_rf_chains : 2u;
++
++	at = sy_d2_tlv(b, at, SY_D2_TAG_VDEV_CREATE, 32);
++	at = sy_d2_le32(b, at, SY_D2_VDEV_ID);
++	at = sy_d2_le32(b, at, SY_D2_VDEV_TYPE_STA);
++	at = sy_d2_le32(b, at, SY_D2_VDEV_SUBTYPE_NONE);
++	for (i = 0; i < 6u; i++)
++		b[at++] = sy_d2_our_mac[i];
++	b[at++] = 0;
++	b[at++] = 0;
++	at = sy_d2_le32(b, at, streams);
++	at = sy_d2_le32(b, at, SY_D2_PDEV_ID);
++	at = sy_d2_le32(b, at, 0);		/* vdev_stats_id */
++	at = sy_d2_tlv(b, at, SY_D2_TAG_ARRAY_STRUCT, streams * 16u);
++	for (i = 0; i < streams; i++) {
++		at = sy_d2_tlv(b, at, SY_D2_TAG_VDEV_TXRX, 12);
++		at = sy_d2_le32(b, at, i);	/* band 0 = 2G, band 1 = 5G */
++		at = sy_d2_le32(b, at, chains);
++		at = sy_d2_le32(b, at, chains);
++	}
++	return at;
++}
++
++/* WMI_VDEV_SET_PARAM (wmi.c:1616-1646; 16-byte struct). */
++static unsigned
++sy_d2_build_vdev_param(uint8_t *b, uint32_t param, uint32_t value)
++{
++	unsigned at = 4;
++
++	at = sy_d2_tlv(b, at, SY_D2_TAG_VDEV_SET_PARAM, 12);
++	at = sy_d2_le32(b, at, SY_D2_VDEV_ID);
++	at = sy_d2_le32(b, at, param);
++	at = sy_d2_le32(b, at, value);
++	return at;
++}
++
++/* WMI_START_SCAN (wmi.c:2213-2394): 160-byte fixed command, then the channel
++ * array, an empty SSID array, one broadcast BSSID and an empty IE array.  With
++ * num_ssids=0 the driver also sets WMI_SCAN_FLAG_PASSIVE (mac.c:2980-2986). */
++static unsigned
++sy_d2_build_start_scan(uint8_t *b)
++{
++	unsigned at = 4;
++	unsigned i;
++	uint32_t n = SY_D2_CHAN_COUNT;
++
++	at = sy_d2_tlv(b, at, SY_D2_TAG_START_SCAN, 156);
++	at = sy_d2_le32(b, at, SY_D2_SCAN_ID);
++	at = sy_d2_le32(b, at, SY_D2_SCAN_REQ_ID);
++	at = sy_d2_le32(b, at, SY_D2_VDEV_ID);
++	at = sy_d2_le32(b, at, 1);		/* WMI_SCAN_PRIORITY_LOW */
++	at = sy_d2_le32(b, at, SY_D2_SCAN_NOTIFY);
++	at = sy_d2_le32(b, at, 50);		/* dwell active */
++	at = sy_d2_le32(b, at, 150);		/* dwell passive */
++	at = sy_d2_le32(b, at, 50);		/* min rest */
++	at = sy_d2_le32(b, at, 500);		/* max rest */
++	at = sy_d2_le32(b, at, 0);		/* repeat probe */
++	at = sy_d2_le32(b, at, 0);		/* probe spacing */
++	at = sy_d2_le32(b, at, 0);		/* idle time */
++	at = sy_d2_le32(b, at, 20000);		/* max scan time */
++	at = sy_d2_le32(b, at, 5);		/* probe delay */
++	at = sy_d2_le32(b, at, SY_D2_SCAN_CHAN_STAT | SY_D2_SCAN_PASSIVE);
++	at = sy_d2_le32(b, at, 0);		/* burst duration */
++	at = sy_d2_le32(b, at, n);		/* num chan */
++	at = sy_d2_le32(b, at, 1);		/* num bssid */
++	at = sy_d2_le32(b, at, 0);		/* num ssids (passive) */
++	at = sy_d2_le32(b, at, 0);		/* ie len */
++	at = sy_d2_le32(b, at, 0);		/* n probes */
++	for (i = 0; i < 4u; i++)		/* mac_addr 8 B */
++		b[at++] = 0;
++	for (i = 0; i < 4u; i++)		/* mac_mask 8 B */
++		b[at++] = 0;
++	for (i = 0; i < 32u; i++)		/* ie_bitmap 32 B */
++		b[at++] = 0;
++	at = sy_d2_le32(b, at, 0);		/* num vendor oui */
++	at = sy_d2_le32(b, at, 0);		/* scan ctrl flags ext */
++	at = sy_d2_le32(b, at, 0);		/* dwell active 2g */
++	at = sy_d2_le32(b, at, 40);		/* dwell active 6g */
++	at = sy_d2_le32(b, at, 30);		/* dwell passive 6g */
++	at = sy_d2_le32(b, at, 0);		/* scan start offset */
++	at = sy_d2_tlv(b, at, SY_D2_TAG_ARRAY_UINT32, n * 4u);
++	for (i = 0; i < n; i++)
++		at = sy_d2_le32(b, at, SY_D2_CHAN_FIRST + i * SY_D2_CHAN_STEP);
++	at = sy_d2_tlv(b, at, SY_D2_TAG_ARRAY_FIXED, 0);	/* no SSID */
++	at = sy_d2_tlv(b, at, SY_D2_TAG_ARRAY_FIXED, 8);	/* one BSSID */
++	for (i = 0; i < 6u; i++)
++		b[at++] = 0xff;
++	b[at++] = 0;
++	b[at++] = 0;
++	at = sy_d2_tlv(b, at, SY_D2_TAG_ARRAY_BYTE, 0);	/* no extra IE */
++	return at;
++}
++
++/* WMI_MGMT_TX_SEND (wmi.c:748-791): the frame lives at a DMA address and its
++ * first 64 bytes are also inlined (WMI_MGMT_SEND_DOWNLD_LEN). */
++static unsigned
++sy_d2_build_mgmt_tx(uint8_t *b, uint32_t frame_len, uint32_t buf_len)
++{
++	unsigned at = 4;
++	unsigned i;
++	uint64_t pa = (uint64_t)(SY_CE_IOVA + SY_D2_OFF_FRAME);
++
++	at = sy_d2_tlv(b, at, SY_D2_TAG_MGMT_TX_SEND, 32);
++	at = sy_d2_le32(b, at, SY_D2_VDEV_ID);
++	at = sy_d2_le32(b, at, sy_d2_desc_id);
++	at = sy_d2_le32(b, at, 0);		/* chanfreq: current channel */
++	at = sy_d2_le32(b, at, (uint32_t)pa);
++	at = sy_d2_le32(b, at, (uint32_t)(pa >> 32));
++	at = sy_d2_le32(b, at, frame_len);
++	at = sy_d2_le32(b, at, buf_len);
++	at = sy_d2_le32(b, at, 0);		/* tx params valid */
++	at = sy_d2_tlv(b, at, SY_D2_TAG_ARRAY_BYTE, buf_len);
++	for (i = 0; i < buf_len; i++)
++		b[at++] = sy_d2_frame[i];
++	return at;
++}
++
++/* WMI_PEER_CREATE (wmi.c:1109-1140; 20-byte struct). */
++static unsigned
++sy_d2_build_peer_create(uint8_t *b, const uint8_t *mac)
++{
++	unsigned at = 4;
++	unsigned i;
++
++	at = sy_d2_tlv(b, at, SY_D2_TAG_PEER_CREATE, 16);
++	at = sy_d2_le32(b, at, SY_D2_VDEV_ID);
++	for (i = 0; i < 6u; i++)
++		b[at++] = mac[i];
++	b[at++] = 0;
++	b[at++] = 0;
++	at = sy_d2_le32(b, at, SY_D2_PEER_TYPE_DEFAULT);
++	return at;
++}
++
++/* WMI_VDEV_START (wmi.c:991-1074): 116-byte fixed command + channel + empty
++ * ARRAY_STRUCT.  Channel mode follows the real phone (HE20 on 2G/5G) and its
++ * reg_info values for a 2.4 GHz channel; punct bitmap unused = all ones. */
++static unsigned
++sy_d2_build_vdev_start(uint8_t *b, uint32_t freq)
++{
++	unsigned at = 4;
++	unsigned i;
++	uint32_t mode = (freq < 2500u) ? SY_D2_MODE_11AX_HE20_2G : SY_D2_MODE_11AX_HE20;
++	uint32_t info = mode;
++	uint32_t chains = (sy_wmi_rf_chains >= 1u && sy_wmi_rf_chains <= 4u) ?
++	    sy_wmi_rf_chains : 2u;
++
++	at = sy_d2_tlv(b, at, SY_D2_TAG_VDEV_START, 112);
++	at = sy_d2_le32(b, at, SY_D2_VDEV_ID);
++	at = sy_d2_le32(b, at, 0);		/* requestor id */
++	at = sy_d2_le32(b, at, 0);		/* beacon interval (STA) */
++	at = sy_d2_le32(b, at, 0);		/* dtim period */
++	at = sy_d2_le32(b, at, SY_D2_VDEV_START_LDPC);
++	for (i = 0; i < 36u; i++)		/* SSID, unused for STA */
++		b[at++] = 0;
++	at = sy_d2_le32(b, at, 0);		/* bcn tx rate */
++	at = sy_d2_le32(b, at, 0);		/* bcn tx power */
++	at = sy_d2_le32(b, at, 0);		/* noa descriptors */
++	at = sy_d2_le32(b, at, 0);		/* disable hw ack */
++	at = sy_d2_le32(b, at, chains);		/* preferred tx streams */
++	at = sy_d2_le32(b, at, chains);		/* preferred rx streams */
++	at = sy_d2_le32(b, at, 0);		/* he ops */
++	at = sy_d2_le32(b, at, 0);		/* cac duration */
++	at = sy_d2_le32(b, at, 0);		/* regdomain */
++	at = sy_d2_le32(b, at, 0);		/* min data rate */
++	at = sy_d2_le32(b, at, 0);		/* mbssid flags */
++	at = sy_d2_le32(b, at, 0);		/* mbssid tx vdev */
++	at = sy_d2_le32(b, at, 0);		/* eht ops */
++	at = sy_d2_le32(b, at, 0xffffffffu);	/* punct bitmap */
++	at = sy_d2_chan(b, at, freq, info);
++	at = sy_d2_tlv(b, at, SY_D2_TAG_ARRAY_STRUCT, 0);
++	return at;
++}
++
++/* Extract SSID / channel / BSSID from a beacon or probe response carried in a
++ * WMI_MGMT_RX event, and remember the first 16 distinct BSSIDs. */
++static void
++sy_d2_parse_mgmt(uint32_t freq, int rssi, const uint8_t *f, unsigned flen)
++{
++	unsigned pos;
++	unsigned i;
++	unsigned sl = 0;
++	uint32_t ch = 0;
++	uint16_t fc;
++	const uint8_t * bssid;
++	uint8_t ssid[33];
++
++	if (flen < 36u)
++		return;
++	fc = (uint16_t)(f[0] | (f[1] << 8));
++	if ((fc & 0x0fu) != 0x08u && (fc & 0x0fu) != 0x05u)
++		return;			/* only beacons and probe responses */
++	bssid = f + 16u;		/* addr3 is the BSSID for both */
++	pos = 36u;
++	while (pos + 2u <= flen) {
++		uint8_t id = f[pos];
++		uint8_t elen = f[pos + 1u];
++
++		if (pos + 2u + (unsigned)elen > flen)
++			break;
++		if (id == 0u && elen <= 32u) {
++			memcpy(ssid, f + pos + 2u, elen);
++			sl = elen;
++		}
++		if (id == 3u && elen >= 1u)
++			ch = f[pos + 2u];
++		pos += 2u + (unsigned)elen;
++	}
++	for (i = 0; i < sy_d2_results; i++) {
++		if (!memcmp(bssid, sy_d2_bssid[i], 6))
++			break;
++	}
++	if (i == sy_d2_results && sy_d2_results < SY_D2_MAX_RESULTS) {
++		memcpy(sy_d2_bssid[i], bssid, 6);
++		memcpy(sy_d2_ssid[i], ssid, sl);
++		sy_d2_ssid[i][sl] = 0;
++		sy_d2_ssid_len[i] = sl;
++		sy_d2_freq[i] = freq;
++		sy_d2_rssi[i] = rssi;
++		sy_d2_results++;
++	}
++	printf("PANDORA WLAN: D2 BSS %u: bssid %02x:%02x:%02x:%02x:%02x:%02x ssid '%.*s' "
++	    "freq %u ch %u rssi %d\n", i, bssid[0], bssid[1], bssid[2], bssid[3],
++	    bssid[4], bssid[5], (int)sl, (const char *)ssid, freq, ch, rssi);
++	sy_log_sync();
++}
++
++/* Consume the HTC trailer: credit report records (htc.c:179-233, htc.h:131-153).
++ * With the real phone's single transmit credit this is what lets D2 send more
++ * than one WMI command at all. */
++static void
++sy_htc_trailer(const uint8_t *b, uint32_t len)
++{
++	uint32_t at = 0;
++	uint32_t i;
++	uint32_t eid;
++	uint32_t credits;
++
++	while (at + 4u <= len) {
++		uint32_t id = b[at];
++		uint32_t rlen = b[at + 1u];
++
++		if (at + 4u + rlen > len)
++			break;
++		if (id == 1u) {		/* ATH12K_HTC_RECORD_CREDITS */
++			for (i = 0; i + 4u <= rlen; i += 4u) {
++				eid = b[at + 4u + i];
++				credits = b[at + 4u + i + 1u];
++				if (eid == sy_htc_wmi_eid) {
++					sy_htc_tx_credits += credits;
++					printf("PANDORA WLAN: HTC credit report: eid %u +%u "
++					    "(now %u)\n", eid, credits, sy_htc_tx_credits);
++					sy_log_sync();
++				}
++			}
++		}
++		at += 4u + rlen;
++	}
++}
++
++/* D2 event dispatcher, called from sy_wmi_event() before the D1 handlers. */
++static int
++sy_d2_event(uint32_t cmd, const uint8_t *b, uint32_t len)
++{
++	uint32_t at;
++	uint32_t hdr;
++	uint32_t tag;
++	uint32_t tl;
++	const uint8_t * p;
++
++	if (cmd == SY_D2_EVT_SCAN) {
++		at = 4u;
++		while (at + 4u <= len) {
++			hdr = (uint32_t)(b[at] | (b[at + 1] << 8) |
++			    (b[at + 2] << 16) | (b[at + 3] << 24));
++			tag = hdr >> 16;
++			tl = hdr & 0xffffu;
++			if (tag == SY_D2_TAG_SCAN_EVENT && tl >= 12u &&
++			    at + 4u + 12u <= len) {
++				p = b + at + 4u;
++				uint32_t et = (uint32_t)(p[0] | (p[1] << 8) |
++				    (p[2] << 16) | (p[3] << 24));
++				uint32_t reason = (uint32_t)(p[4] | (p[5] << 8) |
++				    (p[6] << 16) | (p[7] << 24));
++
++				if (et & 1u)
++					sy_d2_scan_started = 1;
++				if (et & 2u) {
++					sy_d2_scan_completed = 1;
++					sy_d2_scan_reason = reason;
++				}
++				printf("PANDORA WLAN: D2 scan event %#x reason %u\n", et,
++				    reason);
++				sy_log_sync();
++			}
++			at += 4u + tl;
++		}
++		return 1;
++	}
++	if (cmd == SY_D2_EVT_MGMT_RX) {
++		uint32_t freq = 0;
++		uint32_t buf_len = 0;
++		uint32_t status = 0;
++		int rssi = 0;
++		const uint8_t * frame = 0;
++		unsigned flen = 0;
++
++		at = 4u;
++		while (at + 4u <= len) {
++			hdr = (uint32_t)(b[at] | (b[at + 1] << 8) |
++			    (b[at + 2] << 16) | (b[at + 3] << 24));
++			tag = hdr >> 16;
++			tl = hdr & 0xffffu;
++			p = b + at + 4u;
++			if (tag == SY_D2_TAG_MGMT_RX_HDR && tl >= 68u) {
++				buf_len = (uint32_t)(p[16] | (p[17] << 8) |
++				    (p[18] << 16) | (p[19] << 24));
++				status = (uint32_t)(p[20] | (p[21] << 8) |
++				    (p[22] << 16) | (p[23] << 24));
++				rssi = (int)(uint32_t)(p[44] | (p[45] << 8) |
++				    (p[46] << 16) | (p[47] << 24));
++				freq = (uint32_t)(p[64] | (p[65] << 8) |
++				    (p[66] << 16) | (p[67] << 24));
++			} else if (tag == SY_D2_TAG_ARRAY_BYTE) {
++				frame = p;
++				flen = tl;
++			}
++			at += 4u + tl;
++		}
++		if (status & 0x29u) {	/* CRC | decrypt | key-cache errors */
++			printf("PANDORA WLAN: D2 mgmt rx dropped status %#x\n", status);
++			return 1;
++		}
++		if (frame && flen)
++			sy_d2_parse_mgmt(freq, rssi, frame, flen < buf_len ? flen : buf_len);
++		return 1;
++	}
++	if (cmd == SY_D2_EVT_MGMT_TX_COMPL) {
++		at = 4u;
++		while (at + 4u <= len) {
++			hdr = (uint32_t)(b[at] | (b[at + 1] << 8) |
++			    (b[at + 2] << 16) | (b[at + 3] << 24));
++			tag = hdr >> 16;
++			tl = hdr & 0xffffu;
++			p = b + at + 4u;
++			if (tag == SY_D2_TAG_MGMT_TX_COMPL && tl >= 12u) {
++				uint32_t desc = (uint32_t)(p[0] | (p[1] << 8) |
++				    (p[2] << 16) | (p[3] << 24));
++				uint32_t st = (uint32_t)(p[4] | (p[5] << 8) |
++				    (p[6] << 16) | (p[7] << 24));
++
++				if (desc == sy_d2_desc_id - 1u) {
++					sy_d2_mgmt_tx_status = st;
++					sy_d2_mgmt_tx_done = 1;
++					printf("PANDORA WLAN: D2 mgmt tx done desc %u "
++					    "status %u\n", desc, st);
++					sy_log_sync();
++				}
++			}
++			at += 4u + tl;
++		}
++		return 1;
++	}
++	if (cmd == SY_D2_EVT_VDEV_START) {
++		at = 4u;
++		while (at + 4u <= len) {
++			hdr = (uint32_t)(b[at] | (b[at + 1] << 8) |
++			    (b[at + 2] << 16) | (b[at + 3] << 24));
++			tag = hdr >> 16;
++			tl = hdr & 0xffffu;
++			p = b + at + 4u;
++			if (tag == SY_D2_TAG_VDEV_START_RESP && tl >= 36u) {
++				uint32_t vdev = (uint32_t)(p[0] | (p[1] << 8) |
++				    (p[2] << 16) | (p[3] << 24));
++				uint32_t st = (uint32_t)(p[12] | (p[13] << 8) |
++				    (p[14] << 16) | (p[15] << 24));
++
++				if (vdev == SY_D2_VDEV_ID) {
++					sy_d2_vdev_start_status = st;
++					sy_d2_vdev_start_done = 1;
++					printf("PANDORA WLAN: D2 vdev start resp "
++					    "vdev %u status %u\n", vdev, st);
++					sy_log_sync();
++				}
++			}
++			at += 4u + tl;
++		}
++		return 1;
++	}
++	return 0;
++}
++
++/* D2-B: send one open-system auth frame to the first scanned BSS, create the peer
++ * (fire-and-forget, see the block comment) and start the vdev on its channel. */
++static int
++sy_d2_connect_attempt(void)
++{
++	unsigned at;
++	unsigned flen;
++	unsigned i;
++	unsigned bi = 0;
++	uint8_t * f = sy_d2_frame;
++	uint32_t freq;
++	uint32_t spent;
++
++	if (sy_d2_results == 0u) {
++		printf("PANDORA WLAN: D2-B: no scan result, skip connect case\n");
++		return -1;
++	}
++	/* prefer a 2.4 GHz result: the channel/reg_info values used here are the
++	 * ones the real phone's driver used for a 2.4 GHz vdev start */
++	for (i = 0; i < sy_d2_results; i++) {
++		if (sy_d2_freq[i] < 2500u) {
++			bi = i;
++			break;
++		}
++	}
++	freq = sy_d2_freq[bi];
++	flen = 30u;
++	memset(f, 0, 64u);
++	f[0] = 0xb0u;			/* management, authentication */
++	f[1] = 0x00u;
++	memcpy(f + 4u, sy_d2_bssid[bi], 6);	/* addr1 = BSSID */
++	memcpy(f + 10u, sy_d2_our_mac, 6);	/* addr2 = our vdev MAC */
++	memcpy(f + 16u, sy_d2_bssid[bi], 6);	/* addr3 = BSSID */
++	f[24] = 0; f[25] = 0;		/* auth algorithm: open */
++	f[26] = 1; f[27] = 0;		/* auth sequence: 1 */
++	f[28] = 0; f[29] = 0;		/* status: success */
++	memcpy((void *)(sy_ce_va + SY_D2_OFF_FRAME), f, flen);
++	flush_dcache64(sy_pa(sy_ce_va + SY_D2_OFF_FRAME), (unsigned)SY_D2_FRAME_MAX,
++	    TRUE);
++	__asm__ volatile("dsb sy" ::: "memory");
++	sy_d2_desc_id++;
++	at = sy_d2_build_mgmt_tx(sy_d2_tx, flen, flen);
++	if (sy_d2_send(SY_D2_MGMT_TX_SEND_CMD, at))
++		return -1;
++	for (spent = 0; spent < 1000u && !sy_d2_mgmt_tx_done; spent += 10u) {
++		sy_ce_pump();
++		sy_usleep(10000);
++	}
++	printf("PANDORA WLAN: D2-B: auth mgmt tx %s (status %u)\n",
++	    sy_d2_mgmt_tx_done ? "confirmed" : "no completion", sy_d2_mgmt_tx_status);
++	sy_log_sync();
++	at = sy_d2_build_peer_create(sy_d2_tx, sy_d2_bssid[bi]);
++	if (sy_d2_send(SY_D2_PEER_CREATE_CMD, at))
++		return -1;
++	/* PEER_CREATE has no WMI response: the HTT peer-map event is D3. */
++	sy_d2_settle(100u);
++	at = sy_d2_build_vdev_start(sy_d2_tx, freq);
++	if (sy_d2_send(SY_D2_VDEV_START_CMD, at))
++		return -1;
++	for (spent = 0; spent < 5000u && !sy_d2_vdev_start_done; spent += 10u) {
++		sy_ce_pump();
++		sy_usleep(10000);
++	}
++	if (sy_d2_vdev_start_done) {
++		printf("PANDORA WLAN: D2-B: vdev start confirmed, status %u\n",
++		    sy_d2_vdev_start_status);
++	} else {
++		printf("PANDORA WLAN: D2-B: vdev start no response (peer map is D3)\n");
++	}
++	sy_log_sync();
++	return 0;
++}
++
++/* Stage 22 entry.  Runs after D1 (sy_wmi_ready) and never blocks the kernel:
++ * every wait is bounded and every failure only prints. */
++static void
++sy_d2_run(void)
++{
++	unsigned at;
++	unsigned i;
++	unsigned spent;
++	uint32_t chains;
++	uint32_t mask;
++	uint32_t hw_mode;
++	int d2conn = 1;
++
++	if (sy_d2_ran)
++		return;
++	sy_d2_ran = 1;
++	printf("PANDORA WLAN: step %u: D2 WMI (hw mode, vdev, scan)\n", sy_step);
++	sy_log_sync();
++	if (!sy_wmi_ready) {
++		printf("PANDORA WLAN: D2: deferred, WMI_READY not reached\n");
++		sy_log_sync();
++		return;
++	}
++	chains = (sy_wmi_rf_chains >= 1u && sy_wmi_rf_chains <= 4u) ? sy_wmi_rf_chains : 2u;
++	mask = (1u << chains) - 1u;
++	for (i = 0; i < 6u; i++)
++		sy_d2_our_mac[i] = sy_wmi_mac[i];
++	for (i = 0; i < 6u; i++) {
++		if (sy_d2_our_mac[i])
++			break;
++	}
++	if (i == 6u) {
++		sy_d2_our_mac[0] = 0x02;
++		sy_d2_our_mac[1] = 0x00;
++		sy_d2_our_mac[2] = 0x00;
++		sy_d2_our_mac[3] = 0x00;
++		sy_d2_our_mac[4] = 0x01;
++		sy_d2_our_mac[5] = 0x00;
++		printf("PANDORA WLAN: D2: READY mac was zero, local MAC used\n");
++	}
++	printf("PANDORA WLAN: D2: chains %u mask %#x mac %02x:%02x:%02x:%02x:%02x:%02x\n",
++	    chains, mask, sy_d2_our_mac[0], sy_d2_our_mac[1], sy_d2_our_mac[2],
++	    sy_d2_our_mac[3], sy_d2_our_mac[4], sy_d2_our_mac[5]);
++	sy_log_sync();
++
++	hw_mode = SY_D2_HW_MODE_DBS;
++	(void)PE_parse_boot_argn("songyuan_hwmode", &hw_mode, sizeof(hw_mode));
++	at = sy_d2_build_hw_mode(sy_d2_tx, hw_mode);
++	if (sy_d2_send(SY_D2_HW_MODE_CMD, at))
++		return;
++	sy_d2_hw_mode_done = 1;
++	sy_d2_settle(200u);
++
++	at = sy_d2_build_pdev_param(sy_d2_tx, SY_D2_PDEV_PARAM_TX_CHAIN_MASK, mask);
++	if (sy_d2_send(SY_D2_PDEV_SET_PARAM_CMD, at))
++		return;
++	sy_d2_settle(40u);
++	at = sy_d2_build_pdev_param(sy_d2_tx, SY_D2_PDEV_PARAM_RX_CHAIN_MASK, mask);
++	if (sy_d2_send(SY_D2_PDEV_SET_PARAM_CMD, at))
++		return;
++	sy_d2_settle(40u);
++	at = sy_d2_build_pdev_param(sy_d2_tx, SY_D2_PDEV_PARAM_DYNAMIC_BW, 1u);
++	if (sy_d2_send(SY_D2_PDEV_SET_PARAM_CMD, at))
++		return;
++	sy_d2_settle(40u);
++	at = sy_d2_build_pdev_param(sy_d2_tx, SY_D2_PDEV_PARAM_PMF_QOS, 1u);
++	if (sy_d2_send(SY_D2_PDEV_SET_PARAM_CMD, at))
++		return;
++	sy_d2_settle(40u);
++	at = sy_d2_build_pdev_param(sy_d2_tx, SY_D2_PDEV_PARAM_ARP_AC_OVERRIDE, 0u);
++	if (sy_d2_send(SY_D2_PDEV_SET_PARAM_CMD, at))
++		return;
++	sy_d2_settle(40u);
++	at = sy_d2_build_pdev_param(sy_d2_tx, SY_D2_PDEV_PARAM_MESH_MCAST, 1u);
++	if (sy_d2_send(SY_D2_PDEV_SET_PARAM_CMD, at))
++		return;
++	sy_d2_settle(40u);
++	at = sy_d2_build_pdev_param(sy_d2_tx, SY_D2_PDEV_PARAM_IDLE_PS, 1u);
++	if (sy_d2_send(SY_D2_PDEV_SET_PARAM_CMD, at))
++		return;
++	sy_d2_settle(60u);
++
++	at = sy_d2_build_chan_list(sy_d2_tx);
++	if (sy_d2_send(SY_D2_SCAN_CHAN_LIST_CMD, at))
++		return;
++	sy_d2_settle(80u);
++	printf("PANDORA WLAN: D2: %u scan channels sent\n", SY_D2_CHAN_COUNT);
++	sy_log_sync();
++
++	at = sy_d2_build_vdev_create(sy_d2_tx);
++	if (sy_d2_send(SY_D2_VDEV_CREATE_CMD, at))
++		return;
++	sy_d2_vdev_done = 1;
++	sy_d2_settle(80u);
++	at = sy_d2_build_vdev_param(sy_d2_tx, SY_D2_VDEV_PARAM_TX_ENCAP, 1u);
++	if (sy_d2_send(SY_D2_VDEV_SET_PARAM_CMD, at))
++		return;
++	sy_d2_settle(40u);
++	at = sy_d2_build_vdev_param(sy_d2_tx, SY_D2_VDEV_PARAM_RX_DECAP, 1u);
++	if (sy_d2_send(SY_D2_VDEV_SET_PARAM_CMD, at))
++		return;
++	sy_d2_settle(40u);
++	at = sy_d2_build_vdev_param(sy_d2_tx, SY_D2_VDEV_PARAM_NSS, chains);
++	if (sy_d2_send(SY_D2_VDEV_SET_PARAM_CMD, at))
++		return;
++	sy_d2_settle(40u);
++	at = sy_d2_build_vdev_param(sy_d2_tx, SY_D2_VDEV_PARAM_RTS_THRESHOLD, 0u);
++	if (sy_d2_send(SY_D2_VDEV_SET_PARAM_CMD, at))
++		return;
++	sy_d2_settle(40u);
++
++	at = sy_d2_build_start_scan(sy_d2_tx);
++	if (sy_d2_send(SY_D2_START_SCAN_CMD, at))
++		return;
++	for (spent = 0; spent < 15000u && !sy_d2_scan_completed; spent += 10u) {
++		sy_ce_pump();
++		sy_usleep(10000);
++	}
++	printf("PANDORA WLAN: D2: scan %s, reason %u, %u BSS seen\n",
++	    sy_d2_scan_completed ? "completed" : "no completion", sy_d2_scan_reason,
++	    sy_d2_results);
++	sy_log_sync();
++	if (sy_d2_scan_completed && sy_d2_results) {
++		for (i = 0; i < sy_d2_results; i++) {
++			printf("PANDORA WLAN: D2 result %u: '%.*s' %02x:%02x:%02x:%02x:%02x:%02x "
++			    "freq %u rssi %d\n", i + 1, (int)sy_d2_ssid_len[i],
++			    (const char *)sy_d2_ssid[i], sy_d2_bssid[i][0], sy_d2_bssid[i][1],
++			    sy_d2_bssid[i][2], sy_d2_bssid[i][3], sy_d2_bssid[i][4],
++			    sy_d2_bssid[i][5], sy_d2_freq[i], sy_d2_rssi[i]);
++		}
++		sy_log_sync();
++	}
++	(void)PE_parse_boot_argn("songyuan_d2conn", &d2conn, sizeof(d2conn));
++	if (d2conn) {
++		if (sy_d2_connect_attempt() == 0)
++			printf("PANDORA WLAN: D2-B DONE (peer create is fire-and-forget, "
++			    "peer map is D3)\n");
++	}
++	printf("PANDORA WLAN: D2 DONE\n");
 +	sy_log_sync();
 +}
 +
