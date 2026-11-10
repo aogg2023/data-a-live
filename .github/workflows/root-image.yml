@@ -3,8 +3,8 @@ on:
   workflow_dispatch:
     inputs:
       ipsw_url:
-        description: iPhone X iOS 16.7.16 IPSW
-        default: https://updates.cdn-apple.com/2025FallFCS/fullrestores/122-77006/1158E502-D76D-4226-AA06-ED5E30CD1111/iPhone10,3,iPhone10,6_16.7.16_20H392_Restore.ipsw
+        description: iPhone X iOS 16.5 IPSW
+        default: https://updates.cdn-apple.com/2023SpringFCS/fullrestores/032-85130/6AB0D10A-8AF9-4F6C-8CF5-A1B315CABE88/iPhone10,3,iPhone10,6_16.5_20F66_Restore.ipsw
       root_size:
         description: HFS+ image size
         default: 12G
@@ -43,7 +43,9 @@ jobs:
         run: |
           curl -L --retry 5 -o ipsw.zip "${{ inputs.ipsw_url }}"
           ls -l ipsw.zip
-          unzip -o -q ipsw.zip 087-86698-044.dmg 087-86593-047.dmg 087-86715-047.dmg \
+          unzip -o -q ipsw.zip 096-04088-077.dmg 096-04666-078.dmg 096-03536-083.dmg \
+            Firmware/096-04088-077.dmg.trustcache Firmware/096-04666-078.dmg.trustcache \
+            Firmware/096-03536-083.dmg.trustcache \
             Firmware/all_flash/DeviceTree.d22ap.im4p BuildManifest.plist
           ls -l *.dmg Firmware/all_flash/DeviceTree.d22ap.im4p
 
@@ -52,11 +54,20 @@ jobs:
           git clone --depth 1 https://github.com/bangprovn/ios-fuxi.git ios-fuxi
           ls ios-fuxi/tools/mkiosroot.sh
           sudo chmod +x ios-fuxi/tools/mkiosroot.sh
+          python3 - <<'PY'
+          p = "ios-fuxi/tools/sweet-root-tweaks.py"
+          s = open(p).read()
+          old = "BUILD, VERSION = '20H392', '16.7.16'"
+          new = "BUILD, VERSION = '20F66', '16.5'"
+          if old not in s:
+              raise SystemExit("sweet-root-tweaks.py: expected 20H392/16.7.16")
+          open(p, "w").write(s.replace(old, new, 1))
+          PY
 
       - name: build the HFS+ root image
         run: |
           sudo -E bash ios-fuxi/tools/mkiosroot.sh \
-            087-86698-044.dmg 087-86593-047.dmg 087-86715-047.dmg root.img "${{ inputs.root_size }}"
+            096-04088-077.dmg 096-04666-078.dmg 096-03536-083.dmg root.img "${{ inputs.root_size }}"
           ls -l root.img
           sudo chown "$(id -u):$(id -g)" root.img
 
