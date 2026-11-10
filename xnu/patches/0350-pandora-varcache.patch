@@ -456,7 +456,7 @@
  }
  
  static void
-@@ -51,21 +470,6870 @@
+@@ -51,21 +470,7152 @@
  		cv_sleep(100);
  	}
  	if (rootvnode == NULLVP) {
@@ -794,6 +794,7 @@
 +static void sy_d3_version(void);
 +static void sy_d3_on_mgmt(const uint8_t *f, unsigned flen);
 +static void sy_d3_run(void);
++static void sy_e_run(void);	/* stage 24: HTT rings, TCL/REO, buffers */
 +
 +static vm_offset_t parf, phy, dbi, iatu, conf, pcism, gcc_low, gcc, tlmm_low, tlmm, tcsr, rsc, cmddb, crm;
 +#define SY_PHY_ROWS (sizeof(sy_phy_seq) / sizeof(sy_phy_seq[0]))
@@ -1898,6 +1899,13 @@
 +		if (sy_step >= 23 && sy_sbl_ok && sy_keep_alive && sy_wlfw_on &&
 +		    (sy_mhi_m0_ok || sy_chan_force)) {
 +			sy_d3_run();
++		}
++		/* stage 24: E - TCL/REO/WBM rings, RXDMA via HTT, buffers.
++		 * CE pipes stay the D1 rings; their device addresses match
++		 * hw_srng_table_peach. */
++		if (sy_step >= 24 && sy_sbl_ok && sy_keep_alive && sy_wlfw_on &&
++		    (sy_mhi_m0_ok || sy_chan_force)) {
++			sy_e_run();
 +		}
 +			if (smmu) {
 +				printf("PANDORA WLAN: SMMU IDR0 %#x IDR1 %#x IDR2 %#x CR0 %#x\n",
@@ -3396,13 +3404,19 @@
 +/* Poll event ring 1 (IPCR and data) and print what the device sends, including the
 + * QRTR header of channel 21 transfers, so the QMI handshake can be built from real
 + * traffic instead of guesses. */
-+/* The endpoint updates the event context's *rp* field with its producer index and
-+ * the host publishes its own index in the context's *wp* field plus the event ring
-+ * doorbell (see mainline mhi_process_data_event_ring/mhi_recycle_ev_ring_element:
-+ * read er_ctxt->rp, write er_ctxt->wp, ring ERDB with that wp). A transfer event's
-+ * ptr names the TRE in the channel ring, not the data buffer; the buffer address is
-+ * inside that TRE. */
++/* The endpoint updates the event context's *rp* field with its producer index.
++ * The host's published *wp* is a credit, not the host read index: it starts at
++ * base+len-16 and advances one element per consumed event
++ * (mhi_recycle_ev_ring_element). After a batch the host rings ERDB with that wp.
++ * A transfer event's ptr names the TRE in the channel ring, not the data buffer;
++ * the buffer address is inside that TRE. */
 +static uint32_t sy_mhi_hi[2];	/* host element index per event ring */
++/* Published event-ring wp. Starts at len-16 (sy_mhi_init) and advances one
++ * element per consumed event, wrapping to 0. Linux mhi_recycle_ev_ring_element
++ * (ref_mhi_main.c:557-563). Publishing wp == the device rp leaves no slot. */
++static uint32_t sy_mhi_wp_off[2] = {
++	SY_MHI_ER0_LEN - 16u, SY_MHI_ER1_LEN - 16u
++};
 +
 +static void
 +sy_mhi_ev_walk(unsigned idx, unsigned *shown)
@@ -3497,13 +3511,21 @@
 +		if (hi >= rlen[idx])
 +			hi = 0;
 +		sy_mhi_hi[idx] = hi;
-+		sy_wr(evc, 0x24, (uint32_t)(base + hi));	/* publish host index */
++		sy_mhi_wp_off[idx] += 16u;
++		if (sy_mhi_wp_off[idx] >= rlen[idx])
++			sy_mhi_wp_off[idx] = 0;
++		sy_wr(evc, 0x24, (uint32_t)(base + sy_mhi_wp_off[idx]));
++		sy_wr(evc, 0x28, (uint32_t)((base + sy_mhi_wp_off[idx]) >> 32));
 +		__asm__ volatile("dsb sy" ::: "memory");
 +	}
 +	flush_dcache64(sy_pa(evc), (unsigned)PAGE_SIZE, TRUE);
-+	if (erdb && erdb + 16 <= 0x1000) {
-+		sy_wr(sy_bar_va, erdb + 8 * idx, (uint32_t)(base + hi));
-+		sy_wr(sy_bar_va, erdb + 8 * idx + 4, (uint32_t)((base + hi) >> 32));
++	if (n && erdb && erdb + 16 <= 0x1000) {
++		uint64_t wp = base + sy_mhi_wp_off[idx];
++
++		sy_wr(sy_bar_va, erdb + 8 * idx, (uint32_t)wp);
++		sy_wr(sy_bar_va, erdb + 8 * idx + 4, (uint32_t)(wp >> 32));
++		printf("PANDORA WLAN: MHI ERDB recycle ring %u dev %#x wp %#llx\n",
++		    idx, dev, (unsigned long long)wp);
 +	}
 +}
 +
@@ -4903,11 +4925,10 @@
 + * and every constant below cites that tree:
 + *  - CE register block: device offset 0x01b80000, 0x2000 per copy engine
 + *    (hal.h:44-53, HAL_CE_WFSS_CE_REG_BASE / HAL_SEQ_WCSS_UMAC_CE0_SRC_REG).
-+ *  - BAR0 only exposes that block through the window register at BAR0+0x310c:
-+ *    write 0x40000000 | ((dev_off>>19)&0x3f), then touch
-+ *    BAR0+0x80000+(dev_off & 0x7ffff) (pci.c:22-27, 146-165, 1187-1211).
-+ *    WCN7850 has static_window_map=false (pci.c:1229-1232), so every CE access
-+ *    takes this window path.
++ *  - BAR0 exposes that block through a window: write
++ *    0x40000000 | ((dev_off>>19)&0x3f), then touch
++ *    BAR0+0x80000+(dev_off & 0x7ffff) (pci.c:22-27, 146-165).
++ *    This phone's register is 0x3278, not the WCN7850 0x310c.
 + *  - Ring registers (relative to the CE block; hal.h:58-102,190-197; hal.c:1253-1422):
 + *      R0 +0x00 base LSB, +0x04 base MSB | (ring size in dwords << 8),
 + *      +0x08 ring id/entry size, +0x10 misc, +0x1c/+0x20 TP address (src rings),
@@ -4931,9 +4952,11 @@
 + *    wmi.c:5568-5582).  This phone parses SERVICE_READY_EXT2 (aux caps) before
 + *    that ready event (android_dmesg.txt:2384,2388-2390,2409), so WMI_INIT is
 + *    held until EXT2 arrives.
-+ *  - The CE window register is not confirmed for device 0x110e.  The plan says
-+ *    to read BAR0+0x310c first and, only if that read is all ones, BAR0+0x3278
-+ *    (ref/data-a-live-songyuan/docs/WIFI-2026-11-01.md section 5).
++ *  - The window register on this phone is BAR0+0x3278.  qca_cld3_peach_v2.ko
++ *    hif_read32_mb_reg_window / hif_write32_mb_reg_window (symbol 0x483b44 /
++ *    0x483a18) do `mov w, #0x3278`, then write 0x40000000 with bits [24:19]
++ *    of the device offset, and access BAR0+0x80000+(offset & 0x7ffff).
++ *    0x310c is logged and not selected.
 + *
 + * Design choices for this first pass, stated so a later stage can change them:
 + *  1. No shadow registers: WLAN_CFG carries no shadow_reg_v3 list and the rings
@@ -4953,8 +4976,8 @@
 +#define SY_CE_WIN_AP	0x00080000UL	/* pci.c:22 WINDOW_START */
 +#define SY_CE_WIN_EN	0x40000000UL	/* pci.c:22 WINDOW_ENABLE_BIT */
 +#define SY_CE_WIN_MASK	0x0007ffffUL	/* pci.c:22 WINDOW_RANGE_MASK */
-+/* BAR0+0x3000 page offset of the window register.  0x10c is 0x310c; 0x278 is
-+ * 0x3278.  sy_ce_mem() keeps 0x10c unless that read is 0xffffffff. */
++/* BAR0+0x3000 page offset of the window register.  0x278 is BAR0+0x3278,
++ * the register hif_*_mb_reg_window in qca_cld3_peach_v2.ko writes. */
 +#define SY_CE_IOVA	0xB0800000UL	/* L2 row 388 of the installed SMMU tables */
 +#define SY_CE_SIZE	0x00200000UL	/* 2 MiB = one L3 page (512 x 4 KiB) */
 +
@@ -5056,7 +5079,7 @@
 +static vm_offset_t sy_ce_l3;		/* one 4 KiB L3 table for the 2 MiB window */
 +static vm_offset_t sy_ce_wreg;		/* BAR0+0x3000 page holding the window reg */
 +static vm_offset_t sy_ce_win;		/* BAR0+0x80000..+0xa0000 aperture */
-+static uint32_t sy_ce_win_off = 0x0000010cu;
++static uint32_t sy_ce_win_off = 0x00000278u;
 +static uint32_t sy_ce_win_cur = 0xffffffffu;
 +static uint32_t sy_ce_tx_ctrl_idx;	/* round robin over the two CE0 TX buffers */
 +static uint32_t sy_ce_tx_wmi_idx;	/* round robin over the two CE3 TX buffers */
@@ -5198,17 +5221,12 @@
 +		return 1;
 +	}
 +	probe = sy_rd(sy_ce_wreg, sy_ce_win_off);
++	printf("PANDORA WLAN: CE: window +0x278 reads %#x, +0x10c reads %#x\n",
++	    probe, sy_rd(sy_ce_wreg, 0x10cu));
 +	if (probe == 0xffffffffu) {
-+		uint32_t alt = sy_rd(sy_ce_wreg, 0x278u);
-+
-+		printf("PANDORA WLAN: CE: window +0x10c reads %#x, +0x278 reads %#x\n",
-+		    probe, alt);
-+		if (alt == 0xffffffffu) {
-+			printf("PANDORA WLAN: CE: neither window register decodes\n");
-+			sy_log_sync();
-+			return 1;
-+		}
-+		sy_ce_win_off = 0x278u;
++		printf("PANDORA WLAN: CE: peach window 0x3278 does not decode\n");
++		sy_log_sync();
++		return 1;
 +	}
 +	sy_ce_window(SY_CE_BASE_OFF);
 +	printf("PANDORA WLAN: CE: window BAR0+%#x %#x -> %#x (want %#x)\n",
@@ -7026,8 +7044,11 @@
 +		sy_log_sync();
 +		return;
 +	}
-+	if (len < 12u)
++	if (len < 12u) {
++		printf("PANDORA WLAN: D3: HTT msg %#x (%u B)\n", typ, len);
++		sy_log_sync();
 +		return;
++	}
 +	w1 = (uint32_t)(b[4] | (b[5] << 8) | (b[6] << 16) | (b[7] << 24));
 +	w2 = (uint32_t)(b[8] | (b[9] << 8) | (b[10] << 16) | (b[11] << 24));
 +	if (typ == SY_D3_PEER_MAP || typ == SY_D3_PEER_MAP2 || typ == SY_D3_PEER_MAP3)
@@ -7319,6 +7340,267 @@
 +		return;
 +	printf("PANDORA WLAN: D3 DONE peer %u aid %u\n",
 +	    sy_d3_peer_id, sy_d3_assoc_aid);
++	sy_log_sync();
++}
++
++/* ---- E: HTT data path (stage 24) -------------------------------------------
++ *
++ * Ring register bases are the first record of each kind in hw_srng_table_peach
++ * inside this phone's qca_cld3_peach_v2.ko (.data symbol, 0x414 bytes).  Each
++ * record is 36 bytes: start ring id, max rings, entry size in 32-bit words,
++ * then two register addresses (R0 base, R2 head/tail) and two strides.
++ * File offset of the symbol is .data 0xe408 + 0x12a98.  29 records.
++ *   REO dest   id 1,  8 words, R0 0x00a38500, R2 0x00a3b048, stride 0x78
++ *   TCL data   id 24, 8 words, R0 0x00a44918, R2 0x00a46000, stride 0x78, 5 rings
++ *   WBM idle   id 120, 2 words, R0 0x00a34d3c, R2 0x00a370b8
++ *   WBM2SW     id 128, 8 words, R0 0x00a34e08, R2 0x00a370c8, stride 0x78, 8 rings
++ *   RXDMA buf  id 184 (0xb8), max 5, 2 words, both register addresses 0.
++ *   htt_srng_setup in this ko (text 0x3bef98) matches ring id 0xb8 and
++ *   sends HTT ring id 5, ring type 2 (the word 0x02000000) and pdev = mac.
++ *   The LOOP_CNT_DIS bit is not set on that path (w27 is 0).
++ * CE src/dst/status in the same table are 0x01b80000 / 0x01b81000 / 0x01b81058
++ * with stride 0x2000, which is what D1 already programs.  Those pipes are not
++ * rebuilt here.
++ *
++ * The register layout inside one ring block is the one sy_ce_ring_hw() already
++ * uses, and that function's CE addresses are the peach table's CE entries.
++ * WCN7850's 0x00a44b58 / 0x00a384e4 block bases are a different chip and are
++ * not used.
++ *
++ * Host depths below are the counts that fit in the existing 2 MiB CE window
++ * (0x10000..0x80000 is otherwise empty).  ath12k's DP_TCL_DATA_RING_SIZE is
++ * 512 and DP_REO_DST_RING_SIZE is 2048 (dp.h:160-161); REO is kept at 512 so
++ * the ring stays inside that hole.  RX buffers are 32, not the phone driver's
++ * runtime wlan_cfg count: that count is filled after boot and is not a static
++ * in the module.  Each buffer is DP_RX_BUFFER_SIZE 2048 (dp.h:181).
++ *
++ * RX_RING_SELECTION_CFG is not sent.  ath12k's wcn7850 filter carries
++ * hal_rx_desc_wcn7850 offsets (dp_rx.c:3976-3983).  This module's RX TLV
++ * parsers are hal_rx_*_peach, and those qword offsets were not counted out
++ * of the ko.
++ *
++ * target_ce_config_wlan in the same ko (9 x 6 words, 216 bytes) is not what
++ * D1's WLAN_CFG sends.  hif_ce_prepare_config picks a table from the target
++ * type; only the out-of-range fallback stores this unsuffixed table.  The
++ * running target type was not printed, so the QMI CE list is left as it was.
++ */
++#define SY_E_TCL_DEV		0x00a44918u
++#define SY_E_TCL_R2		0x00a46000u
++#define SY_E_TCL_ID		24u
++#define SY_E_REO_DEV		0x00a38500u
++#define SY_E_REO_R2		0x00a3b048u
++#define SY_E_REO_ID		1u
++#define SY_E_WBM_DEV		0x00a34e08u
++#define SY_E_WBM_R2		0x00a370c8u
++#define SY_E_WBM_ID		128u
++#define SY_E_IDLE_DEV		0x00a34d3cu
++#define SY_E_IDLE_R2		0x00a370b8u
++#define SY_E_IDLE_ID		120u
++#define SY_E_N_TCL		512u
++#define SY_E_N_REO		512u
++#define SY_E_N_WBM		64u
++#define SY_E_N_IDLE		32u
++#define SY_E_N_RX		32u
++#define SY_E_DESC32		32u
++#define SY_E_DESC8		8u
++#define SY_E_LINK_SZ		128u	/* hal.h HAL_LINK_DESC_SIZE */
++#define SY_E_RX_BUF		2048u
++#define SY_E_OFF_TCL		0x00010000u
++#define SY_E_OFF_REO		0x00014000u
++#define SY_E_OFF_WBM		0x00018000u
++#define SY_E_OFF_IDLE		0x00019000u
++#define SY_E_OFF_LINK		0x0001a000u
++#define SY_E_OFF_RXRING		0x0001c000u
++#define SY_E_OFF_RXHP		0x0001c200u
++#define SY_E_OFF_TXBUF		0x0001d000u
++#define SY_E_OFF_RXBUF		0x00020000u
++#define SY_E_HTT_SRING		0x0bu	/* dp.h HTT_H2T_MSG_TYPE_SRING_SETUP */
++#define SY_E_SW_TO_SW		2u	/* dp.h HTT_SW_TO_SW_RING; ko stores 2<<24 */
++#define SY_E_HOST1_RXBUF	5u	/* dp.h HTT_HOST1_TO_FW_RXBUF_RING */
++#define SY_E_RBM_IDLE_DESC	1u	/* hal.c ath12k_hal_set_link_desc_addr */
++#define SY_E_RBM_SW0		5u	/* hal.h:789-795, SW0 is value 5 */
++
++static unsigned sy_e_ran;
++static uint32_t sy_e_tcl_hp;
++static uint32_t sy_e_idle_hp;
++static uint32_t sy_e_rx_hp;
++
++static void
++sy_e_srng(uint32_t dev, uint32_t dev_r2, uint32_t ring_id, uint32_t entries,
++    uint32_t desc_sz, uint32_t off, unsigned dst)
++{
++	uint64_t base = SY_CE_IOVA + off;
++	uint64_t rdp = SY_CE_IOVA + SY_CE_OFF_RDP + 4u * ring_id;
++	uint32_t dw = desc_sz >> 2;
++	uint32_t ring_dw = dw * entries;
++	uint32_t v;
++
++	memset((void *)(sy_ce_va + off), 0, desc_sz * entries);
++	flush_dcache64(sy_pa(sy_ce_va + off), desc_sz * entries, TRUE);
++	__asm__ volatile("dsb sy" ::: "memory");
++	sy_ce_wr(dev + 0x00u, (uint32_t)base);
++	sy_ce_wr(dev + 0x04u, (uint32_t)((base >> 32) & 0xffull) | (ring_dw << 8));
++	if (dst)
++		sy_ce_wr(dev + 0x08u, dw | (ring_id << 8));
++	else
++		sy_ce_wr(dev + 0x08u, dw);
++	if (dst) {
++		sy_ce_wr(dev + 0x14u, (uint32_t)rdp);
++		sy_ce_wr(dev + 0x18u, (uint32_t)(rdp >> 32));
++		sy_ce_wr(dev + 0x24u, ((0x1000u >> 3) << 16) | dw);
++		v = 0x40u;
++	} else if (ring_id == SY_E_IDLE_ID) {
++		/* hal_srng_src_hw_init_generic compares the ring id with 0x78
++		 * and, for the idle link ring, skips the host TP address and
++		 * writes MISC 0x43: MSI_RING_ID_DISABLE | LOOPCNT_DISABLE | ENABLE. */
++		sy_ce_wr(dev + 0x30u, dw);
++		sy_ce_wr(dev + 0x34u, 0);
++		v = 0x43u;
++	} else {
++		sy_ce_wr(dev + 0x1cu, (uint32_t)rdp);
++		sy_ce_wr(dev + 0x20u, (uint32_t)(rdp >> 32));
++		sy_ce_wr(dev + 0x30u, dw);
++		sy_ce_wr(dev + 0x34u, 0);
++		v = 0x42u;
++	}
++	sy_ce_wr(dev_r2, 0);
++	sy_ce_wr(dev_r2 + 4u, 0);
++	sy_ce_wr(dev + 0x10u, v);
++	printf("PANDORA WLAN: E: ring id %u %s %u x %u at %#x, base read %#x misc %#x\n",
++	    ring_id, dst ? "dst" : "src", entries, desc_sz, (unsigned)base,
++	    sy_ce_rd(dev), sy_ce_rd(dev + 0x10u));
++	sy_log_sync();
++}
++
++static void
++sy_e_bufaddr(uint32_t *d, uint64_t iova, uint32_t rbm, uint32_t cookie)
++{
++	d[0] = (uint32_t)iova;
++	d[1] = (uint32_t)((iova >> 32) & 0xffull) | ((rbm & 0xfu) << 8) |
++	    (cookie << 12);
++}
++
++/* One TCL data command, 8 words, matching hal_tcl_data_cmd (hal_desc.h:1280)
++ * and the peach table's 8-word TCL entry.  len 0 leaves the ring alone. */
++static int
++sy_e_tx(const void *frame, uint32_t len)
++{
++	uint32_t dw = SY_E_DESC32 >> 2;
++	uint32_t ring_dw = dw * SY_E_N_TCL;
++	uint32_t tp, next, *d;
++	uint64_t iova;
++
++	if (!frame || !len || len > SY_E_RX_BUF)
++		return 0;
++	if (!sy_e_ran)
++		return -1;
++	tp = sy_ce_rdp(SY_E_TCL_ID);
++	next = (sy_e_tcl_hp + dw) % ring_dw;
++	if (next == tp)
++		return -1;
++	memcpy((void *)(sy_ce_va + SY_E_OFF_TXBUF), frame, len);
++	flush_dcache64(sy_pa(sy_ce_va + SY_E_OFF_TXBUF), len, TRUE);
++	iova = SY_CE_IOVA + SY_E_OFF_TXBUF;
++	d = (uint32_t *)(sy_ce_va + SY_E_OFF_TCL) + sy_e_tcl_hp;
++	memset(d, 0, SY_E_DESC32);
++	sy_e_bufaddr(d, iova, SY_E_RBM_SW0, 0);
++	d[2] = 0;				/* desc type buffer, bank 0 */
++	d[4] = len & 0xffffu;			/* INFO2 data length */
++	d[5] = 0u << 24;			/* INFO3 vdev 0, tid 0 */
++	flush_dcache64(sy_pa((vm_offset_t)d), SY_E_DESC32, TRUE);
++	__asm__ volatile("dsb sy" ::: "memory");
++	sy_e_tcl_hp = next;
++	sy_ce_wr(SY_E_TCL_R2, sy_e_tcl_hp);
++	printf("PANDORA WLAN: E: TCL posted %u B hp %#x\n", len, sy_e_tcl_hp);
++	sy_log_sync();
++	return 0;
++}
++
++static void
++sy_e_run(void)
++{
++	unsigned i, n;
++	uint32_t *hp;
++	uint32_t msg[13];
++	uint64_t ring, php, ptp;
++
++	if (sy_e_ran)
++		return;
++	if (!sy_ce_va || !sy_htc_htt_ok) {
++		printf("PANDORA WLAN: E: CE or HTT not up\n");
++		sy_log_sync();
++		return;
++	}
++	sy_e_ran = 1;
++	sy_e_srng(SY_E_TCL_DEV, SY_E_TCL_R2, SY_E_TCL_ID, SY_E_N_TCL, SY_E_DESC32,
++	    SY_E_OFF_TCL, 0);
++	sy_e_srng(SY_E_REO_DEV, SY_E_REO_R2, SY_E_REO_ID, SY_E_N_REO, SY_E_DESC32,
++	    SY_E_OFF_REO, 1);
++	sy_e_srng(SY_E_WBM_DEV, SY_E_WBM_R2, SY_E_WBM_ID, SY_E_N_WBM, SY_E_DESC32,
++	    SY_E_OFF_WBM, 1);
++	sy_e_srng(SY_E_IDLE_DEV, SY_E_IDLE_R2, SY_E_IDLE_ID, SY_E_N_IDLE, SY_E_DESC8,
++	    SY_E_OFF_IDLE, 0);
++
++	n = SY_E_N_IDLE - 1u;
++	for (i = 0; i < n; i++) {
++		uint32_t *e = (uint32_t *)(sy_ce_va + SY_E_OFF_IDLE) + i * 2u;
++
++		memset((void *)(sy_ce_va + SY_E_OFF_LINK + i * SY_E_LINK_SZ), 0,
++		    SY_E_LINK_SZ);
++		sy_e_bufaddr(e, SY_CE_IOVA + SY_E_OFF_LINK + i * SY_E_LINK_SZ,
++		    SY_E_RBM_IDLE_DESC, i);
++	}
++	flush_dcache64(sy_pa(sy_ce_va + SY_E_OFF_IDLE), SY_E_N_IDLE * SY_E_DESC8, TRUE);
++	flush_dcache64(sy_pa(sy_ce_va + SY_E_OFF_LINK), SY_E_N_IDLE * SY_E_LINK_SZ, TRUE);
++	__asm__ volatile("dsb sy" ::: "memory");
++	sy_e_idle_hp = n * 2u;
++	sy_ce_wr(SY_E_IDLE_R2, sy_e_idle_hp);
++
++	n = SY_E_N_RX - 1u;
++	for (i = 0; i < n; i++) {
++		uint32_t *e = (uint32_t *)(sy_ce_va + SY_E_OFF_RXRING) + i * 2u;
++
++		memset((void *)(sy_ce_va + SY_E_OFF_RXBUF + i * SY_E_RX_BUF), 0, 64);
++		sy_e_bufaddr(e, SY_CE_IOVA + SY_E_OFF_RXBUF + i * SY_E_RX_BUF,
++		    SY_E_RBM_SW0, i);
++	}
++	flush_dcache64(sy_pa(sy_ce_va + SY_E_OFF_RXBUF),
++	    (SY_E_N_RX - 1u) * SY_E_RX_BUF, TRUE);
++	hp = (uint32_t *)(sy_ce_va + SY_E_OFF_RXHP);
++	hp[0] = n * 2u;
++	hp[1] = 0;
++	sy_e_rx_hp = hp[0];
++	flush_dcache64(sy_pa(sy_ce_va + SY_E_OFF_RXRING), SY_E_N_RX * SY_E_DESC8, TRUE);
++	flush_dcache64(sy_pa(sy_ce_va + SY_E_OFF_RXHP), 8, TRUE);
++	__asm__ volatile("dsb sy" ::: "memory");
++
++	ring = SY_CE_IOVA + SY_E_OFF_RXRING;
++	php = SY_CE_IOVA + SY_E_OFF_RXHP;
++	ptp = php + 4u;
++	memset(msg, 0, sizeof(msg));
++	/* pdev 0, HTT ring 5, type SW_TO_SW.  Matches htt_srng_setup for id 0xb8. */
++	msg[0] = SY_E_HTT_SRING | (SY_E_HOST1_RXBUF << 16) | (SY_E_SW_TO_SW << 24);
++	msg[1] = (uint32_t)ring;
++	msg[2] = (uint32_t)(ring >> 32);
++	msg[3] = (SY_E_N_RX * 2u) | (2u << 16);
++	msg[4] = (uint32_t)php;
++	msg[5] = (uint32_t)(php >> 32);
++	msg[6] = (uint32_t)ptp;
++	msg[7] = (uint32_t)(ptp >> 32);
++	msg[11] = 2u;	/* one-entry batch, timer 0 */
++	if (sy_htc_send(sy_htc_htt_eid, msg, sizeof(msg))) {
++		printf("PANDORA WLAN: E: HTT SRING_SETUP send failed\n");
++		sy_log_sync();
++		return;
++	}
++	for (i = 0; i < 100u; i++) {
++		sy_ce_pump();
++		sy_usleep(10000);
++	}
++	(void)sy_e_tx(NULL, 0);
++	printf("PANDORA WLAN: E DONE tcl %u reo %u wbm %u idle hp %#x rx hp %#x "
++	    "reo r2 %#x\n", SY_E_N_TCL, SY_E_N_REO, SY_E_N_WBM, sy_e_idle_hp,
++	    sy_e_rx_hp, sy_ce_rd(SY_E_REO_R2));
 +	sy_log_sync();
 +}
 +
