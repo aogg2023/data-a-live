@@ -1,6 +1,6 @@
 --- a/bsd/vfs/vfs_syscalls.c
 +++ b/bsd/vfs/vfs_syscalls.c
-@@ -14682,4 +14682,71 @@
+@@ -14682,4 +14682,94 @@
  {
  	return unlinkat_internal(vfs_context_kernel(), AT_FDCWD, NULLVP, CAST_USER_ADDR_T(path), UIO_SYSSPACE, 0);
  }
@@ -15,43 +15,66 @@
 +{
 +	vfs_context_t ctx = vfs_context_kernel();
 +	UIO_STACKBUF(uio_buf, 1);
-+	char dbuf[4096];
++	char *dbuf;
 +	off_t loff = 0;
++	int error = 0;
 +
++	/* Directory bytes and child paths sit on the heap. A 4096-byte buffer
++	 * plus PATH_MAX on every recursive frame overflowed the 16KB kernel
++	 * stack while deleting AppPlaceholders (ioslog_k11). */
++	dbuf = kalloc_data(4096, Z_WAITOK);
++	if (dbuf == NULL) {
++		return ENOMEM;
++	}
 +	for (;;) {
 +		uio_t auio = uio_createwithbuffer(1, loff, UIO_SYSSPACE, UIO_READ,
 +		    &uio_buf[0], sizeof(uio_buf));
-+		if (auio == NULL) {
-+			return ENOMEM;
-+		}
-+		uio_addiov(auio, (uint64_t)(uintptr_t)dbuf, sizeof(dbuf));
 +		int eofflag = 0, numdirent = 0;
-+		int error = VNOP_READDIR(vp, auio, 0, &eofflag, &numdirent, ctx);
-+		if (error) {
-+			return error;
++		unsigned used, at;
++
++		if (auio == NULL) {
++			error = ENOMEM;
++			break;
 +		}
-+		unsigned used = (unsigned)(sizeof(dbuf) - uio_resid(auio));
++		uio_addiov(auio, (uint64_t)(uintptr_t)dbuf, 4096);
++		error = VNOP_READDIR(vp, auio, 0, &eofflag, &numdirent, ctx);
++		if (error) {
++			break;
++		}
++		used = (unsigned)(4096 - uio_resid(auio));
 +		loff = uio_offset(auio);
 +		if (used == 0) {
 +			break;
 +		}
-+		for (unsigned at = 0; at + sizeof(struct dirent) <= used; ) {
++		/* HFS records are STD_DIRENT_LEN, not sizeof(struct dirent). */
++		for (at = 0; at + 8 <= used; ) {
 +			struct dirent *dp = (struct dirent *)(void *)(dbuf + at);
-+			if (dp->d_reclen == 0 || at + dp->d_reclen > used) {
++			char *sub;
++			int n;
++
++			if (dp->d_reclen < 12 || at + dp->d_reclen > used) {
 +				break;
 +			}
 +			if (strcmp(dp->d_name, ".") != 0 && strcmp(dp->d_name, "..") != 0) {
-+				char sub[PATH_MAX];
-+				snprintf(sub, sizeof(sub), "%s/%s", path, dp->d_name);
-+				(void)pandora_rmrf(sub);
++				sub = kalloc_data(1024, Z_WAITOK);
++				if (sub == NULL) {
++					error = ENOMEM;
++					break;
++				}
++				n = snprintf(sub, 1024, "%s/%s", path, dp->d_name);
++				if (n > 0 && n < 1024) {
++					(void)pandora_rmrf(sub);
++				}
++				kfree_data(sub, 1024);
 +			}
 +			at += dp->d_reclen;
 +		}
-+		if (eofflag) {
++		if (error || eofflag) {
 +			break;
 +		}
 +	}
-+	return 0;
++	kfree_data(dbuf, 4096);
++	return error;
 +}
 +
 +int
