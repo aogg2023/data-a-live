@@ -62,6 +62,15 @@ jobs:
           if old not in s:
               raise SystemExit("sweet-root-tweaks.py: expected 20H392/16.7.16")
           open(p, "w").write(s.replace(old, new, 1))
+          p = "ios-fuxi/tools/fuxi-stage-root.py"
+          s = open(p).read()
+          a = "version.get('ProductBuildVersion') != '20H392'"
+          b = "parser.error('expected iOS 20H392')"
+          if a not in s or b not in s:
+              raise SystemExit("fuxi-stage-root.py: expected 20H392")
+          s = s.replace(a, "version.get('ProductBuildVersion') != '20F66'", 1)
+          s = s.replace(b, "parser.error('expected iOS 20F66')", 1)
+          open(p, "w").write(s)
           PY
 
       - name: build the HFS+ root image
