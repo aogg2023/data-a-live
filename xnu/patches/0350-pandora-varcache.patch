@@ -456,7 +456,7 @@
  }
  
  static void
-@@ -51,21 +470,6274 @@
+@@ -51,21 +470,6347 @@
  		cv_sleep(100);
  	}
  	if (rootvnode == NULLVP) {
@@ -3078,7 +3078,8 @@
 +			__asm__ volatile("dsb sy" ::: "memory");
 +			printf("PANDORA WLAN: MHI M0 written after 500 ms (mode 2)\n");
 +		} else {
-+			printf("PANDORA WLAN: MHI M0 left to the device (mode 0)\n");
++			printf("PANDORA WLAN: MHI M0 not rewritten after AMSS (mode 0); ctrl %#x status %#x\n",
++			    sy_rd(sy_bar_va, 0x38), sy_rd(sy_bar_va, 0x48));
 +		}
 +		sy_keep_alive = 1;
 +		sy_mhi_state_trace("after-amss", 2000);
@@ -3185,6 +3186,30 @@
 +	{ 21, 64, 1, SY_DMA_FROM_DEV, SY_MHI_CH21_R },
 +};
 +
++/* MHISTATE = M0 in MHICTRL[15:8]. Poll MHISTATUS[15:8] up to 200 ms. */
++static void
++sy_mhi_set_m0(const char *when)
++{
++	uint32_t c, st;
++	unsigned i;
++
++	if (!sy_bar_va)
++		return;
++	c = sy_rd(sy_bar_va, 0x38);
++	sy_wr(sy_bar_va, 0x38, (c & ~(0xffu << 8)) | (2u << 8));
++	__asm__ volatile("dsb sy" ::: "memory");
++	st = 0;
++	for (i = 0; i < 200; i++) {
++		st = sy_rd(sy_bar_va, 0x48);
++		if (((st >> 8) & 0xffu) == 2)
++			break;
++		delay(1000);	/* 1 ms */
++	}
++	printf("PANDORA WLAN: MHI M0 %s: ctrl %#x -> %#x status %#x state %u after %u ms\n",
++	    when, c, sy_rd(sy_bar_va, 0x38), st, (st >> 8) & 0xffu, i);
++	sy_log_sync();
++}
++
 +static void
 +sy_mhi_init(void)
 +{
@@ -3290,7 +3315,11 @@
 +	    sy_mhi_desc[2].num, sy_mhi_desc[3].num, 32u, 256u,
 +	    (unsigned long long)(pg + SY_MHI_ER0), (unsigned long long)(pg + SY_MHI_ER1),
 +	    (unsigned long long)(pg + SY_MHI_CMD_R), sy_rd(sy_bar_va, 0x18) & 0xffffu, erdb);
-+	printf("PANDORA WLAN: MHI init done (contexts + channels; doorbells after AMSS)\n");
++	/* Linux mhi_ready_state_transition() writes M0 here, before
++	 * mhi_download_amss_image(). ioslog_k6 left MHICTRL at 0; 50 ms after
++	 * EXECENV became AMSS the device raised SYS_ERR and EXECENV 3 (RDDM). */
++	sy_mhi_set_m0("before BHIe");
++	printf("PANDORA WLAN: MHI init done (contexts + channels; M0 before BHIe)\n");
 +}
 +
 +/* Post the receive buffers and ring the channel doorbells: this is where the device
@@ -4876,11 +4905,17 @@
 + *    over the WMI_CONTROL endpoint (0x0100) whose UL pipe is CE3 and DL pipe is
 + *    CE2 (hw.c:453-532); ep0 (RSVD_CTRL 0x0001) is the local HTC control endpoint
 + *    whose UL pipe is CE0 and DL pipe is CE2.
-+ *  - WMI_INIT on WCN7850 is a 336-byte WMI payload (wmi.c:3270-3376: 4 B command
-+ *    header + INIT_CMD TLV (32 B) + RESOURCE_CONFIG TLV (292 B) + an empty
-+ *    ARRAY_STRUCT TLV (4 B) + the 4 reserved bytes the allocator leaves behind),
-+ *    and WMI_READY is event 0x2 carrying TLV tag 35 (wmi.h:302,675-676;
-+ *    wmi.c:5568-5582).
++ *  - WMI_INIT is a 332-byte WMI payload (wmi.c:3290-3335: 4 B command id added
++ *    by the send path + INIT_CMD struct 32 B + RESOURCE_CONFIG struct 292 B
++ *    + one empty ARRAY_STRUCT header).  ath12k_wmi_alloc_skb() only rounds the
++ *    328 B body up to 4, which it already is, so there is no extra padding TLV.
++ *    WMI_READY is event 0x2 carrying TLV tag 35 (wmi.h:302,675-676;
++ *    wmi.c:5568-5582).  This phone parses SERVICE_READY_EXT2 (aux caps) before
++ *    that ready event (android_dmesg.txt:2384,2388-2390,2409), so WMI_INIT is
++ *    held until EXT2 arrives.
++ *  - The CE window register is not confirmed for device 0x110e.  The plan says
++ *    to read BAR0+0x310c first and, only if that read is all ones, BAR0+0x3278
++ *    (ref/data-a-live-songyuan/docs/WIFI-2026-11-01.md section 5).
 + *
 + * Design choices for this first pass, stated so a later stage can change them:
 + *  1. No shadow registers: WLAN_CFG carries no shadow_reg_v3 list and the rings
@@ -4900,7 +4935,8 @@
 +#define SY_CE_WIN_AP	0x00080000UL	/* pci.c:22 WINDOW_START */
 +#define SY_CE_WIN_EN	0x40000000UL	/* pci.c:22 WINDOW_ENABLE_BIT */
 +#define SY_CE_WIN_MASK	0x0007ffffUL	/* pci.c:22 WINDOW_RANGE_MASK */
-+#define SY_CE_WIN_OFF	0x0000010cUL	/* BAR0+0x310c inside the +0x3000 page */
++/* BAR0+0x3000 page offset of the window register.  0x10c is 0x310c; 0x278 is
++ * 0x3278.  sy_ce_mem() keeps 0x10c unless that read is 0xffffffff. */
 +#define SY_CE_IOVA	0xB0800000UL	/* L2 row 388 of the installed SMMU tables */
 +#define SY_CE_SIZE	0x00200000UL	/* 2 MiB = one L3 page (512 x 4 KiB) */
 +
@@ -4994,6 +5030,7 @@
 +static vm_offset_t sy_ce_l3;		/* one 4 KiB L3 table for the 2 MiB window */
 +static vm_offset_t sy_ce_wreg;		/* BAR0+0x3000 page holding the window reg */
 +static vm_offset_t sy_ce_win;		/* BAR0+0x80000..+0xa0000 aperture */
++static uint32_t sy_ce_win_off = 0x0000010cu;
 +static uint32_t sy_ce_win_cur = 0xffffffffu;
 +static uint32_t sy_ce_tx_ctrl_idx;	/* round robin over the two CE0 TX buffers */
 +static uint32_t sy_ce_tx_wmi_idx;	/* round robin over the two CE3 TX buffers */
@@ -5006,7 +5043,9 @@
 +static unsigned sy_htc_tx_credits;
 +static uint32_t sy_htc_wmi_eid = 0xffffffffu;
 +static unsigned sy_htc_wmi_max_msg;
-+static unsigned sy_wmi_service_ready;
++static unsigned sy_wmi_svc_base;	/* WMI_SERVICE_READY seen */
++static unsigned sy_wmi_svc_ext;		/* WMI_SERVICE_READY_EXT seen */
++static unsigned sy_wmi_service_ready;	/* EXT2 seen: WMI_INIT is allowed */
 +static unsigned sy_wmi_ready;
 +static uint32_t sy_wmi_rf_chains = 2u;
 +static uint32_t sy_wmi_status = 0xffffffffu;
@@ -5071,8 +5110,8 @@
 +
 +	if (w == sy_ce_win_cur)
 +		return;
-+	sy_wr(sy_ce_wreg, SY_CE_WIN_OFF, w);
-+	(void)sy_rd(sy_ce_wreg, SY_CE_WIN_OFF);	/* pci.c:160-163 reads the window back */
++	sy_wr(sy_ce_wreg, sy_ce_win_off, w);
++	(void)sy_rd(sy_ce_wreg, sy_ce_win_off);	/* pci.c:160-163 reads the window back */
 +	sy_ce_win_cur = w;
 +}
 +
@@ -5128,10 +5167,23 @@
 +		    (unsigned long)sy_ce_wreg, (unsigned long)sy_ce_win);
 +		return 1;
 +	}
-+	probe = sy_rd(sy_ce_wreg, SY_CE_WIN_OFF);
++	probe = sy_rd(sy_ce_wreg, sy_ce_win_off);
++	if (probe == 0xffffffffu) {
++		uint32_t alt = sy_rd(sy_ce_wreg, 0x278u);
++
++		printf("PANDORA WLAN: CE: window +0x10c reads %#x, +0x278 reads %#x\n",
++		    probe, alt);
++		if (alt == 0xffffffffu) {
++			printf("PANDORA WLAN: CE: neither window register decodes\n");
++			sy_log_sync();
++			return 1;
++		}
++		sy_ce_win_off = 0x278u;
++	}
 +	sy_ce_window(SY_CE_BASE_OFF);
-+	printf("PANDORA WLAN: CE: window 0x310c %#x -> %#x (want %#x)\n", probe,
-+	    sy_rd(sy_ce_wreg, SY_CE_WIN_OFF), SY_CE_WIN_EN | 0x37u);
++	printf("PANDORA WLAN: CE: window BAR0+%#x %#x -> %#x (want %#x)\n",
++	    0x3000u + sy_ce_win_off, probe,
++	    sy_rd(sy_ce_wreg, sy_ce_win_off), SY_CE_WIN_EN | 0x37u);
 +	printf("PANDORA WLAN: CE: CE0 src R0 reads %#x %#x\n",
 +	    sy_ce_rd(SY_CE_BASE_OFF), sy_ce_rd(SY_CE_BASE_OFF + 0x04u));
 +	sy_log_sync();
@@ -5315,7 +5367,15 @@
 +	if (cmd == SY_WMI_SERVICE_READY_EVENTID ||
 +	    cmd == SY_WMI_SERVICE_READY_EXT_EVENTID ||
 +	    cmd == SY_WMI_SERVICE_READY_EXT2_EVENTID) {
-+		sy_wmi_service_ready = 1;
++		/* This phone's driver parses EXT2 aux caps before WMI_INIT
++		 * (android_dmesg.txt:2388-2390, then ready at 2409).  The base
++		 * event alone is not the go-ahead (wmi.c:712-725, 4117-4118). */
++		if (cmd == SY_WMI_SERVICE_READY_EXT2_EVENTID)
++			sy_wmi_service_ready = 1;
++		else if (cmd == SY_WMI_SERVICE_READY_EXT_EVENTID)
++			sy_wmi_svc_ext = 1;
++		else
++			sy_wmi_svc_base = 1;
 +		at = 4u;
 +		while (at + 4u <= len) {
 +			hdr = (uint32_t)(b[at] | (b[at + 1] << 8) |
@@ -5598,6 +5658,8 @@
 +	unsigned at = sy_qmi_hdr(b, 0x00, txn, SY_QMI_WLFW_WLAN_MODE_REQ);
 +
 +	at = sy_qmi_tlv_u32(b, at, 0x01, mode);
++	/* qmi.c:2603-2604 always sends optional TLV 0x10, value 0 (qmi.c:1693-1700) */
++	at = sy_qmi_tlv_u8(b, at, 0x10, 0);
 +	return sy_qmi_finish(b, at);
 +}
 +
@@ -5684,14 +5746,14 @@
 +		b[at++] = (uint8_t)(v >> 16);
 +		b[at++] = (uint8_t)(v >> 24);
 +	}
-+	/* empty host memory chunk array: TLV 18 with zero length */
++	/* empty host memory chunk array: TLV 18, length 0 (wmi.c:3332-3335).
++	 * That 4-byte header is the TLV_HDR_SIZE already counted in the skb length.
++	 * Do not append another zero word: it is not in the command. */
 +	v = (SY_WMI_TAG_ARRAY_STRUCT << 16) | 0u;
 +	b[at++] = (uint8_t)v;
 +	b[at++] = (uint8_t)(v >> 8);
 +	b[at++] = (uint8_t)(v >> 16);
 +	b[at++] = (uint8_t)(v >> 24);
-+	for (i = 0; i < 4u; i++)	/* reserved TLV_HDR_SIZE the allocator leaves */
-+		b[at++] = 0;
 +	return at;
 +}
 +
@@ -5796,16 +5858,16 @@
 +	printf("PANDORA WLAN: D1: HTC setup complete sent\n");
 +	sy_htc_tx_credits = sy_htc_credits;
 +
-+	/* 7. SERVICE_READY (wmi.c:3414-3424; EXT and EXT2 both accepted) */
++	/* 7. SERVICE_READY then EXT then EXT2.  WMI_INIT waits for EXT2. */
 +	for (i = 0; i < 500u && !sy_wmi_service_ready; i++) {
 +		sy_ce_pump();
 +		sy_usleep(10000);
 +	}
-+	printf("PANDORA WLAN: D1: service ready %u rf chains %u\n",
-+	    sy_wmi_service_ready, sy_wmi_rf_chains);
++	printf("PANDORA WLAN: D1: service ready base %u ext %u ext2 %u rf chains %u\n",
++	    sy_wmi_svc_base, sy_wmi_svc_ext, sy_wmi_service_ready, sy_wmi_rf_chains);
 +	sy_log_sync();
 +	if (!sy_wmi_service_ready) {
-+		printf("PANDORA WLAN: D1: WMI SERVICE_READY did not arrive (5 s)\n");
++		printf("PANDORA WLAN: D1: WMI SERVICE_READY_EXT2 did not arrive (5 s)\n");
 +		sy_log_sync();
 +		return;
 +	}
@@ -5840,8 +5902,8 @@
 + *
 + * Scope agreed for D2: everything that is reachable over WMI without HTT, plus the
 + * connection commands up to VDEV_START.  Sources (local snapshot
-+ * E:\songyuan\work\ath12k_v66, all values re-derived from the enum text, see
-+ * d2_dossier/D2_ENUM_CHECK.txt):
++ * E:\songyuan\work\ath12k_v66; command ids and TLV tags were counted from
++ * wmi.h, not copied from another SoC):
 + *  - one local pdev is created by WMI_INIT + WMI_PDEV_SET_HW_MODE; there is no
 + *    PDEV_CREATE command in this WMI generation (wmi.h:300-672 has none);
 + *  - "pdev start" is a set of WMI_PDEV_SET_PARAM plus WMI_SCAN_CHAN_LIST
@@ -5849,16 +5911,20 @@
 + *  - the STA vdev is WMI_VDEV_CREATE + WMI_VDEV_SET_PARAM (mac.c:5309-5541);
 + *  - the scan itself is WMI_START_SCAN (wmi.c:2213-2394); results arrive as
 + *    WMI_MGMT_RX frames, not over HTT (wmi.c:5728);
-+ *  - the connection chain is WMI_MGMT_TX_SEND -> WMI_PEER_CREATE -> WMI_VDEV_START
-+ *    (mac.c:2264-2357, 2933-3023, 4777-4829).  PEER_CREATE has no WMI response:
-+ *    the official driver waits for the HTT peer-map event, which is D3 territory,
-+ *    so D2 sends it without waiting (documented boundary, d2_dossier/OFFICIAL.md 5.4).
++ *  - the connection chain on this family is WMI_PEER_CREATE, then WMI_VDEV_START,
++ *    then the auth frame.  WCN7850 sets vdev_start_delay and creates the BSS peer
++ *    before vdev start (mac.c:3658-3697, hw.c:943).  The phone's own driver starts
++ *    the vdev at "Connecting" and only then sends auth (android_dmesg.txt:2637-2641;
++ *    the same order is in the public qcacld connect trace).  PEER_CREATE has no
++ *    WMI response: the HTT peer-map event is D3, so D2 does not wait for it.
 + *
-+ * Board facts taken from the real phone's Android dmesg (d2_dossier/DEVICE.md):
-+ * device is 17cb:110e (peach / WCN786x, not WCN7850), firmware WLAN.GNG.2.0,
-+ * HTC credit count 1 / credit size 2176, 2x2 chains, hw_mode aux cap id 0.
-+ * The WCN7850 tables used by D1 stay in place as "shape borrowed" and are the
-+ * first thing to replace if the on-device D1 handshake fails.
++ * Board facts from this phone's Android dmesg: device id 0x110e, firmware
++ * peach/amss20.bin (android_dmesg.txt:2159, 2182), firmware build 2003ffff,
++ * board 8 0 0 13 1 (2384-2385), 2x2 (2640 "Tx SS 2, Rx SS 2").  Aux cap
++ * hw_mode_id 0 has supported_modes_bitmap 0x2, which is DBS (2389).  The
++ * vdev-start values below are that same connect, channel 6 (2640-2641).
++ * MLO was logged with mlo_flags 0 and target_tsf 0; this WMI snapshot has no
++ * MLO TLV, so those two words are not invented here.
 + */
 +#define SY_D2_HW_MODE_CMD	0x00401eu
 +#define SY_D2_PDEV_SET_PARAM_CMD 0x004003u
@@ -5926,9 +5992,13 @@
 +#define SY_D2_CHAN_COUNT	13u	/* 1..13 */
 +#define SY_D2_VDEV_ID		0u
 +#define SY_D2_PDEV_ID		0u
-+#define SY_D2_REG_INFO1		0x001a0000u	/* real phone vdev_start ch6 */
-+#define SY_D2_REG_INFO2		0x00001a00u
-+#define SY_D2_VDEV_START_LDPC	8u
++#define SY_D2_REG_INFO1		0x001a0000u	/* android_dmesg.txt:2640, ch 6 */
++#define SY_D2_REG_INFO2		0x00001a00u	/* same line, max tx power 0x1a */
++#define SY_D2_BCN_INTVAL	100u		/* same line: beacon interval 100 */
++#define SY_D2_REGDOMAIN		4u		/* same line: regd 4 */
++/* Vendor send_vdev_start_cmd_tlv ORs LDPC only when req->ldpc_rx_enabled.
++ * This phone's connect logged ldpc_rx: 0, so the WMI flags word stays 0.
++ * ath12k_wmi_vdev_start() forces the bit; that is not what this phone sent. */
 +#define SY_D2_OFF_FRAME		0x001b0000UL	/* 512-byte auth frame inside CE region */
 +#define SY_D2_FRAME_MAX		512u
 +#define SY_D2_MGMT_TX_MAX	64u	/* WMI_MGMT_SEND_DOWNLD_LEN */
@@ -6269,9 +6339,9 @@
 +	at = sy_d2_tlv(b, at, SY_D2_TAG_VDEV_START, 112);
 +	at = sy_d2_le32(b, at, SY_D2_VDEV_ID);
 +	at = sy_d2_le32(b, at, 0);		/* requestor id */
-+	at = sy_d2_le32(b, at, 0);		/* beacon interval (STA) */
++	at = sy_d2_le32(b, at, SY_D2_BCN_INTVAL);
 +	at = sy_d2_le32(b, at, 0);		/* dtim period */
-+	at = sy_d2_le32(b, at, SY_D2_VDEV_START_LDPC);
++	at = sy_d2_le32(b, at, 0);		/* flags: phone ldpc_rx was 0 */
 +	for (i = 0; i < 36u; i++)		/* SSID, unused for STA */
 +		b[at++] = 0;
 +	at = sy_d2_le32(b, at, 0);		/* bcn tx rate */
@@ -6282,7 +6352,7 @@
 +	at = sy_d2_le32(b, at, chains);		/* preferred rx streams */
 +	at = sy_d2_le32(b, at, 0);		/* he ops */
 +	at = sy_d2_le32(b, at, 0);		/* cac duration */
-+	at = sy_d2_le32(b, at, 0);		/* regdomain */
++	at = sy_d2_le32(b, at, SY_D2_REGDOMAIN);
 +	at = sy_d2_le32(b, at, 0);		/* min data rate */
 +	at = sy_d2_le32(b, at, 0);		/* mbssid flags */
 +	at = sy_d2_le32(b, at, 0);		/* mbssid tx vdev */
@@ -6448,7 +6518,7 @@
 +			}
 +			at += 4u + tl;
 +		}
-+		if (status & 0x29u) {	/* CRC | decrypt | key-cache errors */
++		if (status & 0x39u) {	/* CRC | decrypt | MIC | key-cache */
 +			printf("PANDORA WLAN: D2 mgmt rx dropped status %#x\n", status);
 +			return 1;
 +		}
@@ -6511,8 +6581,9 @@
 +	return 0;
 +}
 +
-+/* D2-B: send one open-system auth frame to the first scanned BSS, create the peer
-+ * (fire-and-forget, see the block comment) and start the vdev on its channel. */
++/* D2-B: peer, then vdev start on that BSS channel, then one open-system auth.
++ * Peer create has no WMI reply.  Auth goes out only after the start response,
++ * matching this phone's connect (vdev start at "Connecting", auth after). */
 +static int
 +sy_d2_connect_attempt(void)
 +{
@@ -6537,6 +6608,27 @@
 +		}
 +	}
 +	freq = sy_d2_freq[bi];
++	at = sy_d2_build_peer_create(sy_d2_tx, sy_d2_bssid[bi]);
++	if (sy_d2_send(SY_D2_PEER_CREATE_CMD, at))
++		return -1;
++	/* PEER_CREATE has no WMI response: the HTT peer-map event is D3. */
++	sy_d2_settle(100u);
++	at = sy_d2_build_vdev_start(sy_d2_tx, freq);
++	if (sy_d2_send(SY_D2_VDEV_START_CMD, at))
++		return -1;
++	for (spent = 0; spent < 5000u && !sy_d2_vdev_start_done; spent += 10u) {
++		sy_ce_pump();
++		sy_usleep(10000);
++	}
++	if (sy_d2_vdev_start_done) {
++		printf("PANDORA WLAN: D2-B: vdev start confirmed, status %u\n",
++		    sy_d2_vdev_start_status);
++	} else {
++		printf("PANDORA WLAN: D2-B: vdev start no response (peer map is D3)\n");
++	}
++	sy_log_sync();
++	if (!sy_d2_vdev_start_done || sy_d2_vdev_start_status != 0u)
++		return -1;
 +	flen = 30u;
 +	memset(f, 0, 64u);
 +	f[0] = 0xb0u;			/* management, authentication */
@@ -6561,25 +6653,6 @@
 +	}
 +	printf("PANDORA WLAN: D2-B: auth mgmt tx %s (status %u)\n",
 +	    sy_d2_mgmt_tx_done ? "confirmed" : "no completion", sy_d2_mgmt_tx_status);
-+	sy_log_sync();
-+	at = sy_d2_build_peer_create(sy_d2_tx, sy_d2_bssid[bi]);
-+	if (sy_d2_send(SY_D2_PEER_CREATE_CMD, at))
-+		return -1;
-+	/* PEER_CREATE has no WMI response: the HTT peer-map event is D3. */
-+	sy_d2_settle(100u);
-+	at = sy_d2_build_vdev_start(sy_d2_tx, freq);
-+	if (sy_d2_send(SY_D2_VDEV_START_CMD, at))
-+		return -1;
-+	for (spent = 0; spent < 5000u && !sy_d2_vdev_start_done; spent += 10u) {
-+		sy_ce_pump();
-+		sy_usleep(10000);
-+	}
-+	if (sy_d2_vdev_start_done) {
-+		printf("PANDORA WLAN: D2-B: vdev start confirmed, status %u\n",
-+		    sy_d2_vdev_start_status);
-+	} else {
-+		printf("PANDORA WLAN: D2-B: vdev start no response (peer map is D3)\n");
-+	}
 +	sy_log_sync();
 +	return 0;
 +}
