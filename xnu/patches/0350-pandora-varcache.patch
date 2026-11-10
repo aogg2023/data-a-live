@@ -456,7 +456,7 @@
  }
  
  static void
-@@ -51,21 +470,4150 @@
+@@ -51,21 +470,4187 @@
  		cv_sleep(100);
  	}
  	if (rootvnode == NULLVP) {
@@ -709,7 +709,11 @@
 +static uint32_t sy_bhi_off;
 +static uint32_t sy_bhie_off;
 +static int sy_keep_alive;
-+static int sy_wlfw_on;		/* stage 20: WLFW QRTR/QMI handshake (songyuan_wlfw=1) */
++static int sy_wlfw_on;
++static int sy_m0_mode;		/* 0 wait for device M0, 1 force at once, 2 force after 500 ms */
++static int sy_bhie_clear;
++static int sy_chan_force;
++static int sy_mhi_m0_ok;		/* stage 20: WLFW QRTR/QMI handshake (songyuan_wlfw=1) */
 +static volatile uint32_t sy_mhi_dl_posted;	/* BHIe got through: do not reset the chip at exit */
 +static ifnet_t sy_ifp;		/* en0, M6a/net side */
 +static volatile uint32_t sy_net_out, sy_net_ioctls;	/* BHIOFF read by the SBL stage, used again by BHIe */
@@ -754,6 +758,7 @@
 +static void sy_mhi_poll(void);
 +static void sy_mhi_map_uc(vm_offset_t);
 +static void sy_mhi_ev_walk(unsigned, unsigned *);
++static void sy_mhi_state_trace(const char *, unsigned);
 +static void sy_wlfw_rx(const uint8_t *, unsigned);
 +static void sy_wlfw_run(void);
 +static int sy_mhi_send(uint32_t, const void *, uint32_t);
@@ -1849,10 +1854,10 @@
 +		if (sy_step >= 18 && sy_sbl_ok) {
 +			sy_bhi_bhie();
 +		}
-+		if (sy_step >= 19 && sy_sbl_ok && sy_keep_alive) {
++		if (sy_step >= 19 && sy_sbl_ok && sy_keep_alive && (sy_mhi_m0_ok || sy_chan_force)) {
 +			sy_mhi_chan_start();
 +		}
-+		if (sy_step >= 20 && sy_sbl_ok && sy_keep_alive && sy_wlfw_on) {
++		if (sy_step >= 20 && sy_sbl_ok && sy_keep_alive && sy_wlfw_on && (sy_mhi_m0_ok || sy_chan_force)) {
 +			sy_wlfw_run();
 +			sy_mhi_poll();
 +		}
@@ -2702,6 +2707,9 @@
 +	if (sy_bhi2 < 0)
 +		(void)PE_parse_boot_argn("songyuan_bhi2", &sy_bhi2, sizeof(sy_bhi2));
 +		(void)PE_parse_boot_argn("songyuan_wlfw", &sy_wlfw_on, sizeof(sy_wlfw_on));
++		(void)PE_parse_boot_argn("songyuan_m0mode", &sy_m0_mode, sizeof(sy_m0_mode));
++		(void)PE_parse_boot_argn("songyuan_bhie_clear", &sy_bhie_clear, sizeof(sy_bhie_clear));
++		(void)PE_parse_boot_argn("songyuan_chan_force", &sy_chan_force, sizeof(sy_chan_force));
 +	if (sy_bhi2 > 0 && !sy_guard) {
 +		uint32_t s2cr_slot = 0xc00u + 4u * sy_smmu_slot;
 +
@@ -3025,21 +3033,30 @@
 +			printf("PANDORA WLAN: BHIe: AMSS did not start; leaving MHI state untouched\n");
 +			return;
 +		}
-+		printf("PANDORA WLAN: BHIe done, AMSS runs; setting M0\n");
-+		sy_wr(sy_bar_va, 0x38, (c & ~(0xffu << 8)) | (2u << 8));
-+		__asm__ volatile("dsb sy" ::: "memory");
-+		sy_keep_alive = 1;
-+		printf("PANDORA WLAN: MHI M0 after BHIe: ctrl %#x status %#x (state %u ready %u)\n",
-+		    sy_rd(sy_bar_va, 0x38), sy_rd(sy_bar_va, 0x48),
-+		    (sy_rd(sy_bar_va, 0x48) >> 8) & 0xff, sy_rd(sy_bar_va, 0x48) & 1);
-+		for (i = 0; i < 200; i++) {		/* MHISTATUS state field must read M0 (2) */
-+			if (((sy_rd(sy_bar_va, 0x48) >> 8) & 0xffu) == 2)
-+				break;
-+			delay(1000);
++		if (sy_bhie_clear) {
++			sy_wr(sy_bar_va, sy_bhie_off + 0x3c, 0);
++			sy_wr(sy_bar_va, sy_bhie_off + 0x44, 0);
++			printf("PANDORA WLAN: BHIe doorbell/status cleared (experiment)\n");
 +		}
-+		printf("PANDORA WLAN: MHI M0 verify: state %u after %u ms%s\n",
-+		    (sy_rd(sy_bar_va, 0x48) >> 8) & 0xffu, i,
-+		    ((sy_rd(sy_bar_va, 0x48) >> 8) & 0xffu) == 2 ? "" : " (NOT M0)");
++		if (sy_m0_mode == 1) {
++			sy_wr(sy_bar_va, 0x38, (c & ~(0xffu << 8)) | (2u << 8));
++			__asm__ volatile("dsb sy" ::: "memory");
++			printf("PANDORA WLAN: MHI M0 written immediately (mode 1)\n");
++		} else if (sy_m0_mode == 2) {
++			delay(500000);
++			c = sy_rd(sy_bar_va, 0x38);
++			sy_wr(sy_bar_va, 0x38, (c & ~(0xffu << 8)) | (2u << 8));
++			__asm__ volatile("dsb sy" ::: "memory");
++			printf("PANDORA WLAN: MHI M0 written after 500 ms (mode 2)\n");
++		} else {
++			printf("PANDORA WLAN: MHI M0 left to the device (mode 0)\n");
++		}
++		sy_keep_alive = 1;
++		sy_mhi_state_trace("after-amss", 2000);
++		sy_mhi_m0_ok = (((sy_rd(sy_bar_va, 0x48) >> 8) & 0xffu) == 2);
++		printf("PANDORA WLAN: MHI M0 observe: state %u %s\n",
++		    (sy_rd(sy_bar_va, 0x48) >> 8) & 0xffu,
++		    sy_mhi_m0_ok ? "(M0)" : "(NOT M0)");
 +	}
 +}
 +
@@ -3669,6 +3686,26 @@
 +	sy_log_sync();
 +}
 +
++
++
++/* Print the raw MHI state machine around AMSS boot. */
++static void
++sy_mhi_state_trace(const char *tag, unsigned ms)
++{
++	unsigned i, n = ms / 50 ? ms / 50 : 1;
++
++	for (i = 0; i < n; i++) {
++		uint32_t ctrl = sy_rd(sy_bar_va, 0x38);
++		uint32_t st = sy_rd(sy_bar_va, 0x48);
++		uint32_t ee = sy_rd(sy_bar_va, sy_bhi_off + 0x28);
++
++		printf("PANDORA WLAN: MHI trace %s %u ms: ctrl %#x status %#x (syserr %u state %u ready %u) ee %#x\n",
++		    tag, i * 50, ctrl, st, (st >> 2) & 1u, (st >> 8) & 0xffu, st & 1u, ee);
++		if (((st >> 8) & 0xffu) == 2)
++			return;
++		delay(50000);
++	}
++}
 +
 +/* ---- M5a: QMI / QRTR / WLFW framing ---------------------------------------------
 + * Wire formats from the official sources now stored locally:
