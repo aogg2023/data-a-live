@@ -6187,9 +6187,9 @@
 +	at = sy_d2_le32(b, at, 0);		/* num ssids (passive) */
 +	at = sy_d2_le32(b, at, 0);		/* ie len */
 +	at = sy_d2_le32(b, at, 0);		/* n probes */
-+	for (i = 0; i < 4u; i++)		/* mac_addr 8 B */
++	for (i = 0; i < 8u; i++)		/* mac_addr 8 B */
 +		b[at++] = 0;
-+	for (i = 0; i < 4u; i++)		/* mac_mask 8 B */
++	for (i = 0; i < 8u; i++)		/* mac_mask 8 B */
 +		b[at++] = 0;
 +	for (i = 0; i < 32u; i++)		/* ie_bitmap 32 B */
 +		b[at++] = 0;
