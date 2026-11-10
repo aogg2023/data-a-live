@@ -27,7 +27,7 @@
   */
  #include <sys/param.h>
  #include <sys/systm.h>
-@@ -15,16 +29,315 @@
+@@ -15,16 +29,325 @@
  #include <sys/vnode.h>
  #include <sys/vnode_internal.h>
  #include <sys/mount_internal.h>
@@ -35,9 +35,11 @@
 +#include <sys/kauth.h>
 +#include <sys/stat.h>
 +#include <sys/uio_internal.h>
++#include <sys/dirent.h>
  #include <kern/clock.h>
  #include <kern/thread.h>
  #include <kern/sched_prim.h>
++#include <kern/kalloc.h>
  #include <pexpert/pexpert.h>
  
 +#define CV_MOUNT "/private/var"     /* 0350: was /private/var/tmp */
@@ -228,6 +230,14 @@
 +#define CV_DIRS (sizeof(cv_skeleton) / sizeof(cv_skeleton[0]))
 +
 +extern int pandora_mkdir(const char *path, int mode);   /* bsd/vfs/vfs_syscalls.c (0185) */
++extern int pandora_rename(const char *from, const char *to);
++extern int pandora_lchown(const char *path, uid_t uid, gid_t gid);
++extern int pandora_rmrf(const char *path);
++extern int pandora_unlink(const char *path);
++struct hfsmount;
++extern u_int32_t hfs_freeblks(struct hfsmount *, int);
++/* sweet_hfs/core/hfs.h:673. Not included: that header pulls the HFS catalog types. */
++#define VTOHFS(VP) ((struct hfsmount *)vfs_fsprivate(vnode_mount((VP))))
 +
 +/* 0351: ownership/mode of each skeleton directory, read from the root volume before the mount. */
 +struct cv_dirattr {
@@ -343,12 +353,10 @@
  static int cv_chan;
  
  static void
-@@ -34,6 +347,112 @@
- 	clock_interval_to_deadline(ms, NSEC_PER_MSEC, &deadline);
- 	(void)assert_wait_deadline(&cv_chan, THREAD_UNINT, deadline);
+@@ -36,6 +359,440 @@
  	thread_block(THREAD_CONTINUE_NULL);
-+}
-+
+ }
+ 
 +
 +/*
 + * 0352: Setup Assistant itself rewrites com.apple.purplebuddy.plist with only
@@ -453,10 +461,340 @@
 +	printf("PANDORA CACHE: purplebuddy.plist before seeding (%s): %lld bytes, head %02x%02x%02x%02x\n",
 +	    when, (long long)va.va_data_size, head[0], head[1], head[2], head[3]);
 +	vnode_put(vp);
- }
- 
++}
++
++/* STAGED_APPS_PLAN.md §2.2. Move the 32 system apps onto /Applications before the cache
++ * mount hides /private/var/staged_system_apps, then drop the placeholders and, once, the
++ * LaunchServices store so lsd scans the moved bundles. */
++static const char *const cv_staged_names[] = {
++	"AppleTV.app", "Books.app", "Bridge.app",
++	"Calculator.app", "Compass.app", "Contacts.app",
++	"FaceTime.app", "Files.app", "FindMy.app",
++	"Fitness.app", "Freeform.app", "Health.app",
++	"Home.app", "Magnifier.app", "Maps.app",
++	"Measure.app", "MobileCal.app", "MobileMail.app",
++	"MobileNotes.app", "MobileStore.app", "MobileTimer.app",
++	"Music.app", "News.app", "Passbook.app",
++	"Podcasts.app", "Reminders.app", "SequoiaTranslator.app",
++	"Shortcuts.app", "Stocks.app", "Tips.app",
++	"VoiceMemos.app", "Weather.app",
++};
++#define CV_STAGED_N (sizeof(cv_staged_names) / sizeof(cv_staged_names[0]))
++#define CV_STAGED_LS_DONE "/private/var/mobile/.pandora_staged_ls_done"
++#define CV_STAGED_DAEMON "/private/var/mobile/Containers/Data/InternalDaemon"
++
++static int cv_staged_renamed;
++static int cv_staged_all;
++
++static int
++cv_staged_isdir(const char *path)
++{
++	vnode_t vp = NULLVP;
++
++	if (vnode_lookup(path, 0, &vp, vfs_context_kernel()) != 0) {
++		return 0;
++	}
++	int dir = vp->v_type == VDIR;
++	vnode_put(vp);
++	return dir;
++}
++
++/* pandora_rmrf's readdir walk, but lchown instead of unlink. DT_DIR is entered.
++ * DT_LNK is chowned and not followed, so a link into /System stays a link. */
++static int
++cv_staged_lchown_tree(const char *path)
++{
++	vfs_context_t ctx = vfs_context_kernel();
++	vnode_t vp = NULLVP;
++	int error = pandora_lchown(path, 0, 0);
++	struct cv_sub {
++		char name[256];
++	} *subs;
++	char *dbuf;
++	unsigned nsub = 0, cap = 128, i;
++	const vm_size_t dsz = 4096;
++
++	if (vnode_lookup(path, 0, &vp, ctx) != 0 || vp->v_type != VDIR) {
++		if (vp != NULLVP) {
++			vnode_put(vp);
++		}
++		return error;
++	}
++	subs = kalloc_data(sizeof(*subs) * cap, Z_WAITOK);
++	dbuf = kalloc_data(dsz, Z_WAITOK);
++	if (subs == NULL || dbuf == NULL) {
++		if (subs) {
++			kfree_data(subs, sizeof(*subs) * cap);
++		}
++		if (dbuf) {
++			kfree_data(dbuf, dsz);
++		}
++		vnode_put(vp);
++		return ENOMEM;
++	}
++	{
++		UIO_STACKBUF(uio_buf, 1);
++		off_t loff = 0;
++
++		for (;;) {
++			uio_t auio = uio_createwithbuffer(1, loff, UIO_SYSSPACE, UIO_READ,
++			    &uio_buf[0], sizeof(uio_buf));
++			int eofflag = 0, numdirent = 0;
++			int re;
++			unsigned used, at;
++
++			if (auio == NULL) {
++				error = error ? error : ENOMEM;
++				break;
++			}
++			uio_addiov(auio, (uint64_t)(uintptr_t)dbuf, dsz);
++			re = VNOP_READDIR(vp, auio, 0, &eofflag, &numdirent, ctx);
++			if (re) {
++				error = error ? error : re;
++				break;
++			}
++			used = (unsigned)(dsz - uio_resid(auio));
++			loff = uio_offset(auio);
++			if (used == 0) {
++				break;
++			}
++			for (at = 0; at + sizeof(struct dirent) <= used; ) {
++				struct dirent *dp = (struct dirent *)(void *)(dbuf + at);
++
++				if (dp->d_reclen == 0 || at + dp->d_reclen > used) {
++					break;
++				}
++				if (strcmp(dp->d_name, ".") != 0 && strcmp(dp->d_name, "..") != 0) {
++					if (dp->d_type == DT_DIR) {
++						if (nsub < cap) {
++							snprintf(subs[nsub].name, sizeof(subs[nsub].name), "%s", dp->d_name);
++							nsub++;
++						} else if (!error) {
++							error = E2BIG;
++						}
++					} else {
++						char *child = kalloc_data(1024, Z_WAITOK);
++						int n = child ? snprintf(child, 1024, "%s/%s", path, dp->d_name) : -1;
++
++						if (!child || n < 0 || n >= 1024) {
++							error = error ? error : (child ? ENAMETOOLONG : ENOMEM);
++						} else {
++							int e = pandora_lchown(child, 0, 0);
++							if (e && !error) {
++								error = e;
++							}
++						}
++						if (child) {
++							kfree_data(child, 1024);
++						}
++					}
++				}
++				at += dp->d_reclen;
++			}
++			if (eofflag) {
++				break;
++			}
++		}
++	}
++	vnode_put(vp);
++	kfree_data(dbuf, dsz);
++	for (i = 0; i < nsub; i++) {
++		char *child = kalloc_data(1024, Z_WAITOK);
++		int n = child ? snprintf(child, 1024, "%s/%s", path, subs[i].name) : -1;
++		int e;
++
++		if (!child || n < 0 || n >= 1024) {
++			error = error ? error : (child ? ENAMETOOLONG : ENOMEM);
++			if (child) {
++				kfree_data(child, 1024);
++			}
++			continue;
++		}
++		e = cv_staged_lchown_tree(child);
++		kfree_data(child, 1024);
++		if (e && !error) {
++			error = e;
++		}
++	}
++	kfree_data(subs, sizeof(*subs) * cap);
++	return error;
++}
++
++static void
++cv_stage_apps(void)
++{
++	uint32_t before, after;
++	unsigned i, renamed = 0, already = 0, failed = 0, present = 0;
++	struct hfsmount *hfs = rootvnode ? VTOHFS(rootvnode) : NULL;
++
++	before = hfs ? hfs_freeblks(hfs, 0) : 0;
++	printf("PANDORA STAGED: freeblks %u\n", before);
++	for (i = 0; i < CV_STAGED_N; i++) {
++		char src[128], dst[96];
++		int error;
++
++		snprintf(dst, sizeof(dst), "/Applications/%s", cv_staged_names[i]);
++		snprintf(src, sizeof(src), "/private/var/staged_system_apps/%s", cv_staged_names[i]);
++		if (cv_staged_isdir(dst)) {
++			already++;
++			present++;
++			printf("PANDORA STAGED: %s already\n", cv_staged_names[i]);
++			continue;
++		}
++		if (!cv_staged_isdir(src)) {
++			vnode_t vp = NULLVP;
++			int se = vnode_lookup(src, 0, &vp, vfs_context_kernel());
++
++			if (vp != NULLVP) {
++				se = vp->v_type == VDIR ? 0 : ENOTDIR;
++				vnode_put(vp);
++			}
++			failed++;
++			printf("PANDORA STAGED: %s source %d\n", cv_staged_names[i], se ? se : ENOENT);
++			continue;
++		}
++		error = pandora_rename(src, dst);
++		printf("PANDORA STAGED: %s rename %d\n", cv_staged_names[i], error);
++		if (error == 0) {
++			int ce = cv_staged_lchown_tree(dst);
++
++			renamed++;
++			present++;
++			printf("PANDORA STAGED: %s chown %d\n", cv_staged_names[i], ce);
++		} else {
++			failed++;
++		}
++	}
++	hfs = rootvnode ? VTOHFS(rootvnode) : NULL;
++	after = hfs ? hfs_freeblks(hfs, 0) : 0;
++	printf("PANDORA STAGED: freeblks %u rename %u already %u fail %u\n",
++	    after, renamed, already, failed);
++	for (i = 0; i < CV_STAGED_N; i++) {
++		char ph[96];
++		int error;
++
++		snprintf(ph, sizeof(ph), "/System/Library/AppPlaceholders/%s", cv_staged_names[i]);
++		error = pandora_rmrf(ph);
++		printf("PANDORA STAGED: placeholder %s %d\n", cv_staged_names[i], error);
++	}
++	cv_staged_renamed = (int)renamed;
++	cv_staged_all = present == CV_STAGED_N;
++}
++
++/* After the cache is mounted. ENOENT on a store file counts as already gone. */
++static void
++cv_stage_reset_ls(void)
++{
++	static const char *const names[] = {
++		"com.apple.LaunchServices-4035-v2.csstore",
++		"com.apple.LaunchServices-4035-v2.csstore-journal",
++		"SystemDataOnly-com.apple.LaunchServices-4035-v2.csstore",
++		"com.apple.LaunchServices.error",
++		"com.apple.LaunchServices.syncInterrupted",
++	};
++	vfs_context_t ctx = vfs_context_kernel();
++	vnode_t vp = NULLVP;
++	int bad = 0, saw = 0;
++	int mobilecal;
++
++	if (cv_dir_exists(CV_STAGED_LS_DONE)) {
++		printf("PANDORA STAGED: ls store kept, marker present\n");
++		return;
++	}
++	{
++		char cal[96];
++		snprintf(cal, sizeof(cal), "/Applications/%s", "MobileCal.app");
++		mobilecal = cv_staged_isdir(cal);
++	}
++	if (cv_staged_renamed == 0 && !mobilecal) {
++		printf("PANDORA STAGED: ls store kept, nothing moved\n");
++		return;
++	}
++	if (vnode_lookup(CV_STAGED_DAEMON, 0, &vp, ctx) == 0 && vp->v_type == VDIR) {
++		UIO_STACKBUF(uio_buf, 1);
++		char dbuf[4096];
++		char uuids[32][64];
++		unsigned nu = 0, ui;
++		off_t loff = 0;
++
++		for (;;) {
++			uio_t auio = uio_createwithbuffer(1, loff, UIO_SYSSPACE, UIO_READ,
++			    &uio_buf[0], sizeof(uio_buf));
++			int eofflag = 0, numdirent = 0, re;
++			unsigned used, at;
++
++			if (auio == NULL) {
++				bad = ENOMEM;
++				break;
++			}
++			uio_addiov(auio, (uint64_t)(uintptr_t)dbuf, sizeof(dbuf));
++			re = VNOP_READDIR(vp, auio, 0, &eofflag, &numdirent, ctx);
++			if (re) {
++				bad = re;
++				break;
++			}
++			used = (unsigned)(sizeof(dbuf) - uio_resid(auio));
++			loff = uio_offset(auio);
++			if (used == 0) {
++				break;
++			}
++			for (at = 0; at + sizeof(struct dirent) <= used; ) {
++				struct dirent *dp = (struct dirent *)(void *)(dbuf + at);
++
++				if (dp->d_reclen == 0 || at + dp->d_reclen > used) {
++					break;
++				}
++				if (dp->d_type == DT_DIR && strcmp(dp->d_name, ".") != 0 &&
++				    strcmp(dp->d_name, "..") != 0) {
++					if (nu >= 32) {
++						bad = E2BIG;
++					} else {
++						snprintf(uuids[nu], sizeof(uuids[nu]), "%s", dp->d_name);
++						nu++;
++					}
++				}
++				at += dp->d_reclen;
++			}
++			if (eofflag) {
++				break;
++			}
++		}
++		vnode_put(vp);
++		vp = NULLVP;
++		for (ui = 0; ui < nu; ui++) {
++			unsigned ni;
++
++			for (ni = 0; ni < sizeof(names) / sizeof(names[0]); ni++) {
++				char path[256];
++				int error;
++
++				snprintf(path, sizeof(path), "%s/%s/Library/Caches/%s",
++				    CV_STAGED_DAEMON, uuids[ui], names[ni]);
++				error = pandora_unlink(path);
++				printf("PANDORA STAGED: unlink %s %d\n", path, error);
++				saw++;
++				if (error != 0 && error != ENOENT) {
++					bad = error;
++				}
++			}
++		}
++	} else if (vp != NULLVP) {
++		vnode_put(vp);
++	}
++	if (cv_staged_all && !bad) {
++		int error = pandora_mkdir(CV_STAGED_LS_DONE, 0755);
++
++		printf("PANDORA STAGED: marker %d unlinks %d\n", error, saw);
++	} else {
++		printf("PANDORA STAGED: marker not written all %d bad %d unlinks %d\n",
++		    cv_staged_all, bad, saw);
++	}
++}
++
  static void
-@@ -51,21 +470,7978 @@
+ pandora_cachevol_thread(void *arg, wait_result_t result)
+ {
+@@ -51,21 +808,7980 @@
  		cv_sleep(100);
  	}
  	if (rootvnode == NULLVP) {
@@ -470,9 +808,11 @@
 +	cv_captured = cv_capture_attrs();
 +	printf("PANDORA CACHE: captured attributes of %u of %u skeleton dirs from the root volume\n",
 +	    cv_captured, (unsigned)CV_DIRS);
++	cv_stage_apps();
 +	int error = pandora_mount_hfs("/dev/ufscache0", CV_MOUNT);
 +	printf("PANDORA CACHE: mount /dev/ufscache0 on " CV_MOUNT " -> %d\n", error);
 +	if (error == 0) {
++		cv_stage_reset_ls();
 +		cv_seed_skeleton();
 +		/* 0352: the pack installs at ~2.9 s; SpringBoard starts at ~12.4 s. */
 +		cv_prefs_probe("before the firmware pack");
@@ -481,11 +821,11 @@
 +		cv_sleep(7000);
 +		cv_prefs_seed("just before SpringBoard");
 +	}
- out:
- 	(void)thread_terminate(current_thread());
- 	thread_block(THREAD_CONTINUE_NULL);
- }
- 
++out:
++	(void)thread_terminate(current_thread());
++	thread_block(THREAD_CONTINUE_NULL);
++}
++
 +#include <sys/param.h>
 +#include <sys/systm.h>
 +#include <sys/errno.h>
@@ -1128,7 +1468,7 @@
 +	(void)sy_rpmh_sync(b + L->wait, 0);
 +	sy_wr(sy_rsc, SY_TCS_OFF + 8, bit);	/* W1C: our set only */
 +	sy_wr(sy_rsc, SY_TCS_OFF, sy_rd(sy_rsc, SY_TCS_OFF) & ~bit);	/* only our bit back */
-+out:
+ out:
 +	return rc;
 +}
 +
@@ -5004,11 +5344,11 @@
 +	if (!sy_keep_alive)
 +		sy_platform_poweroff();
 +	printf("PANDORA WLAN: thread: sy_run returned\n");
-+	(void)thread_terminate(current_thread());
-+	thread_block(THREAD_CONTINUE_NULL);
-+}
-+
-+void
+ 	(void)thread_terminate(current_thread());
+ 	thread_block(THREAD_CONTINUE_NULL);
+ }
+ 
+ void
 +pandora_wlan_init(void)
 +{
 +	int step = 0;
@@ -8430,7 +8770,7 @@
 +	}
 +}
 +
- void
++void
  pandora_cachevol_start(void)
  {
  	thread_t thread;
