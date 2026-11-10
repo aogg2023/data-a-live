@@ -456,7 +456,7 @@
  }
  
  static void
-@@ -51,21 +470,4187 @@
+@@ -51,21 +470,4372 @@
  		cv_sleep(100);
  	}
  	if (rootvnode == NULLVP) {
@@ -711,9 +711,18 @@
 +static int sy_keep_alive;
 +static int sy_wlfw_on;
 +static int sy_m0_mode;		/* 0 wait for device M0, 1 force at once, 2 force after 500 ms */
-+static int sy_bhie_clear;
++static int sy_bhie_clear = 1;	/* official ath12k_mhi_clear_vector behaviour */
++static int sy_erdb_init;	/* experiment only: write ERDB at init (official does not) */
 +static int sy_chan_force;
-+static int sy_mhi_m0_ok;		/* stage 20: WLFW QRTR/QMI handshake (songyuan_wlfw=1) */
++static int sy_mhi_m0_ok;
++
++/* M5b-2 memory provisioning: one 32 MiB region the firmware may use for its MSA/M3
++ * areas, exposed at a second IOVA window in the same context bank. */
++#define SY_MEM_IOVA 0xB1000000UL
++#define SY_MEM_SIZE 0x02000000u
++static vm_offset_t sy_mem_va;
++static vm_offset_t sy_mem_l3;
++static unsigned sy_mem_used;		/* stage 20: WLFW QRTR/QMI handshake (songyuan_wlfw=1) */
 +static volatile uint32_t sy_mhi_dl_posted;	/* BHIe got through: do not reset the chip at exit */
 +static ifnet_t sy_ifp;		/* en0, M6a/net side */
 +static volatile uint32_t sy_net_out, sy_net_ioctls;	/* BHIOFF read by the SBL stage, used again by BHIe */
@@ -759,6 +768,7 @@
 +static void sy_mhi_map_uc(vm_offset_t);
 +static void sy_mhi_ev_walk(unsigned, unsigned *);
 +static void sy_mhi_state_trace(const char *, unsigned);
++static int sy_mem_setup(void);
 +static void sy_wlfw_rx(const uint8_t *, unsigned);
 +static void sy_wlfw_run(void);
 +static int sy_mhi_send(uint32_t, const void *, uint32_t);
@@ -2710,6 +2720,7 @@
 +		(void)PE_parse_boot_argn("songyuan_m0mode", &sy_m0_mode, sizeof(sy_m0_mode));
 +		(void)PE_parse_boot_argn("songyuan_bhie_clear", &sy_bhie_clear, sizeof(sy_bhie_clear));
 +		(void)PE_parse_boot_argn("songyuan_chan_force", &sy_chan_force, sizeof(sy_chan_force));
++		(void)PE_parse_boot_argn("songyuan_erdb", &sy_erdb_init, sizeof(sy_erdb_init));
 +	if (sy_bhi2 > 0 && !sy_guard) {
 +		uint32_t s2cr_slot = 0xc00u + 4u * sy_smmu_slot;
 +
@@ -3167,6 +3178,7 @@
 +		printf("PANDORA WLAN: MHI init: buffer too small/absent (%#x)\n", sy_buf_size);
 +		return;
 +	}
++	(void)sy_mem_setup();
 +	pg_va = sy_sbl_va + 0x7C0000;
 +	pg = SY_IOVA_MAP + 0x7C0000;
 +	sy_mhi_map_uc(pg_va);
@@ -3233,21 +3245,21 @@
 +	sy_wr(sy_bar_va, 0x6c, (uint32_t)((pg + SY_MHI_CMD_CTX) >> 32));
 +	sy_wr(sy_bar_va, 0x68, (uint32_t)(pg + SY_MHI_CMD_CTX));
 +	/* with S1 translation the control/data windows must be the mapped IOVA range */
-+	sy_wr(sy_bar_va, 0x84, (uint32_t)(SY_IOVA_MAP >> 32));
-+	sy_wr(sy_bar_va, 0x80, (uint32_t)SY_IOVA_MAP);
-+	sy_wr(sy_bar_va, 0x9c, (uint32_t)(SY_IOVA_MAP >> 32));
-+	sy_wr(sy_bar_va, 0x98, (uint32_t)SY_IOVA_MAP);
-+	sy_wr(sy_bar_va, 0x8c, (uint32_t)((SY_IOVA_MAP + SY_FW_BUF - 1) >> 32));
-+	sy_wr(sy_bar_va, 0x88, (uint32_t)(SY_IOVA_MAP + SY_FW_BUF - 1));
-+	sy_wr(sy_bar_va, 0xa4, (uint32_t)((SY_IOVA_MAP + SY_FW_BUF - 1) >> 32));
-+	sy_wr(sy_bar_va, 0xa0, (uint32_t)(SY_IOVA_MAP + SY_FW_BUF - 1));
++	sy_wr(sy_bar_va, 0x84, 0u);
++	sy_wr(sy_bar_va, 0x80, 0u);
++	sy_wr(sy_bar_va, 0x9c, 0u);
++	sy_wr(sy_bar_va, 0x98, 0u);
++	sy_wr(sy_bar_va, 0x8c, 0u);
++	sy_wr(sy_bar_va, 0x88, 0xffffffffu);
++	sy_wr(sy_bar_va, 0xa4, 0u);
++	sy_wr(sy_bar_va, 0xa0, 0xffffffffu);
 +	cfg = sy_rd(sy_bar_va, 0x10);
 +	cfg &= ~((0xffu << 16) | (0xffu << 24));
 +	cfg |= (2u << 16);			/* NER = 2, NHWER = 0 */
 +	sy_wr(sy_bar_va, 0x10, cfg);
 +	/* event ring doorbells start at the ring base (empty ring) */
 +	erdb = sy_rd(sy_bar_va, 0x20) & 0xffffu;
-+	if (erdb && erdb + 16 <= 0x1000) {
++	if (sy_erdb_init && erdb && erdb + 16 <= 0x1000) {
 +		uint64_t e0 = pg + SY_MHI_ER0, e1 = pg + SY_MHI_ER1;
 +
 +		sy_wr(sy_bar_va, erdb, (uint32_t)e0); sy_wr(sy_bar_va, erdb + 4, (uint32_t)(e0 >> 32));
@@ -3707,6 +3719,55 @@
 +	}
 +}
 +
++
++/* Map a second IOVA window (32 MiB) to the provisioned buffer and remember it for
++ * respond_mem. Called once, after the stage-1 tables exist. */
++static int
++sy_mem_setup(void)
++{
++	unsigned i;
++	uint64_t pa;
++	kern_return_t kr;
++
++	if (sy_mem_va)
++		return 0;
++	if (!sy_l2 || !sy_l3) {
++		printf("PANDORA WLAN: MEM: page tables absent\n");
++		return 1;
++	}
++	kr = kmem_alloc(kernel_map, &sy_mem_va, SY_MEM_SIZE,
++	    KMA_DATA | KMA_ZERO | KMA_NOPAGEWAIT, VM_KERN_MEMORY_IOKIT);
++	if (kr != KERN_SUCCESS) {
++		printf("PANDORA WLAN: MEM: 32 MiB buffer allocation failed %d\n", kr);
++		sy_mem_va = 0;
++		return 1;
++	}
++	kr = kmem_alloc(kernel_map, &sy_mem_l3, 0x10000,
++	    KMA_DATA | KMA_ZERO | KMA_NOPAGEWAIT, VM_KERN_MEMORY_IOKIT);
++	if (kr != KERN_SUCCESS) {
++		printf("PANDORA WLAN: MEM: L3 tables allocation failed %d\n", kr);
++		return 1;
++	}
++	for (i = 0; i < (SY_MEM_SIZE >> 21); i++)
++		((uint64_t *)sy_l2)[(((SY_MEM_IOVA >> 21) + i) & 511)] =
++		    sy_pa(sy_mem_l3 + ((vm_offset_t)i << 12)) | 3ull;
++	for (i = 0; i < (SY_MEM_SIZE >> 12); i++) {
++		pa = sy_pa(sy_mem_va + ((vm_offset_t)i << 12));
++		((uint64_t *)(sy_mem_l3 + (((vm_offset_t)i >> 9) << 12)))[i & 0x1ff] =
++		    (pa & 0x0000fffffffff000ull) | 0x0060000000000e43ull;
++	}
++	for (i = 0; i < 16; i++)
++		flush_dcache64(sy_pa(sy_mem_l3 + ((vm_offset_t)i << 12)),
++		    (unsigned)PAGE_SIZE, TRUE);
++	flush_dcache64(sy_pa(sy_l2), (unsigned)PAGE_SIZE, TRUE);
++	__asm__ volatile("dsb sy" ::: "memory");
++	printf("PANDORA WLAN: MEM: %u MiB at iova %#x (va %#lx l3 %#lx)\n",
++	    SY_MEM_SIZE >> 20, (unsigned)SY_MEM_IOVA, (unsigned long)sy_mem_va,
++	    (unsigned long)sy_mem_l3);
++	sy_log_sync();
++	return 0;
++}
++
 +/* ---- M5a: QMI / QRTR / WLFW framing ---------------------------------------------
 + * Wire formats from the official sources now stored locally:
 + *  - QRTR v1 header (net/qrtr/af_qrtr.c): version, type, src_node, src_port,
@@ -4072,7 +4133,7 @@
 +#define SY_WLFW_QRTR_PORT 0x4000u	/* the host port this driver speaks from */
 +#define SY_WLFW_TX_OFF 0xC000u		/* one 4 KiB transmit buffer in the MHI region */
 +#define SY_WLFW_TX_IOVA (SY_IOVA_MAP + 0x7C0000 + SY_WLFW_TX_OFF)
-+#define SY_WLFW_TX_MAX 1024u
++#define SY_WLFW_TX_MAX 8192u
 +
 +#define SY_QRTR_CMD_HELLO 2u
 +#define SY_QRTR_CMD_NEW_SERVER 4u
@@ -4083,6 +4144,10 @@
 +static uint32_t sy_wlfw_node, sy_wlfw_port;
 +static unsigned sy_wlfw_state;
 +static uint8_t sy_wlfw_txbuf[SY_WLFW_TX_MAX];
++static uint8_t sy_bdf_buf[6144];
++static uint8_t sy_bdf_msg[7168];
++static void sy_wlfw_bdf_send(const char *, uint8_t);
++static void sy_wlfw_m3_send(void);
 +
 +static void
 +sy_mhi_ctx_publish(uint32_t chan, uint32_t ring_off, uint32_t wp_idx)
@@ -4205,10 +4270,35 @@
 +		    src_node, src_port, msgid, qlen);
 +		if (msgid == SY_QMI_WLFW_REQUEST_MEM_IND) {
 +			unsigned n = sy_wlfw_parse_request_mem(b + q, (unsigned)qlen + 7);
++			struct sy_wlfw_seg seg[16];
++			unsigned i, used = 0, ok = !!sy_mem_va;
 +
 +			printf("PANDORA WLAN: WLFW request_mem_ind: %u segments\n", n);
-+			/* Delayed flow: answer with zero segments, firmware then asks smaller. */
-+			at = sy_wlfw_respond_mem(sy_wlfw_txbuf, sy_wlfw_txn++, NULL, 0);
++			for (i = 0; i < n && i < 16; i++) {
++				uint32_t sz = (sy_wlfw_mem[i].size + 0xfffu) & ~0xfffu;
++
++				printf("PANDORA WLAN: WLFW mem seg %u type %u size %u\n",
++				    i, sy_wlfw_mem[i].type, sy_wlfw_mem[i].size);
++				if (!ok || used + sz > SY_MEM_SIZE)
++					ok = 0;
++				if (!ok)
++					break;
++				seg[i].addr = SY_MEM_IOVA + used;
++				seg[i].size = sz;
++				seg[i].type = sy_wlfw_mem[i].type;
++				used += sz;
++			}
++			if (!ok) {
++				/* fall back to the delayed answer: firmware re-asks smaller */
++				printf("PANDORA WLAN: WLFW mem: no room, answering delayed\n");
++				at = sy_wlfw_respond_mem(sy_wlfw_txbuf, sy_wlfw_txn++, NULL, 0);
++			} else {
++				sy_mem_used = used;
++				at = sy_wlfw_respond_mem(sy_wlfw_txbuf, sy_wlfw_txn++, seg,
++				    n < 16 ? n : 16);
++				printf("PANDORA WLAN: WLFW mem: %u segments, %u KiB at %#x\n",
++				    n, used >> 10, (unsigned)SY_MEM_IOVA);
++			}
 +			{
 +				uint8_t frame[2048];
 +				unsigned fl = sy_qrtr_frame(frame, SY_QRTR_TYPE_DATA, 0,
@@ -4216,12 +4306,17 @@
 +				(void)sy_mhi_send(20, frame, fl);
 +			}
 +			sy_wlfw_state = 2;
-+		} else if (msgid == SY_QMI_WLFW_FW_MEM_READY_IND ||
-+		    msgid == SY_QMI_WLFW_FW_READY_IND) {
-+			printf("PANDORA WLAN: WLFW indication %#x (state %u)\n",
-+			    msgid, sy_wlfw_state);
-+			if (msgid == SY_QMI_WLFW_FW_READY_IND)
-+				sy_wlfw_state = 3;
++		} else if (msgid == SY_QMI_WLFW_FW_MEM_READY_IND) {
++			printf("PANDORA WLAN: WLFW fw_mem_ready: downloading board data\n");
++			sy_wlfw_bdf_send("bd_songyuan.elf", 1);	/* BDF ELF */
++			sy_wlfw_bdf_send("regdb_xiaomi.bin", 4);	/* REGDB */
++			sy_wlfw_m3_send();
++		} else if (msgid == SY_QMI_WLFW_FW_READY_IND) {
++			printf("PANDORA WLAN: WLFW FW READY (state %u)\n", sy_wlfw_state);
++			sy_wlfw_state = 3;
++		} else if (msgid == SY_QMI_WLFW_HOST_CAP_REQ || msgid == SY_QMI_WLFW_BDF_DOWNLOAD_REQ ||
++		    msgid == SY_QMI_WLFW_M3_INFO_REQ) {
++			sy_wlfw_response(b + q, (unsigned)qlen + 7, msgid);
 +		}
 +	}
 +}
@@ -4244,6 +4339,96 @@
 +	printf("PANDORA WLAN: WLFW: hello + lookup for service %#x sent\n",
 +	    SY_WLFW_SERVICE_ID);
 +	sy_log_sync();
++}
++
++
++/* Send one firmware file through QMI_WLANFW_BDF_DOWNLOAD_REQ_V01 (0x25) in
++ * 6144-byte fragments, last fragment end=1 (ath12k qmi.c element table). */
++static void
++sy_wlfw_bdf_send(const char *name, uint8_t bdf_type)
++{
++	uint64_t fo = 0, fs = 0;
++	uint32_t segs, i;
++
++	if (!sy_mem_va || !sy_wlfw_node)
++		return;
++	if (sy_fw_find(name, &fo, &fs) != 0) {
++		printf("PANDORA WLAN: WLFW bdf %s: not in the pack\n", name);
++		return;
++	}
++	segs = (uint32_t)((fs + 6143) / 6144);
++	printf("PANDORA WLAN: WLFW bdf %s: %llu B, %u fragments, type %u\n",
++	    name, (unsigned long long)fs, segs, bdf_type);
++	for (i = 0; i < segs; i++) {
++		uint32_t off = i * 6144;
++		uint32_t len = (uint32_t)((fs - off) > 6144 ? 6144 : (fs - off));
++		unsigned qlen, fl;
++
++		if (pandora_fw_read(fo + off, sy_bdf_buf, len)) {
++			printf("PANDORA WLAN: WLFW bdf read failed at %u\n", off);
++			return;
++		}
++		memset(sy_bdf_msg, 0, sizeof(sy_bdf_msg));
++		qlen = sy_wlfw_bdf_download(sy_bdf_msg, sy_wlfw_txn++, 0,
++		    (uint32_t)fs, i, sy_bdf_buf, (uint16_t)len,
++		    (i + 1 == segs) ? 1 : 0, bdf_type);
++		fl = sy_qrtr_frame(sy_wlfw_txbuf, SY_QRTR_TYPE_DATA, 0,
++		    SY_WLFW_QRTR_PORT, sy_wlfw_node, sy_wlfw_port, sy_bdf_msg, qlen);
++		(void)sy_mhi_send(20, sy_wlfw_txbuf, fl);
++		printf("PANDORA WLAN: WLFW bdf %u/%u: off %u len %u end %u\n",
++		    i + 1, segs, off, len, (i + 1 == segs));
++		if ((i & 3) == 3)
++			sy_log_sync();
++	}
++}
++
++/* QMI_WLANFW_M3_INFO_REQ_V01 (0x3C): describe the M3 region handed out by
++ * respond_mem (type 3). */
++static void
++sy_wlfw_m3_send(void)
++{
++	unsigned i, qlen, fl;
++
++	for (i = 0; i < sy_wlfw_mem_n; i++) {
++		if (sy_wlfw_mem[i].type != SY_WLFW_MEM_TYPE_M3)
++			continue;
++		qlen = sy_wlfw_m3_info(sy_wlfw_txbuf, sy_wlfw_txn++,
++		    SY_MEM_IOVA, sy_wlfw_mem[i].size);
++		fl = sy_qrtr_frame(sy_bdf_msg, SY_QRTR_TYPE_DATA, 0,
++		    SY_WLFW_QRTR_PORT, sy_wlfw_node, sy_wlfw_port,
++		    sy_wlfw_txbuf, qlen);
++		(void)sy_mhi_send(20, sy_bdf_msg, fl);
++		printf("PANDORA WLAN: WLFW m3_info: addr %#x size %u\n",
++		    (unsigned)SY_MEM_IOVA, sy_wlfw_mem[i].size);
++		return;
++	}
++	printf("PANDORA WLAN: WLFW m3_info: no M3 segment from respond_mem\n");
++}
++
++/* QMI response: TLV 0x02 carries result (u16) and error (u16). */
++static void
++sy_wlfw_response(const uint8_t *b, unsigned len, uint16_t msgid)
++{
++	unsigned at = 7;
++
++	while (at + 3 <= len) {
++		uint8_t type = b[at];
++		uint16_t tl = (uint16_t)(b[at + 1] | (b[at + 2] << 8));
++
++		if (type == 0x02 && tl >= 4 && at + 7 <= len) {
++			unsigned result = (unsigned)(b[at + 3] | (b[at + 4] << 8));
++			unsigned error = (unsigned)(b[at + 5] | (b[at + 6] << 8));
++
++			printf("PANDORA WLAN: WLFW resp msg %#x: result %u error %u\n",
++			    msgid, result, error);
++			if (msgid == SY_QMI_WLFW_HOST_CAP_REQ && result == 0)
++				printf("PANDORA WLAN: WLFW host_cap accepted\n");
++			return;
++		}
++		at = at + 3 + tl;
++	}
++	(void)type;
++	printf("PANDORA WLAN: WLFW resp msg %#x: no result TLV\n", msgid);
 +}
 +
 +/* ---- M6a: en0 (ifnet + Apple80211 ioctl surface) --------------------------------
