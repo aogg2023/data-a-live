@@ -353,7 +353,7 @@
  static int cv_chan;
  
  static void
-@@ -36,6 +359,440 @@
+@@ -36,6 +359,442 @@
  	thread_block(THREAD_CONTINUE_NULL);
  }
  
@@ -558,10 +558,11 @@
 +			if (used == 0) {
 +				break;
 +			}
-+			for (at = 0; at + sizeof(struct dirent) <= used; ) {
++			/* HFS records are STD_DIRENT_LEN, not sizeof(struct dirent). */
++			for (at = 0; at + 8 <= used; ) {
 +				struct dirent *dp = (struct dirent *)(void *)(dbuf + at);
 +
-+				if (dp->d_reclen == 0 || at + dp->d_reclen > used) {
++				if (dp->d_reclen < 12 || at + dp->d_reclen > used) {
 +					break;
 +				}
 +				if (strcmp(dp->d_name, ".") != 0 && strcmp(dp->d_name, "..") != 0) {
@@ -738,10 +739,11 @@
 +			if (used == 0) {
 +				break;
 +			}
-+			for (at = 0; at + sizeof(struct dirent) <= used; ) {
++			/* HFS records are STD_DIRENT_LEN, not sizeof(struct dirent). */
++			for (at = 0; at + 8 <= used; ) {
 +				struct dirent *dp = (struct dirent *)(void *)(dbuf + at);
 +
-+				if (dp->d_reclen == 0 || at + dp->d_reclen > used) {
++				if (dp->d_reclen < 12 || at + dp->d_reclen > used) {
 +					break;
 +				}
 +				if (dp->d_type == DT_DIR && strcmp(dp->d_name, ".") != 0 &&
@@ -794,7 +796,7 @@
  static void
  pandora_cachevol_thread(void *arg, wait_result_t result)
  {
-@@ -51,21 +808,7980 @@
+@@ -51,21 +810,7980 @@
  		cv_sleep(100);
  	}
  	if (rootvnode == NULLVP) {
