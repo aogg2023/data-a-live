@@ -456,7 +456,7 @@
  }
  
  static void
-@@ -51,21 +470,4372 @@
+@@ -51,21 +470,5367 @@
  		cv_sleep(100);
  	}
  	if (rootvnode == NULLVP) {
@@ -788,6 +788,7 @@
 +static void sy_smmu_bank_scan(void);
 +static void sy_bhi_sbl(void);
 +static void sy_buf_alloc(void);
++static void sy_ce_run(void);	/* stage 21: D1 CE transport + HTC + WMI */
 +
 +static vm_offset_t parf, phy, dbi, iatu, conf, pcism, gcc_low, gcc, tlmm_low, tlmm, tcsr, rsc, cmddb, crm;
 +#define SY_PHY_ROWS (sizeof(sy_phy_seq) / sizeof(sy_phy_seq[0]))
@@ -1870,6 +1871,14 @@
 +		if (sy_step >= 20 && sy_sbl_ok && sy_keep_alive && sy_wlfw_on && (sy_mhi_m0_ok || sy_chan_force)) {
 +			sy_wlfw_run();
 +			sy_mhi_poll();
++		}
++
++		/* stage 21: D1 - CE transport, HTC connect, WMI_INIT/WMI_READY.
++		 * The WLFW FW_READY wait runs inside sy_ce_run(), because sy_wlfw_state is
++		 * declared later in this file (C needs a declaration before the use). */
++		if (sy_step >= 21 && sy_sbl_ok && sy_keep_alive && sy_wlfw_on &&
++		    (sy_mhi_m0_ok || sy_chan_force)) {
++			sy_ce_run();	/* D1: CE + HTC + WMI */
 +		}
 +			if (smmu) {
 +				printf("PANDORA WLAN: SMMU IDR0 %#x IDR1 %#x IDR2 %#x CR0 %#x\n",
@@ -4148,6 +4157,9 @@
 +static uint8_t sy_bdf_msg[7168];
 +static void sy_wlfw_bdf_send(const char *, uint8_t);
 +static void sy_wlfw_m3_send(void);
++/* sy_wlfw_rx() calls this before its definition; C99 rejects implicit
++ * declarations (CI run 42737773853 hit exactly this in pandora_cachevol.c). */
++static void sy_wlfw_response(const uint8_t *, unsigned, uint16_t);
 +
 +static void
 +sy_mhi_ctx_publish(uint32_t chan, uint32_t ring_off, uint32_t wp_idx)
@@ -4317,6 +4329,11 @@
 +		} else if (msgid == SY_QMI_WLFW_HOST_CAP_REQ || msgid == SY_QMI_WLFW_BDF_DOWNLOAD_REQ ||
 +		    msgid == SY_QMI_WLFW_M3_INFO_REQ) {
 +			sy_wlfw_response(b + q, (unsigned)qlen + 7, msgid);
++		} else if (msgid == 0x0022 || msgid == 0x0023) {
++			/* D1: QMI_WLANFW_WLAN_MODE_REQ (0x22) / WLAN_CFG_REQ (0x23) */
++			printf("PANDORA WLAN: WLFW wlan %s response\n",
++			    msgid == 0x0022 ? "mode" : "cfg");
++			sy_wlfw_response(b + q, (unsigned)qlen + 7, msgid);
 +		}
 +	}
 +}
@@ -4427,7 +4444,6 @@
 +		}
 +		at = at + 3 + tl;
 +	}
-+	(void)type;
 +	printf("PANDORA WLAN: WLFW resp msg %#x: no result TLV\n", msgid);
 +}
 +
@@ -4822,6 +4838,985 @@
 +	    KERN_SUCCESS) {
 +		thread_deallocate(th);
 +	}
++}
++
++/* ---- D1: CE transport, HTC connect and WMI_INIT/WMI_READY (stage 21) ----------------
++ *
++ * This is the stage the WLFW QMI handshake was always waiting for.  It is written
++ * against the local mainline ath12k v6.6 snapshot (E:\songyuan\work\ath12k_v66),
++ * and every constant below cites that tree:
++ *  - CE register block: device offset 0x01b80000, 0x2000 per copy engine
++ *    (hal.h:44-53, HAL_CE_WFSS_CE_REG_BASE / HAL_SEQ_WCSS_UMAC_CE0_SRC_REG).
++ *  - BAR0 only exposes that block through the window register at BAR0+0x310c:
++ *    write 0x40000000 | ((dev_off>>19)&0x3f), then touch
++ *    BAR0+0x80000+(dev_off & 0x7ffff) (pci.c:22-27, 146-165, 1187-1211).
++ *    WCN7850 has static_window_map=false (pci.c:1229-1232), so every CE access
++ *    takes this window path.
++ *  - Ring registers (relative to the CE block; hal.h:58-102,190-197; hal.c:1253-1422):
++ *      R0 +0x00 base LSB, +0x04 base MSB | (ring size in dwords << 8),
++ *      +0x08 ring id/entry size, +0x10 misc, +0x1c/+0x20 TP address (src rings),
++ *      +0x14/+0x18 HP address (status ring), +0x24 producer int (status),
++ *      +0x30/+0x34 consumer int (src rings), +0xb0 dst ctrl (max buffer len);
++ *      R2 +0x400 HP, +0x404 TP (hal.h:196-197; the status ring R2 pair is at
++ *      dst block + 0x408).
++ *  - Rings: CE0 src 16 x 16 B (HTC control UL), CE1 512 x 8 B dst + 512 x 16 B
++ *    status, CE2 64 x 8 B dst + 64 x 16 B status (HTC/WMI DL), CE3 32 x 16 B src
++ *    (WMI UL) (ce.c:145-220, hw.c:245-336).
++ *  - HTC frame header is 8 bytes (htc.h:58-61), CONNECT_SERVICE 8 B and its
++ *    response 12 B (htc.h:109-118), READY 8 B (htc.h:99-102).  WMI commands go
++ *    over the WMI_CONTROL endpoint (0x0100) whose UL pipe is CE3 and DL pipe is
++ *    CE2 (hw.c:453-532); ep0 (RSVD_CTRL 0x0001) is the local HTC control endpoint
++ *    whose UL pipe is CE0 and DL pipe is CE2.
++ *  - WMI_INIT on WCN7850 is a 336-byte WMI payload (wmi.c:3270-3376: 4 B command
++ *    header + INIT_CMD TLV (32 B) + RESOURCE_CONFIG TLV (292 B) + an empty
++ *    ARRAY_STRUCT TLV (4 B) + the 4 reserved bytes the allocator leaves behind),
++ *    and WMI_READY is event 0x2 carrying TLV tag 35 (wmi.h:302,675-676;
++ *    wmi.c:5568-5582).
++ *
++ * Design choices for this first pass, stated so a later stage can change them:
++ *  1. No shadow registers: WLAN_CFG carries no shadow_reg_v3 list and the rings
++ *     use the ordinary SRNG HP/TP path of hal.c:1933-1991.  The src-direction
++ *     rings (CE0/CE1-dst/CE3) write HP to the R2 register and read TP from the
++ *     RDP DMA page; the status rings read HP from RDP and write TP to R2+4.
++ *     This keeps D1 independent of the 40-entry shadow list (hal.h:36-41), which
++ *     cannot be validated offline.
++ *  2. No interrupts: the CE status rings are polled, like the existing MHI
++ *     stages; this driver tree has no interrupt handler yet.
++ *  3. Device-written memory (status descriptors, RDP indices, received buffers)
++ *     is read through a write-combined alias of the same physical pages, the
++ *     method sy_mhi_map_uc() already uses (flush_dcache64 exists, invalidate does
++ *     not).
++ */
++#define SY_CE_BASE_OFF	0x01b80000UL	/* hal.h:53 */
++#define SY_CE_WIN_AP	0x00080000UL	/* pci.c:22 WINDOW_START */
++#define SY_CE_WIN_EN	0x40000000UL	/* pci.c:22 WINDOW_ENABLE_BIT */
++#define SY_CE_WIN_MASK	0x0007ffffUL	/* pci.c:22 WINDOW_RANGE_MASK */
++#define SY_CE_WIN_OFF	0x0000010cUL	/* BAR0+0x310c inside the +0x3000 page */
++#define SY_CE_IOVA	0xB0800000UL	/* L2 row 388 of the installed SMMU tables */
++#define SY_CE_SIZE	0x00200000UL	/* 2 MiB = one L3 page (512 x 4 KiB) */
++
++/* ring placement inside the CE region (the same offsets are VA and IOVA offsets) */
++#define SY_CE_OFF_CE0_SRC	0x00000000UL	/* 16 x 16 B = 0x100 */
++#define SY_CE_OFF_CE3_SRC	0x00001000UL	/* 32 x 16 B = 0x200 */
++#define SY_CE_OFF_CE1_DST	0x00002000UL	/* 512 x 8 B = 0x1000 */
++#define SY_CE_OFF_CE1_ST	0x00003000UL	/* 512 x 16 B = 0x2000 */
++#define SY_CE_OFF_CE2_DST	0x00005000UL	/* 64 x 8 B = 0x200 */
++#define SY_CE_OFF_CE2_ST	0x00006000UL	/* 64 x 16 B = 0x400 */
++#define SY_CE_OFF_RDP		0x00007000UL	/* 204 x u32 = 0x330 (hal.h:478-507) */
++#define SY_CE_OFF_CE1_BUF	0x00080000UL	/* 512 x 2048 B */
++#define SY_CE_OFF_CE2_BUF	0x00180000UL	/* 64 x 2048 B */
++#define SY_CE_OFF_CE0_TX	0x001a0000UL	/* 2 x 2048 B HTC control TX */
++#define SY_CE_OFF_CE3_TX	0x001a1000UL	/* 2 x 2048 B WMI TX */
++#define SY_CE_BUF_SZ		2048u		/* ce.c:154-170 CE1/CE2 buffer size */
++
++/* HAL ring ids (hal.h:401,418,435) */
++#define SY_CE_RING_CE0_SRC	64u
++#define SY_CE_RING_CE1_DST	82u
++#define SY_CE_RING_CE1_ST	101u
++#define SY_CE_RING_CE2_DST	83u
++#define SY_CE_RING_CE2_ST	102u
++
++/* HTC message ids, flags and service id (htc.h:18-56,63-97,175-217) */
++#define SY_HTC_MSG_READY	1u
++#define SY_HTC_MSG_CONNECT	2u
++#define SY_HTC_MSG_CONNECT_RESP	3u
++#define SY_HTC_MSG_SETUP_COMPLETE_EX	5u
++#define SY_HTC_FLAG_TRAILER	0x02u
++#define SY_HTC_SVC_WMI_CONTROL	0x0100u
++
++/* WMI constants (wmi.h:302,675-676,1184-1232) */
++#define SY_WMI_INIT_CMDID	0x00000001u
++#define SY_WMI_SERVICE_READY_EVENTID	0x00000001u
++#define SY_WMI_READY_EVENTID	0x00000002u
++#define SY_WMI_SERVICE_READY_EXT_EVENTID	0x00004009u
++#define SY_WMI_SERVICE_READY_EXT2_EVENTID	0x00004022u
++#define SY_WMI_TAG_ARRAY_STRUCT	18u
++#define SY_WMI_TAG_SERVICE_READY	32u
++#define SY_WMI_TAG_READY_EVENT	35u
++#define SY_WMI_TAG_INIT_CMD	74u
++#define SY_WMI_TAG_RESOURCE_CONFIG	75u
++
++/* QMI WLFW messages needed before the CE rings come up (qmi.h:513-520) */
++#define SY_QMI_WLFW_WLAN_MODE_REQ	0x0022
++#define SY_QMI_WLFW_WLAN_CFG_REQ	0x0023
++#define SY_WLFW_FW_MODE_NORMAL		0u	/* core.h:111-113 */
++
++struct sy_ce_ring {
++	uint32_t ce;		/* pipe number 0..8 */
++	uint32_t kind;		/* 0 = CE_SRC, 1 = CE_DST, 2 = CE_DST_STATUS */
++	uint32_t entries;	/* power of two (ce.h:83-92) */
++	uint32_t desc_sz;	/* descriptor bytes: 16 src, 8 dst, 16 status */
++	uint32_t off;		/* offset inside the 2 MiB CE region */
++	uint32_t pool;		/* dst rings: offset of the receive buffer pool */
++	uint32_t dev;		/* device offset of the R0 register block */
++	uint32_t dev_r2;	/* device offset of the R2 HP/TP pair */
++	uint32_t ring_id;	/* HAL ring id, selects the RDP u32 slot */
++	uint32_t idx;		/* host dword index: src/dst HP, status TP */
++	uint32_t seq;		/* dst rings: completed receive buffers so far */
++};
++
++static struct sy_ce_ring sy_ce_ce0_src = {
++	0, 0, 16, 16, SY_CE_OFF_CE0_SRC, 0, 0x01b80000UL, 0x01b80400UL,
++	SY_CE_RING_CE0_SRC, 0, 0
++};
++static struct sy_ce_ring sy_ce_ce3_src = {
++	3, 0, 32, 16, SY_CE_OFF_CE3_SRC, 0, 0x01b86000UL, 0x01b86400UL,
++	67, 0, 0
++};
++static struct sy_ce_ring sy_ce_ce1_dst = {
++	1, 1, 512, 8, SY_CE_OFF_CE1_DST, SY_CE_OFF_CE1_BUF, 0x01b83000UL,
++	0x01b83400UL, SY_CE_RING_CE1_DST, 0, 0
++};
++static struct sy_ce_ring sy_ce_ce1_st = {
++	1, 2, 512, 16, SY_CE_OFF_CE1_ST, 0, 0x01b83058UL, 0x01b83408UL,
++	SY_CE_RING_CE1_ST, 0, 0
++};
++static struct sy_ce_ring sy_ce_ce2_dst = {
++	2, 1, 64, 8, SY_CE_OFF_CE2_DST, SY_CE_OFF_CE2_BUF, 0x01b85000UL,
++	0x01b85400UL, SY_CE_RING_CE2_DST, 0, 0
++};
++static struct sy_ce_ring sy_ce_ce2_st = {
++	2, 2, 64, 16, SY_CE_OFF_CE2_ST, 0, 0x01b85058UL, 0x01b85408UL,
++	SY_CE_RING_CE2_ST, 0, 0
++};
++
++static vm_offset_t sy_ce_va;		/* CE region, cached kernel mapping */
++static vm_offset_t sy_ce_wc;		/* write-combined alias of the same pages */
++static vm_offset_t sy_ce_l3;		/* one 4 KiB L3 table for the 2 MiB window */
++static vm_offset_t sy_ce_wreg;		/* BAR0+0x3000 page holding the window reg */
++static vm_offset_t sy_ce_win;		/* BAR0+0x80000..+0xa0000 aperture */
++static uint32_t sy_ce_win_cur = 0xffffffffu;
++static uint32_t sy_ce_tx_ctrl_idx;	/* round robin over the two CE0 TX buffers */
++static uint32_t sy_ce_tx_wmi_idx;	/* round robin over the two CE3 TX buffers */
++
++/* HTC/WMI state (the endpoint ids are assigned by firmware, htc.c:658-679) */
++static unsigned sy_htc_ready;		/* HTC READY control message seen */
++static unsigned sy_htc_conn_ok;		/* CONNECT_SERVICE response status 0 */
++static unsigned sy_htc_credits;
++static unsigned sy_htc_credit_size;
++static unsigned sy_htc_tx_credits;
++static uint32_t sy_htc_wmi_eid = 0xffffffffu;
++static unsigned sy_htc_wmi_max_msg;
++static unsigned sy_wmi_service_ready;
++static unsigned sy_wmi_ready;
++static uint32_t sy_wmi_rf_chains = 2u;
++static uint32_t sy_wmi_status = 0xffffffffu;
++static uint8_t sy_wmi_mac[6];
++static uint32_t sy_wmi_abi[6];
++
++/* QMI WLAN_CFG tables: the target copy-engine config and the service->CE map of
++ * WCN7850, verbatim from hw.c:245-336 and hw.c:453-532.  The map array has a
++ * terminating {0,0,0}; svc_to_ce_map_len is 14, so only 14 entries are sent
++ * (hw.c:930-935, qmi.c:2676-2683). */
++static const uint32_t sy_ce_tgt_cfg[9][5] = {
++	{ 0, 2, 32, 2048, 0 },		/* CE0 OUT HTC control/raw */
++	{ 1, 1, 32, 2048, 0 },		/* CE1 IN  HTT + HTC control */
++	{ 2, 1, 32, 2048, 0 },		/* CE2 IN  WMI */
++	{ 3, 2, 32, 2048, 0 },		/* CE3 OUT WMI */
++	{ 4, 2, 256, 256, 8 },		/* CE4 OUT HTT, CE_ATTR_DIS_INTR */
++	{ 5, 1, 32, 2048, 0 },		/* CE5 IN  pktlog */
++	{ 6, 3, 32, 16384, 0 },		/* CE6 INOUT hif_memcpy */
++	{ 7, 4, 0, 0, 8 },		/* CE7 INOUT_H2H host only */
++	{ 8, 3, 32, 16384, 0 },		/* CE8 INOUT IPA */
++};
++
++static const uint32_t sy_ce_svc_cfg[14][3] = {
++	{ 0x0104, 2, 3 }, { 0x0104, 1, 2 },	/* WMI_DATA_VO */
++	{ 0x0102, 2, 3 }, { 0x0102, 1, 2 },	/* WMI_DATA_BK */
++	{ 0x0101, 2, 3 }, { 0x0101, 1, 2 },	/* WMI_DATA_BE */
++	{ 0x0103, 2, 3 }, { 0x0103, 1, 2 },	/* WMI_DATA_VI */
++	{ 0x0100, 2, 3 }, { 0x0100, 1, 2 },	/* WMI_CONTROL */
++	{ 0x0001, 2, 0 }, { 0x0001, 1, 2 },	/* RSVD_CTRL (ep0) */
++	{ 0x0300, 2, 4 }, { 0x0300, 1, 1 },	/* HTT_DATA_MSG */
++};
++
++static int sy_ce_mem(void);
++static void sy_ce_window(uint32_t dev_off);
++static uint32_t sy_ce_rd(uint32_t dev_off);
++static void sy_ce_wr(uint32_t dev_off, uint32_t val);
++static uint32_t sy_ce_rdp(uint32_t ring_id);
++static void sy_ce_ring_hw(struct sy_ce_ring *r);
++static void sy_ce_post_one(struct sy_ce_ring *r, uint32_t pool_off);
++static void sy_ce_post(struct sy_ce_ring *r);
++static int sy_ce_send(struct sy_ce_ring *r, uint32_t buf_off, uint32_t len,
++    uint32_t eid);
++static void sy_wmi_event(const uint8_t *b, uint32_t len);
++static void sy_htc_rx(const uint8_t *b, uint32_t len);
++static int sy_htc_send(uint32_t eid, const void *payload, uint32_t len);
++static int sy_htc_connect(void);
++static void sy_ce_poll(struct sy_ce_ring *st, struct sy_ce_ring *dst);
++static void sy_ce_pump(void);
++static void sy_d1_pump_mhi(void);
++static unsigned sy_wlfw_wlan_cfg(uint8_t *b, uint16_t txn);
++static unsigned sy_wlfw_wlan_mode(uint8_t *b, uint16_t txn, uint32_t mode);
++static int sy_d1_qmi_send(uint16_t msgid, const uint8_t *qmi, unsigned qlen);
++static unsigned sy_wmi_init_frame(uint8_t *b);
++
++/* Select the BAR0 window that contains a device register offset (pci.c:146-165). */
++static void
++sy_ce_window(uint32_t dev_off)
++{
++	uint32_t w = SY_CE_WIN_EN | ((dev_off >> 19) & 0x3fu);
++
++	if (w == sy_ce_win_cur)
++		return;
++	sy_wr(sy_ce_wreg, SY_CE_WIN_OFF, w);
++	(void)sy_rd(sy_ce_wreg, SY_CE_WIN_OFF);	/* pci.c:160-163 reads the window back */
++	sy_ce_win_cur = w;
++}
++
++static uint32_t
++sy_ce_rd(uint32_t dev_off)
++{
++	if (dev_off < SY_CE_WIN_AP)
++		return sy_rd(sy_bar_va, dev_off);
++	sy_ce_window(dev_off);
++	return sy_rd(sy_ce_win, dev_off & SY_CE_WIN_MASK);
++}
++
++static void
++sy_ce_wr(uint32_t dev_off, uint32_t val)
++{
++	if (dev_off < SY_CE_WIN_AP) {
++		sy_wr(sy_bar_va, dev_off, val);
++		return;
++	}
++	sy_ce_window(dev_off);
++	sy_wr(sy_ce_win, dev_off & SY_CE_WIN_MASK, val);
++}
++
++/* Hardware writes the consumer index of src-direction rings, and the producer
++ * index of the status rings, into this DMA page (hal.c:1937,1969). */
++static uint32_t
++sy_ce_rdp(uint32_t ring_id)
++{
++	return *(volatile uint32_t *)(sy_ce_wc + SY_CE_OFF_RDP + 4u * ring_id);
++}
++
++/* Allocate the IOVA-contiguous CE region, map it in the installed context bank and
++ * probe the BAR0 window path.  Same pattern as sy_mem_setup() (3213-3238) plus the
++ * context-bank TLBI a live bank needs (1679-1686). */
++static int
++sy_ce_mem(void)
++{
++	unsigned i;
++	uint64_t pa;
++	kern_return_t kr;
++	uint32_t probe;
++
++	if (sy_ce_va)
++		return 0;
++	if (!sy_l2 || !sy_l3 || !sy_cb_va) {
++		printf("PANDORA WLAN: CE: page tables or context bank absent\n");
++		return 1;
++	}
++	sy_ce_wreg = ml_io_map(SY_BAR0_PA + 0x3000UL, 0x1000);
++	sy_ce_win = ml_io_map(SY_BAR0_PA + 0x80000UL, 0x20000);
++	if (!sy_ce_wreg || !sy_ce_win) {
++		printf("PANDORA WLAN: CE: BAR0 window mapping failed %#lx %#lx\n",
++		    (unsigned long)sy_ce_wreg, (unsigned long)sy_ce_win);
++		return 1;
++	}
++	probe = sy_rd(sy_ce_wreg, SY_CE_WIN_OFF);
++	sy_ce_window(SY_CE_BASE_OFF);
++	printf("PANDORA WLAN: CE: window 0x310c %#x -> %#x (want %#x)\n", probe,
++	    sy_rd(sy_ce_wreg, SY_CE_WIN_OFF), SY_CE_WIN_EN | 0x37u);
++	printf("PANDORA WLAN: CE: CE0 src R0 reads %#x %#x\n",
++	    sy_ce_rd(SY_CE_BASE_OFF), sy_ce_rd(SY_CE_BASE_OFF + 0x04u));
++	sy_log_sync();
++
++	kr = kmem_alloc_contig(kernel_map, &sy_ce_va, SY_CE_SIZE, PAGE_MASK, 0, 0,
++	    KMA_DATA | KMA_ZERO | KMA_PERMANENT, VM_KERN_MEMORY_IOKIT);
++	if (kr != KERN_SUCCESS || !sy_ce_va) {
++		sy_ce_va = 0;
++		printf("PANDORA WLAN: CE: 2 MiB contiguous buffer failed %d\n", kr);
++		return 1;
++	}
++	flush_dcache64(sy_pa(sy_ce_va), (unsigned)SY_CE_SIZE, TRUE);
++	kr = kmem_alloc(kernel_map, &sy_ce_l3, 0x1000,
++	    KMA_DATA | KMA_ZERO | KMA_NOPAGEWAIT, VM_KERN_MEMORY_IOKIT);
++	if (kr != KERN_SUCCESS || !sy_ce_l3) {
++		sy_ce_l3 = 0;
++		printf("PANDORA WLAN: CE: L3 table allocation failed %d\n", kr);
++		return 1;
++	}
++	/* one L2 entry (row 388) -> one L3 page -> 512 x 4 KiB */
++	((uint64_t *)sy_l2)[(SY_CE_IOVA >> 21) & 511] = sy_pa(sy_ce_l3) | 3ull;
++	for (i = 0; i < (SY_CE_SIZE >> 12); i++) {
++		pa = sy_pa(sy_ce_va + ((vm_offset_t)i << 12));
++		((uint64_t *)sy_ce_l3)[i & 511] =
++		    (pa & 0x0000fffffffff000ull) | 0x0060000000000e43ull;
++	}
++	flush_dcache64(sy_pa(sy_ce_l3), (unsigned)PAGE_SIZE, TRUE);
++	flush_dcache64(sy_pa(sy_l2), (unsigned)PAGE_SIZE, TRUE);
++	__asm__ volatile("dsb sy" ::: "memory");
++	/* the context bank is already translating: drop stale entries (1679-1686) */
++	sy_wr(sy_cb_va, 0x610, 0xffffffffu);
++	sy_wr(sy_cb_va, 0x7f0, 0xffffffffu);
++	for (i = 0; i < 100u; i++) {
++		if (sy_rd(sy_cb_va, 0x7f4) & 1u)
++			break;
++		sy_usleep(1000);
++	}
++	/* device-written memory is read through this alias (sy_mhi_map_uc pattern) */
++	sy_ce_wc = ml_io_map_unmappable((vm_offset_t)sy_pa(sy_ce_va), SY_CE_SIZE,
++	    VM_WIMG_WCOMB);
++	if (!sy_ce_wc) {
++		printf("PANDORA WLAN: CE: write-combined alias failed\n");
++		return 1;
++	}
++	printf("PANDORA WLAN: CE: %u KiB at iova %#x (va %#lx wc %#lx pa %#llx)\n",
++	    (unsigned)(SY_CE_SIZE >> 10), (unsigned)SY_CE_IOVA, (unsigned long)sy_ce_va,
++	    (unsigned long)sy_ce_wc, (unsigned long long)sy_pa(sy_ce_va));
++	sy_log_sync();
++	return 0;
++}
++
++/* Program one ring's R0/R2 registers (hal.c:1253-1422, 1928-2001).  Order follows
++ * the vendor code: clear the ring memory first, then the R0 block, then zero both
++ * R2 pointers, then the dst control register, and enable the SRNG last. */
++static void
++sy_ce_ring_hw(struct sy_ce_ring *r)
++{
++	uint64_t base = SY_CE_IOVA + r->off;
++	uint64_t rdp = SY_CE_IOVA + SY_CE_OFF_RDP + 4u * r->ring_id;
++	uint32_t dw = r->desc_sz >> 2;		/* entry size in dwords (hal.c:88-104) */
++	uint32_t ring_dw = dw * r->entries;
++	uint32_t v;
++
++	memset((void *)(sy_ce_va + r->off), 0, r->desc_sz * r->entries);
++	flush_dcache64(sy_pa(sy_ce_va + r->off), r->desc_sz * r->entries, TRUE);
++	__asm__ volatile("dsb sy" ::: "memory");
++
++	sy_ce_wr(r->dev + 0x00u, (uint32_t)base);
++	sy_ce_wr(r->dev + 0x04u,
++	    (uint32_t)((base >> 32) & 0xffull) | (ring_dw << 8));
++	if (r->kind == 0)
++		sy_ce_wr(r->dev + 0x08u, dw);
++	else
++		sy_ce_wr(r->dev + 0x08u, dw | (r->ring_id << 8));
++	if (r->kind == 2) {
++		/* status ring: the device is the producer and writes HP into RDP */
++		sy_ce_wr(r->dev + 0x14u, (uint32_t)rdp);
++		sy_ce_wr(r->dev + 0x18u, (uint32_t)(rdp >> 32));
++		v = ((0x1000u >> 3) << 16) | dw;	/* 4 ms timer, one-entry batch */
++		sy_ce_wr(r->dev + 0x24u, v);
++	} else {
++		/* src and dst descriptor rings are both host-producer rings */
++		sy_ce_wr(r->dev + 0x1cu, (uint32_t)rdp);	/* TP address LSB */
++		sy_ce_wr(r->dev + 0x20u, (uint32_t)(rdp >> 32));	/* TP address MSB */
++		sy_ce_wr(r->dev + 0x30u, dw);	/* consumer timer 0, batch 1 entry */
++		sy_ce_wr(r->dev + 0x34u, 0);
++	}
++	/* empty ring: both R2 pointers zero, in dword units (hal.c:1310-1313,1398-1402) */
++	sy_ce_wr(r->dev_r2, 0);
++	sy_ce_wr(r->dev_r2 + 4u, 0);
++	if (r->kind == 1) {
++		/* RMW: max buffer length shares the dst control register */
++		v = sy_ce_rd(r->dev + 0xb0u) & ~0xffffu;
++		sy_ce_wr(r->dev + 0xb0u, v | SY_CE_BUF_SZ);
++	}
++	/* enable last: SRNG_ENABLE, plus MSI_LOOPCNT_DISABLE for src rings
++	 * (hal.h:277-282; the vendor writes MISC after the pointers are cleared) */
++	v = (r->kind == 2) ? 0x40u : 0x42u;
++	sy_ce_wr(r->dev + 0x10u, v);
++	r->idx = 0;
++	r->seq = 0;
++	printf("PANDORA WLAN: CE%u %s: %u x %u B at iova %#x\n", r->ce,
++	    r->kind == 0 ? "src" : (r->kind == 1 ? "dst" : "status"),
++	    r->entries, r->desc_sz, (unsigned)(SY_CE_IOVA + r->off));
++}
++
++/* Submit one receive buffer to a destination ring and publish the new HP. */
++static void
++sy_ce_post_one(struct sy_ce_ring *r, uint32_t pool_off)
++{
++	uint64_t ce_addr = SY_CE_IOVA + pool_off;
++	uint32_t dw = r->desc_sz >> 2;
++	uint32_t * d;
++
++	/* dst desc is 8 B: address low, address high in bits 7:0 (hal.c:1556-1562) */
++	d = (uint32_t *)(sy_ce_va + r->off) + r->idx;
++	d[0] = (uint32_t)ce_addr;
++	d[1] = (uint32_t)((ce_addr >> 32) & 0xffull);
++	flush_dcache64(sy_pa(sy_ce_va + r->off + ((vm_offset_t)r->idx << 2)),
++	    r->desc_sz, TRUE);
++	__asm__ volatile("dsb sy" ::: "memory");
++	r->idx = (r->idx + dw) % (dw * r->entries);
++	sy_ce_wr(r->dev_r2, r->idx);	/* HP (dword index) is the host doorbell */
++}
++
++/* Post entries-2 buffers, as hif_start does (ce.c:861-862 rx_buf_needed). */
++static void
++sy_ce_post(struct sy_ce_ring *r)
++{
++	uint32_t i, n = r->entries - 2u;
++
++	for (i = 0; i < n; i++)
++		sy_ce_post_one(r, r->pool + i * SY_CE_BUF_SZ);
++	printf("PANDORA WLAN: CE%u dst: %u buffers posted (hp %#x)\n", r->ce, n,
++	    r->idx);
++	sy_log_sync();
++}
++
++/* Send one CE frame on a source ring (ce.c:638-717, hal.c:1739-1778). */
++static int
++sy_ce_send(struct sy_ce_ring *r, uint32_t buf_off, uint32_t len, uint32_t eid)
++{
++	uint64_t iova = SY_CE_IOVA + buf_off;
++	uint32_t dw = r->desc_sz >> 2;
++	uint32_t tp = sy_ce_rdp(r->ring_id);
++	uint32_t next = (r->idx + dw) % (dw * r->entries);
++	uint32_t * d;
++
++	if (next == tp) {
++		printf("PANDORA WLAN: CE%u %s ring full (hp %#x tp %#x)\n", r->ce,
++		    r->kind == 0 ? "src" : "dst", r->idx, tp);
++		return -1;
++	}
++	/* src desc is 16 B: addr low, addr high|len<<16, transfer id, flags */
++	d = (uint32_t *)(sy_ce_va + r->off) + r->idx;
++	d[0] = (uint32_t)iova;
++	d[1] = (uint32_t)((iova >> 32) & 0xffull) | (len << 16);
++	d[2] = eid & 0xffffu;	/* HTC endpoint id travels in the CE transfer id */
++	d[3] = 0;
++	flush_dcache64(sy_pa(sy_ce_va + r->off + ((vm_offset_t)r->idx << 2)),
++	    r->desc_sz, TRUE);
++	__asm__ volatile("dsb sy" ::: "memory");
++	r->idx = next;
++	sy_ce_wr(r->dev_r2, r->idx);
++	return 0;
++}
++
++/* Parse a WMI event (TLV tag/len layout from wmi.h:75-76). */
++static void
++sy_wmi_event(const uint8_t *b, uint32_t len)
++{
++	uint32_t cmd, at, hdr, tag, tl, i;
++	const uint8_t * p;
++
++	if (len < 4u)
++		return;
++	cmd = (uint32_t)(b[0] | (b[1] << 8) | (b[2] << 16)) & 0xffffffu;
++	printf("PANDORA WLAN: WMI event %#x (%u B)\n", cmd, len - 4u);
++	if (cmd == SY_WMI_SERVICE_READY_EVENTID ||
++	    cmd == SY_WMI_SERVICE_READY_EXT_EVENTID ||
++	    cmd == SY_WMI_SERVICE_READY_EXT2_EVENTID) {
++		sy_wmi_service_ready = 1;
++		at = 4u;
++		while (at + 4u <= len) {
++			hdr = (uint32_t)(b[at] | (b[at + 1] << 8) |
++			    (b[at + 2] << 16) | (b[at + 3] << 24));
++			tag = hdr >> 16;
++			tl = hdr & 0xffffu;
++			if (tag == SY_WMI_TAG_SERVICE_READY && tl >= 40u &&
++			    at + 4u + 40u <= len) {
++				p = b + at + 4u;
++				sy_wmi_rf_chains = (uint32_t)(p[36] | (p[37] << 8) |
++				    (p[38] << 16) | (p[39] << 24));
++				printf("PANDORA WLAN: WMI service ready: rf chains %u\n",
++				    sy_wmi_rf_chains);
++			}
++			at += 4u + tl;
++		}
++		return;
++	}
++	if (cmd != SY_WMI_READY_EVENTID)
++		return;
++	at = 4u;
++	while (at + 4u <= len) {
++		hdr = (uint32_t)(b[at] | (b[at + 1] << 8) |
++		    (b[at + 2] << 16) | (b[at + 3] << 24));
++		tag = hdr >> 16;
++		tl = hdr & 0xffffu;
++		if (tag == SY_WMI_TAG_READY_EVENT && tl >= 52u &&
++		    at + 4u + 52u <= len) {
++			p = b + at + 4u;
++			for (i = 0; i < 6u; i++)
++				sy_wmi_abi[i] = (uint32_t)(p[4u * i] |
++				    (p[4u * i + 1u] << 8) |
++				    (p[4u * i + 2u] << 16) |
++				    (p[4u * i + 3u] << 24));
++			for (i = 0; i < 6u; i++)
++				sy_wmi_mac[i] = p[24u + i];
++			sy_wmi_status = (uint32_t)(p[32] | (p[33] << 8) |
++			    (p[34] << 16) | (p[35] << 24));
++			sy_wmi_ready = 1;
++			printf("PANDORA WLAN: WMI READY: status %u mac "
++			    "%02x:%02x:%02x:%02x:%02x:%02x abi %#x %#x %#x\n",
++			    sy_wmi_status, sy_wmi_mac[0], sy_wmi_mac[1], sy_wmi_mac[2],
++			    sy_wmi_mac[3], sy_wmi_mac[4], sy_wmi_mac[5],
++			    sy_wmi_abi[0], sy_wmi_abi[1], sy_wmi_abi[2]);
++			sy_log_sync();
++		}
++		at += 4u + tl;
++	}
++}
++
++/* One HTC frame arrived on a destination ring (htc.c:53-72, htc.h:18-23). */
++static void
++sy_htc_rx(const uint8_t *b, uint32_t len)
++{
++	uint32_t eid, plen, msgid, w0, w1;
++	const uint8_t * p;
++
++	if (len < 8u)
++		return;
++	eid = b[0];
++	plen = (uint32_t)(b[2] | (b[3] << 8));
++	if (plen + 8u > len)
++		plen = len - 8u;
++	if (b[1] & SY_HTC_FLAG_TRAILER) {
++		uint32_t tlen = b[4];
++
++		if (tlen <= plen)
++			plen -= tlen;
++	}
++	p = b + 8u;
++	printf("PANDORA WLAN: HTC rx: eid %u flags %#x len %u\n", eid, b[1], plen);
++	if (eid == 0) {
++		if (plen < 8u)
++			return;
++		w0 = (uint32_t)(p[0] | (p[1] << 8) | (p[2] << 16) | (p[3] << 24));
++		w1 = (uint32_t)(p[4] | (p[5] << 8) | (p[6] << 16) | (p[7] << 24));
++		msgid = w0 & 0xffffu;
++		if (msgid == SY_HTC_MSG_READY) {
++			sy_htc_credits = (w0 >> 16) & 0xffffu;
++			sy_htc_credit_size = w1 & 0xffffu;
++			sy_htc_ready = 1;
++			printf("PANDORA WLAN: HTC READY: %u credits of %u B, "
++			    "%u endpoints\n", sy_htc_credits, sy_htc_credit_size,
++			    (w1 >> 16) & 0xffu);
++			sy_log_sync();
++		} else if (msgid == SY_HTC_MSG_CONNECT_RESP) {
++			uint32_t status = w1 & 0xffu;
++
++			sy_htc_wmi_eid = (w1 >> 8) & 0xffu;
++			sy_htc_wmi_max_msg = (w1 >> 16) & 0xffffu;
++			sy_htc_conn_ok = (status == 0u);
++			printf("PANDORA WLAN: HTC connect response: svc %#x status %u "
++			    "eid %u max %u\n", (w0 >> 16) & 0xffffu, status,
++			    sy_htc_wmi_eid, sy_htc_wmi_max_msg);
++			sy_log_sync();
++		} else {
++			printf("PANDORA WLAN: HTC control msg %u ignored\n", msgid);
++		}
++		return;
++	}
++	if (eid != sy_htc_wmi_eid)
++		return;
++	sy_wmi_event(p, plen);
++}
++
++/* Send one HTC frame on its endpoint's UL copy engine (htc.c:74-142). */
++static int
++sy_htc_send(uint32_t eid, const void *payload, uint32_t len)
++{
++	uint32_t off, need = 0, ce = 3;
++	void * r;
++	uint8_t * frame;
++	uint32_t * idxp;
++
++	if (len > 2040u) {
++		printf("PANDORA WLAN: HTC tx: payload %u too long\n", len);
++		return -1;
++	}
++	if (eid == 0) {
++		r = (void *)&sy_ce_ce0_src;
++		ce = 0;
++		idxp = &sy_ce_tx_ctrl_idx;
++		off = SY_CE_OFF_CE0_TX;
++	} else {
++		r = (void *)&sy_ce_ce3_src;
++		idxp = &sy_ce_tx_wmi_idx;
++		off = SY_CE_OFF_CE3_TX;
++	}
++	/* credit accounting of htc.c:90-93: frame bytes / target credit size */
++	if (eid != 0 && sy_htc_credit_size) {
++		need = (8u + len + sy_htc_credit_size - 1u) / sy_htc_credit_size;
++		if (need > sy_htc_tx_credits) {
++			printf("PANDORA WLAN: HTC tx: need %u credits, have %u\n",
++			    need, sy_htc_tx_credits);
++			return -1;
++		}
++	}
++	off += (*idxp) * SY_CE_BUF_SZ;
++	*idxp = (*idxp + 1u) & 1u;
++	frame = (uint8_t *)(sy_ce_va + off);
++	frame[0] = (uint8_t)eid;
++	frame[1] = 0;
++	frame[2] = (uint8_t)len;
++	frame[3] = (uint8_t)(len >> 8);
++	frame[4] = 0;
++	frame[5] = 0;
++	frame[6] = 0;
++	frame[7] = 0;
++	memcpy(frame + 8u, payload, len);
++	flush_dcache64(sy_pa(sy_ce_va + off), (unsigned)SY_CE_BUF_SZ, TRUE);
++	__asm__ volatile("dsb sy" ::: "memory");
++	if (sy_ce_send(r, off, 8u + len, eid))
++		return -1;
++	if (need)
++		sy_htc_tx_credits -= need;
++	printf("PANDORA WLAN: HTC tx: eid %u %u B on CE%u\n", eid, 8u + len, ce);
++	return 0;
++}
++
++/* Connect the WMI_CONTROL service (htc.c:551-713).  WCN7850 connects only WMI and
++ * HTT; HTT belongs to D2.  The receive allocation is the whole target credit
++ * budget because wmi_ep_count is 1 (htc.c:458-483). */
++static int
++sy_htc_connect(void)
++{
++	uint32_t w[2];
++	uint32_t flags;
++
++	w[0] = SY_HTC_MSG_CONNECT | (SY_HTC_SVC_WMI_CONTROL << 16);
++	flags = (sy_htc_credits & 0xffu) << 8;	/* RECV_ALLOC (htc.h:89) */
++	w[1] = flags;
++	if (sy_htc_send(0, w, 8u))
++		return -1;
++	printf("PANDORA WLAN: HTC connect WMI_CONTROL sent (alloc %u)\n",
++	    sy_htc_credits & 0xffu);
++	sy_log_sync();
++	return 0;
++}
++
++/* Consume the completed entries of a status ring and hand the bytes to HTC.  The
++ * k-th completion belongs to the k-th buffer posted on the paired destination
++ * ring (the device consumes them in order, ce.c:319-407). */
++static void
++sy_ce_poll(struct sy_ce_ring *st, struct sy_ce_ring *dst)
++{
++	uint32_t dw = st->desc_sz >> 2;
++	uint32_t hp = sy_ce_rdp(st->ring_id);
++	uint32_t len, buf;
++	const uint32_t * d;
++
++	while (st->idx != hp) {
++		d = (const uint32_t *)(sy_ce_wc + st->off) + st->idx;
++		len = (d[0] >> 16) & 0xffffu;
++		/* only entries-2 buffers are in flight (rx_buf_needed), so the
++		 * completion order cycles over exactly those buffers */
++		buf = dst->pool + (dst->seq % (dst->entries - 2u)) * SY_CE_BUF_SZ;
++		dst->seq++;
++		st->idx = (st->idx + dw) % (dw * st->entries);
++		sy_ce_wr(st->dev_r2 + 4u, st->idx);	/* TP (dword index) back */
++		if (len && len <= SY_CE_BUF_SZ)
++			sy_htc_rx((const uint8_t *)(sy_ce_wc + buf), len);
++		else
++			printf("PANDORA WLAN: CE%u status: bad length %u\n", st->ce,
++			    len);
++		sy_ce_post_one(dst, buf);
++	}
++}
++
++static void
++sy_ce_pump(void)
++{
++	sy_ce_poll(&sy_ce_ce1_st, &sy_ce_ce1_dst);
++	sy_ce_poll(&sy_ce_ce2_st, &sy_ce_ce2_dst);
++}
++
++/* Pump the MHI event rings while D1 waits for QMI responses: the WLFW receive
++ * path keeps running through sy_mhi_ev_walk -> sy_wlfw_rx. */
++static void
++sy_d1_pump_mhi(void)
++{
++	unsigned shown = 0;
++
++	if (!sy_bar_va || !sy_sbl_va)
++		return;
++	sy_mhi_ev_walk(0, &shown);
++	sy_mhi_ev_walk(1, &shown);
++}
++
++/* QMI_WLANFW_WLAN_CFG_REQ (qmi.c:2643-2728): host version, target CE config and
++ * service map.  shadow_reg_v3 is deliberately absent (see the block comment). */
++static unsigned
++sy_wlfw_wlan_cfg(uint8_t *b, uint16_t txn)
++{
++	unsigned at = sy_qmi_hdr(b, 0x00, txn, SY_QMI_WLFW_WLAN_CFG_REQ);
++	unsigned i, k;
++
++	/* TLV 0x10 host_version: QMI_STRING = u8 length + bytes */
++	at = sy_qmi_tlv_hdr(b, at, 0x10, 4u);
++	b[at++] = 3;
++	b[at++] = 'W';
++	b[at++] = 'I';
++	b[at++] = 'N';
++	/* TLV 0x11 tgt_cfg: u8 count + 9 x 5 little-endian u32 */
++	at = sy_qmi_tlv_hdr(b, at, 0x11, (uint16_t)(1u + 9u * 20u));
++	b[at++] = 9;
++	for (i = 0; i < 9u; i++) {
++		for (k = 0; k < 5u; k++) {
++			uint32_t v = sy_ce_tgt_cfg[i][k];
++
++			b[at++] = (uint8_t)v;
++			b[at++] = (uint8_t)(v >> 8);
++			b[at++] = (uint8_t)(v >> 16);
++			b[at++] = (uint8_t)(v >> 24);
++		}
++	}
++	/* TLV 0x12 svc_cfg: u8 count + 14 x 3 little-endian u32 */
++	at = sy_qmi_tlv_hdr(b, at, 0x12, (uint16_t)(1u + 14u * 12u));
++	b[at++] = 14;
++	for (i = 0; i < 14u; i++) {
++		for (k = 0; k < 3u; k++) {
++			uint32_t v = sy_ce_svc_cfg[i][k];
++
++			b[at++] = (uint8_t)v;
++			b[at++] = (uint8_t)(v >> 8);
++			b[at++] = (uint8_t)(v >> 16);
++			b[at++] = (uint8_t)(v >> 24);
++		}
++	}
++	return sy_qmi_finish(b, at);
++}
++
++/* QMI_WLANFW_WLAN_MODE_REQ (qmi.c:2576-2620): only TLV 0x01, mode 0 = NORMAL. */
++static unsigned
++sy_wlfw_wlan_mode(uint8_t *b, uint16_t txn, uint32_t mode)
++{
++	unsigned at = sy_qmi_hdr(b, 0x00, txn, SY_QMI_WLFW_WLAN_MODE_REQ);
++
++	at = sy_qmi_tlv_u32(b, at, 0x01, mode);
++	return sy_qmi_finish(b, at);
++}
++
++/* Wrap a QMI message in a QRTR DATA frame and put it on MHI channel 20, the path
++ * the WLFW handshake already uses (sy_wlfw_run, sy_wlfw_bdf_send). */
++static int
++sy_d1_qmi_send(uint16_t msgid, const uint8_t *qmi, unsigned qlen)
++{
++	static uint8_t frame[2048];
++	unsigned fl;
++
++	fl = sy_qrtr_frame(frame, SY_QRTR_TYPE_DATA, 0, SY_WLFW_QRTR_PORT,
++	    sy_wlfw_node, sy_wlfw_port, qmi, qlen);
++	if (sy_mhi_send(20, frame, fl)) {
++		printf("PANDORA WLAN: D1: QMI %#x send failed\n", msgid);
++		return -1;
++	}
++	printf("PANDORA WLAN: D1: QMI %#x sent (%u B)\n", msgid, qlen);
++	sy_log_sync();
++	return 0;
++}
++
++/* Build the WMI_INIT payload (wmi.c:3270-3376; values wmi.c:231-275 and field order
++ * wmi.h:2400-2471).  The 72 resource fields are written in struct order, with the
++ * chain masks patched from SERVICE_READY. */
++static unsigned
++sy_wmi_init_frame(uint8_t *b)
++{
++	static const uint32_t cfg[72] = {
++		/* 0..8: vdevs, peers, offload peers/buffs, peer keys, tids, skid, chains */
++		4, 16, 3, 3, 2, 32, 16, 2, 2,
++		/* 9..17: rx timeout pri 0..2 low, pri 3 high, decap, scan, bmiss, roam vdev/profiles */
++		100, 100, 100, 40, 1, 4, 3, 3, 8,
++		/* 18..27: mcast groups/table/mode, tx dbg log, wds, dma burst, mac aggr, rx skip, vow, gtk */
++		0, 0, 0, 1024, 0, 0, 0, 0, 0, 2,
++		/* 28..36: msdu desc, frag, tdls vdevs/table, beacon offload, mcast filter, wow, keep alive 0/1 */
++		0x400, 0xa, 1, 8, 2, 0x20, 0x16, 0, 0,
++		/* 37..44: keep alive size, tdls sleep/buffer, wmi separate, ocb vdevs/channels/schedules, flag1 */
++		0, 0, 0, 0, 0, 0, 0, 0,
++		/* 45..52: smart ant, free lists, ns tuples, bpf size, bssid filters */
++		0, 0, 0, 0, 0, 0, 0, 0,
++		/* 53..57: use_pdev_id, dbs duty, group keys, peer map version, sched */
++		1, 0, 0, 1, 0,
++		/* 58..64: twt pdev/sta, nlo ssids, pkt filters, sta vdevs, bssid indicator */
++		0, 0, 0, 0, 0, 0, 0,
++		/* 65..71: ul resp, msdu overrides, flags2, host svc flags, rnr, ema */
++		0, 0, 0, 0, 0, 0, 0
++	};
++	uint32_t at = 0;
++	uint32_t v;
++	unsigned i;
++	uint32_t chain;
++
++	chain = (sy_wmi_rf_chains >= 1u && sy_wmi_rf_chains <= 4u) ?
++	    ((1u << sy_wmi_rf_chains) - 1u) : 3u;
++	b[at++] = (uint8_t)SY_WMI_INIT_CMDID;
++	b[at++] = (uint8_t)(SY_WMI_INIT_CMDID >> 8);
++	b[at++] = (uint8_t)(SY_WMI_INIT_CMDID >> 16);
++	b[at++] = 0;
++	/* TLV 74 INIT_CMD: 32-byte struct, the length field is size-4 */
++	v = (SY_WMI_TAG_INIT_CMD << 16) | 28u;
++	b[at++] = (uint8_t)v;
++	b[at++] = (uint8_t)(v >> 8);
++	b[at++] = (uint8_t)(v >> 16);
++	b[at++] = (uint8_t)(v >> 24);
++	for (i = 0; i < 7u; i++) {	/* 24 B abi version + num_host_mem_chunks = 0 */
++		b[at++] = 0;
++		b[at++] = 0;
++		b[at++] = 0;
++		b[at++] = 0;
++	}
++	/* TLV 75 RESOURCE_CONFIG: 292-byte struct, the length field is size-4 */
++	v = (SY_WMI_TAG_RESOURCE_CONFIG << 16) | 288u;
++	b[at++] = (uint8_t)v;
++	b[at++] = (uint8_t)(v >> 8);
++	b[at++] = (uint8_t)(v >> 16);
++	b[at++] = (uint8_t)(v >> 24);
++	for (i = 0; i < 72u; i++) {
++		v = cfg[i];
++		if (i == 7u || i == 8u)
++			v = chain;
++		b[at++] = (uint8_t)v;
++		b[at++] = (uint8_t)(v >> 8);
++		b[at++] = (uint8_t)(v >> 16);
++		b[at++] = (uint8_t)(v >> 24);
++	}
++	/* empty host memory chunk array: TLV 18 with zero length */
++	v = (SY_WMI_TAG_ARRAY_STRUCT << 16) | 0u;
++	b[at++] = (uint8_t)v;
++	b[at++] = (uint8_t)(v >> 8);
++	b[at++] = (uint8_t)(v >> 16);
++	b[at++] = (uint8_t)(v >> 24);
++	for (i = 0; i < 4u; i++)	/* reserved TLV_HDR_SIZE the allocator leaves */
++		b[at++] = 0;
++	return at;
++}
++
++/* Stage 21 entry.  Everything is bounded and every failure only prints; the driver
++ * never panics, the same convention as stages 1-20. */
++static void
++sy_ce_run(void)
++{
++	uint8_t qmi[1024];
++	uint8_t wmi[512];
++	unsigned at, i, ok;
++
++	printf("PANDORA WLAN: step %u: D1 CE/HTC/WMI\n", sy_step);
++	sy_log_sync();
++
++	/* 1. WLFW must be ready, and the QRTR service address must be known */
++	if (!sy_wlfw_node || !sy_wlfw_port) {
++		printf("PANDORA WLAN: D1: deferred, no WLFW QRTR address\n");
++		sy_log_sync();
++		return;
++	}
++	for (i = 0, ok = 0; i < 1500u; i++) {
++		if (sy_wlfw_state >= 3u) {
++			ok = 1;
++			break;
++		}
++		sy_d1_pump_mhi();
++		sy_usleep(10000);
++	}
++	printf("PANDORA WLAN: D1: WLFW state %u after %u ms (fw ready %u)\n",
++	    sy_wlfw_state, i * 10u, ok);
++	sy_log_sync();
++	if (!ok) {
++		printf("PANDORA WLAN: D1: deferred, WLFW FW_READY never arrived\n");
++		sy_log_sync();
++		return;
++	}
++
++	/* 2. QMI start: WLAN_CFG (CE/service tables) then WLAN_MODE normal */
++	at = sy_wlfw_wlan_cfg(qmi, sy_wlfw_txn++);
++	if (sy_d1_qmi_send(SY_QMI_WLFW_WLAN_CFG_REQ, qmi, at))
++		return;
++	for (i = 0; i < 30u; i++) {
++		sy_d1_pump_mhi();
++		sy_usleep(10000);
++	}
++	at = sy_wlfw_wlan_mode(qmi, sy_wlfw_txn++, SY_WLFW_FW_MODE_NORMAL);
++	if (sy_d1_qmi_send(SY_QMI_WLFW_WLAN_MODE_REQ, qmi, at))
++		return;
++	for (i = 0; i < 50u; i++) {
++		sy_d1_pump_mhi();
++		sy_usleep(10000);
++	}
++	printf("PANDORA WLAN: D1: WLAN normal mode requested\n");
++	sy_log_sync();
++
++	/* 3. host-side CE rings */
++	if (sy_ce_mem())
++		return;
++	sy_ce_ring_hw(&sy_ce_ce0_src);
++	sy_ce_ring_hw(&sy_ce_ce3_src);
++	sy_ce_ring_hw(&sy_ce_ce1_dst);
++	sy_ce_ring_hw(&sy_ce_ce1_st);
++	sy_ce_ring_hw(&sy_ce_ce2_dst);
++	sy_ce_ring_hw(&sy_ce_ce2_st);
++	sy_ce_post(&sy_ce_ce1_dst);
++	sy_ce_post(&sy_ce_ce2_dst);
++
++	/* 4. HTC READY (htc.c:485-549): the firmware writes it into a CE2 buffer */
++	for (i = 0; i < 200u && !sy_htc_ready; i++) {
++		sy_ce_pump();
++		sy_usleep(10000);
++	}
++	if (!sy_htc_ready) {
++		printf("PANDORA WLAN: D1: HTC READY did not arrive (2 s)\n");
++		sy_log_sync();
++		return;
++	}
++
++	/* 5. connect the WMI service and wait for the response (htc.c:551-713) */
++	if (sy_htc_connect())
++		return;
++	for (i = 0; i < 100u && !sy_htc_conn_ok; i++) {
++		sy_ce_pump();
++		sy_usleep(10000);
++	}
++	if (!sy_htc_conn_ok) {
++		printf("PANDORA WLAN: D1: HTC connect failed\n");
++		sy_log_sync();
++		return;
++	}
++	/* 6. SETUP_COMPLETE_EX on ep0 (htc.c:715-742) */
++	{
++		uint32_t setup[3];
++
++		setup[0] = SY_HTC_MSG_SETUP_COMPLETE_EX;
++		setup[1] = 0;
++		setup[2] = 0;
++		if (sy_htc_send(0, setup, (uint32_t)sizeof(setup)))
++			return;
++	}
++	printf("PANDORA WLAN: D1: HTC setup complete sent\n");
++	sy_htc_tx_credits = sy_htc_credits;
++
++	/* 7. SERVICE_READY (wmi.c:3414-3424; EXT and EXT2 both accepted) */
++	for (i = 0; i < 500u && !sy_wmi_service_ready; i++) {
++		sy_ce_pump();
++		sy_usleep(10000);
++	}
++	printf("PANDORA WLAN: D1: service ready %u rf chains %u\n",
++	    sy_wmi_service_ready, sy_wmi_rf_chains);
++	sy_log_sync();
++	if (!sy_wmi_service_ready) {
++		printf("PANDORA WLAN: D1: WMI SERVICE_READY did not arrive (5 s)\n");
++		sy_log_sync();
++		return;
++	}
++
++	/* 8. WMI_INIT on the WMI_CONTROL endpoint (wmi.c:3470-3492) */
++	at = sy_wmi_init_frame(wmi);
++	printf("PANDORA WLAN: D1: WMI_INIT %u B (chain mask %#x)\n", at,
++	    (sy_wmi_rf_chains >= 1u && sy_wmi_rf_chains <= 4u) ?
++	    ((1u << sy_wmi_rf_chains) - 1u) : 3u);
++	if (sy_htc_send(sy_htc_wmi_eid, wmi, at))
++		return;
++
++	/* 9. WMI_READY (wmi.c:518-525, 5568-5582) */
++	for (i = 0; i < 500u && !sy_wmi_ready; i++) {
++		sy_ce_pump();
++		sy_usleep(10000);
++	}
++	if (sy_wmi_ready && sy_wmi_status == 0u) {
++		printf("PANDORA WLAN: WMI READY (D1 DONE): status %u mac "
++		    "%02x:%02x:%02x:%02x:%02x:%02x\n", sy_wmi_status, sy_wmi_mac[0],
++		    sy_wmi_mac[1], sy_wmi_mac[2], sy_wmi_mac[3], sy_wmi_mac[4],
++		    sy_wmi_mac[5]);
++	} else if (sy_wmi_ready) {
++		printf("PANDORA WLAN: WMI READY but status %u\n", sy_wmi_status);
++	} else {
++		printf("PANDORA WLAN: D1: WMI READY did not arrive (5 s)\n");
++	}
++	sy_log_sync();
 +}
 +
  void
