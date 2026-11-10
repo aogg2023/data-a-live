@@ -456,7 +456,7 @@
  }
  
  static void
-@@ -51,21 +470,6347 @@
+@@ -51,21 +470,6870 @@
  		cv_sleep(100);
  	}
  	if (rootvnode == NULLVP) {
@@ -712,7 +712,7 @@
 +static int sy_wlfw_on;
 +static int sy_m0_mode;		/* 0 wait for device M0, 1 force at once, 2 force after 500 ms */
 +static int sy_bhie_clear = 1;	/* official ath12k_mhi_clear_vector behaviour */
-+static int sy_erdb_init;	/* experiment only: write ERDB at init (official does not) */
++static int sy_erdb_init;	/* parsed; the init ERDB write does not depend on it */
 +static int sy_chan_force;
 +static int sy_mhi_m0_ok;
 +
@@ -790,6 +790,10 @@
 +static void sy_buf_alloc(void);
 +static void sy_ce_run(void);	/* stage 21: D1 CE transport + HTC + WMI */
 +static void sy_d2_run(void);	/* stage 22: D2 WMI after READY */
++static int sy_d3_htc_connect(void);	/* stage 23: HTT service, before setup complete */
++static void sy_d3_version(void);
++static void sy_d3_on_mgmt(const uint8_t *f, unsigned flen);
++static void sy_d3_run(void);
 +
 +static vm_offset_t parf, phy, dbi, iatu, conf, pcism, gcc_low, gcc, tlmm_low, tlmm, tcsr, rsc, cmddb, crm;
 +#define SY_PHY_ROWS (sizeof(sy_phy_seq) / sizeof(sy_phy_seq[0]))
@@ -1888,6 +1892,12 @@
 +		if (sy_step >= 22 && sy_sbl_ok && sy_keep_alive && sy_wlfw_on &&
 +		    (sy_mhi_m0_ok || sy_chan_force)) {
 +			sy_d2_run();	/* D2: WMI after READY */
++		}
++		/* stage 23: D3 - HTT peer-map (the service itself is connected
++		 * in D1, before SETUP_COMPLETE) plus assoc, peer assoc, vdev up. */
++		if (sy_step >= 23 && sy_sbl_ok && sy_keep_alive && sy_wlfw_on &&
++		    (sy_mhi_m0_ok || sy_chan_force)) {
++			sy_d3_run();
 +		}
 +			if (smmu) {
 +				printf("PANDORA WLAN: SMMU IDR0 %#x IDR1 %#x IDR2 %#x CR0 %#x\n",
@@ -3263,10 +3273,10 @@
 +			sy_wr(c, 0x10, (uint32_t)(rbase >> 32));
 +			sy_wr(c, 0x14, rlen[i]);
 +			sy_wr(c, 0x18, 0);
-+			sy_wr(c, 0x1c, (uint32_t)rbase);
++			sy_wr(c, 0x1c, (uint32_t)rbase);		/* rp */
 +			sy_wr(c, 0x20, (uint32_t)(rbase >> 32));
-+			sy_wr(c, 0x24, (uint32_t)rbase);
-+			sy_wr(c, 0x28, (uint32_t)(rbase >> 32));
++			sy_wr(c, 0x24, (uint32_t)(rbase + rlen[i] - 16u));	/* wp: one slot reserved */
++			sy_wr(c, 0x28, (uint32_t)((rbase + rlen[i] - 16u) >> 32));
 +			(void)el;
 +		}
 +	}
@@ -3300,13 +3310,21 @@
 +	cfg &= ~((0xffu << 16) | (0xffu << 24));
 +	cfg |= (2u << 16);			/* NER = 2, NHWER = 0 */
 +	sy_wr(sy_bar_va, 0x10, cfg);
-+	/* event ring doorbells start at the ring base (empty ring) */
++	/* Linux pm.c:239-251 and sheng WifiProbe.cpp:460-478 publish
++	 * wp = base+len-16 and ring ERDB with that address before M0.
++	 * ioslog_k7 left wp at the ring base and skipped the doorbell;
++	 * the M0 poll then read MHISTATUS 0xff05, state 255. */
 +	erdb = sy_rd(sy_bar_va, 0x20) & 0xffffu;
-+	if (sy_erdb_init && erdb && erdb + 16 <= 0x1000) {
-+		uint64_t e0 = pg + SY_MHI_ER0, e1 = pg + SY_MHI_ER1;
++	if (erdb && erdb + 16 <= 0x1000) {
++		uint64_t e0 = pg + SY_MHI_ER0 + SY_MHI_ER0_LEN - 16u;
++		uint64_t e1 = pg + SY_MHI_ER1 + SY_MHI_ER1_LEN - 16u;
 +
 +		sy_wr(sy_bar_va, erdb, (uint32_t)e0); sy_wr(sy_bar_va, erdb + 4, (uint32_t)(e0 >> 32));
 +		sy_wr(sy_bar_va, erdb + 8, (uint32_t)e1); sy_wr(sy_bar_va, erdb + 12, (uint32_t)(e1 >> 32));
++		printf("PANDORA WLAN: MHI ERDB %#x wp0 %#llx wp1 %#llx (songyuan_erdb=%d)\n",
++		    erdb, (unsigned long long)e0, (unsigned long long)e1, sy_erdb_init);
++	} else {
++		printf("PANDORA WLAN: MHI ERDB offset %#x not usable\n", erdb);
 +	}
 +	__asm__ volatile("dsb sy" ::: "memory");
 +	printf("PANDORA WLAN: MHI ctx: iova %#llx ch[%u %u %u %u] ev[%u %u] "
@@ -4952,6 +4970,9 @@
 +#define SY_CE_OFF_CE2_BUF	0x00180000UL	/* 64 x 2048 B */
 +#define SY_CE_OFF_CE0_TX	0x001a0000UL	/* 2 x 2048 B HTC control TX */
 +#define SY_CE_OFF_CE3_TX	0x001a1000UL	/* 2 x 2048 B WMI TX */
++#define SY_CE_OFF_CE4_SRC	0x00008000UL	/* 2048 x 16 B = 0x8000, host CE4 (ce.c:180-186) */
++#define SY_CE_OFF_CE4_TX	0x001a2000UL	/* 2 x 256 B HTT TX; src_sz_max is 256 */
++#define SY_CE4_TX_SZ		256u
 +#define SY_CE_BUF_SZ		2048u		/* ce.c:154-170 CE1/CE2 buffer size */
 +
 +/* HAL ring ids (hal.h:401,418,435) */
@@ -5024,6 +5045,11 @@
 +	2, 2, 64, 16, SY_CE_OFF_CE2_ST, 0, 0x01b85058UL, 0x01b85408UL,
 +	SY_CE_RING_CE2_ST, 0, 0
 +};
++/* CE4 src: hal.h:405 is CE0_SRC+4 = 68.  Block is CE0 + 4*0x2000. */
++static struct sy_ce_ring sy_ce_ce4_src = {
++	4, 0, 2048, 16, SY_CE_OFF_CE4_SRC, 0, 0x01b88000UL, 0x01b88400UL,
++	68, 0, 0
++};
 +
 +static vm_offset_t sy_ce_va;		/* CE region, cached kernel mapping */
 +static vm_offset_t sy_ce_wc;		/* write-combined alias of the same pages */
@@ -5034,6 +5060,7 @@
 +static uint32_t sy_ce_win_cur = 0xffffffffu;
 +static uint32_t sy_ce_tx_ctrl_idx;	/* round robin over the two CE0 TX buffers */
 +static uint32_t sy_ce_tx_wmi_idx;	/* round robin over the two CE3 TX buffers */
++static uint32_t sy_ce_tx_htt_idx;
 +
 +/* HTC/WMI state (the endpoint ids are assigned by firmware, htc.c:658-679) */
 +static unsigned sy_htc_ready;		/* HTC READY control message seen */
@@ -5043,6 +5070,8 @@
 +static unsigned sy_htc_tx_credits;
 +static uint32_t sy_htc_wmi_eid = 0xffffffffu;
 +static unsigned sy_htc_wmi_max_msg;
++static uint32_t sy_htc_htt_eid = 0xffffffffu;
++static unsigned sy_htc_htt_ok;
 +static unsigned sy_wmi_svc_base;	/* WMI_SERVICE_READY seen */
 +static unsigned sy_wmi_svc_ext;		/* WMI_SERVICE_READY_EXT seen */
 +static unsigned sy_wmi_service_ready;	/* EXT2 seen: WMI_INIT is allowed */
@@ -5090,6 +5119,7 @@
 +    uint32_t eid);
 +static void sy_wmi_event(const uint8_t *b, uint32_t len);
 +static void sy_htc_rx(const uint8_t *b, uint32_t len);
++static void sy_d3_htt_rx(const uint8_t *b, uint32_t len);
 +static int sy_htc_send(uint32_t eid, const void *payload, uint32_t len);
 +static int sy_htc_connect(void);
 +static void sy_ce_poll(struct sy_ce_ring *st, struct sy_ce_ring *dst);
@@ -5465,17 +5495,28 @@
 +			sy_log_sync();
 +		} else if (msgid == SY_HTC_MSG_CONNECT_RESP) {
 +			uint32_t status = w1 & 0xffu;
++			uint32_t svc = (w0 >> 16) & 0xffffu;
++			uint32_t eid_asg = (w1 >> 8) & 0xffu;
++			uint32_t max_msg = (w1 >> 16) & 0xffffu;
 +
-+			sy_htc_wmi_eid = (w1 >> 8) & 0xffu;
-+			sy_htc_wmi_max_msg = (w1 >> 16) & 0xffffu;
-+			sy_htc_conn_ok = (status == 0u);
++			if (svc == 0x0300u) {
++				sy_htc_htt_eid = eid_asg;
++				sy_htc_htt_ok = (status == 0u);
++			} else {
++				sy_htc_wmi_eid = eid_asg;
++				sy_htc_wmi_max_msg = max_msg;
++				sy_htc_conn_ok = (status == 0u);
++			}
 +			printf("PANDORA WLAN: HTC connect response: svc %#x status %u "
-+			    "eid %u max %u\n", (w0 >> 16) & 0xffffu, status,
-+			    sy_htc_wmi_eid, sy_htc_wmi_max_msg);
++			    "eid %u max %u\n", svc, status, eid_asg, max_msg);
 +			sy_log_sync();
 +		} else {
 +			printf("PANDORA WLAN: HTC control msg %u ignored\n", msgid);
 +		}
++		return;
++	}
++	if (eid == sy_htc_htt_eid) {
++		sy_d3_htt_rx(p, plen);
 +		return;
 +	}
 +	if (eid != sy_htc_wmi_eid)
@@ -5495,6 +5536,30 @@
 +	if (len > 2040u) {
 +		printf("PANDORA WLAN: HTC tx: payload %u too long\n", len);
 +		return -1;
++	}
++	/* HTT has credit flow disabled and a 256-byte CE4 (htc.c:602-607, ce.c:180-186). */
++	if (eid == sy_htc_htt_eid) {
++		uint32_t hoff = SY_CE_OFF_CE4_TX + (sy_ce_tx_htt_idx & 1u) * SY_CE4_TX_SZ;
++
++		if (8u + len > SY_CE4_TX_SZ)
++			return -1;
++		sy_ce_tx_htt_idx++;
++		frame = (uint8_t *)(sy_ce_va + hoff);
++		frame[0] = (uint8_t)eid;
++		frame[1] = 0;
++		frame[2] = (uint8_t)len;
++		frame[3] = (uint8_t)(len >> 8);
++		frame[4] = 0;
++		frame[5] = 0;
++		frame[6] = 0;
++		frame[7] = 0;
++		memcpy(frame + 8u, payload, len);
++		flush_dcache64(sy_pa(sy_ce_va + hoff), SY_CE4_TX_SZ, TRUE);
++		__asm__ volatile("dsb sy" ::: "memory");
++		if (sy_ce_send(&sy_ce_ce4_src, hoff, 8u + len, eid))
++			return -1;
++		printf("PANDORA WLAN: HTC tx: eid %u %u B on CE4\n", eid, 8u + len);
++		return 0;
 +	}
 +	if (eid == 0) {
 +		r = (void *)&sy_ce_ce0_src;
@@ -5539,9 +5604,11 @@
 +	return 0;
 +}
 +
-+/* Connect the WMI_CONTROL service (htc.c:551-713).  WCN7850 connects only WMI and
-+ * HTT; HTT belongs to D2.  The receive allocation is the whole target credit
-+ * budget because wmi_ep_count is 1 (htc.c:458-483). */
++/* Connect the WMI_CONTROL service (htc.c:551-713).  HTT is a separate connect
++ * with recv-alloc 0 and credit flow disabled (htc.c:579-607); D3 does that
++ * before SETUP_COMPLETE.  WMI gets the whole credit budget because
++ * wmi_ep_count is 1 (htc.c:458-483).  This phone logged that one credit on
++ * service 0x100 (android_dmesg.txt:2358-2359). */
 +static int
 +sy_htc_connect(void)
 +{
@@ -5845,6 +5912,14 @@
 +		sy_log_sync();
 +		return;
 +	}
++	/* HTT before SETUP_COMPLETE, same place as ath12k_dp_htt_connect (core.c:470).
++	 * Only when this boot is going on to D3; the ring is the host CE4 from ce.c. */
++	if (sy_step >= 23) {
++		sy_ce_ring_hw(&sy_ce_ce4_src);
++		if (sy_d3_htc_connect())
++			printf("PANDORA WLAN: D3: HTT connect failed\n");
++		sy_log_sync();
++	}
 +	/* 6. SETUP_COMPLETE_EX on ep0 (htc.c:715-742) */
 +	{
 +		uint32_t setup[3];
@@ -6024,6 +6099,13 @@
 +static unsigned sy_d2_ssid_len[SY_D2_MAX_RESULTS];
 +static uint32_t sy_d2_freq[SY_D2_MAX_RESULTS];
 +static int sy_d2_rssi[SY_D2_MAX_RESULTS];
++static uint16_t sy_d2_cap[SY_D2_MAX_RESULTS];
++static unsigned sy_d2_rsn[SY_D2_MAX_RESULTS];	/* RSN IE present */
++static unsigned sy_d2_wpa[SY_D2_MAX_RESULTS];	/* WPA vendor IE present */
++static uint8_t sy_d2_rates[SY_D2_MAX_RESULTS][16];
++static unsigned sy_d2_nrates[SY_D2_MAX_RESULTS];
++static unsigned sy_d2_conn_idx;
++static unsigned sy_d2_conn_valid;
 +static uint8_t sy_d2_our_mac[6];
 +
 +static unsigned sy_d2_le32(uint8_t *b, unsigned at, uint32_t v);
@@ -6373,6 +6455,11 @@
 +	unsigned sl = 0;
 +	uint32_t ch = 0;
 +	uint16_t fc;
++	uint16_t cap = 0;
++	unsigned rsn = 0;
++	unsigned wpa = 0;
++	unsigned nr = 0;
++	uint8_t rates[16];
 +	const uint8_t * bssid;
 +	uint8_t ssid[33];
 +
@@ -6382,10 +6469,12 @@
 +	if ((fc & 0x0fu) != 0x08u && (fc & 0x0fu) != 0x05u)
 +		return;			/* only beacons and probe responses */
 +	bssid = f + 16u;		/* addr3 is the BSSID for both */
++	cap = (uint16_t)(f[34] | (f[35] << 8));	/* capability, after timestamp+interval */
 +	pos = 36u;
 +	while (pos + 2u <= flen) {
 +		uint8_t id = f[pos];
 +		uint8_t elen = f[pos + 1u];
++		unsigned k;
 +
 +		if (pos + 2u + (unsigned)elen > flen)
 +			break;
@@ -6395,6 +6484,16 @@
 +		}
 +		if (id == 3u && elen >= 1u)
 +			ch = f[pos + 2u];
++		if ((id == 1u || id == 50u) && elen) {
++			for (k = 0; k < elen && nr < 16u; k++)
++				rates[nr++] = f[pos + 2u + k];
++		}
++		if (id == 48u)
++			rsn = 1;
++		if (id == 221u && elen >= 4u &&
++		    f[pos + 2u] == 0x00u && f[pos + 3u] == 0x50u &&
++		    f[pos + 4u] == 0xf2u && f[pos + 5u] == 0x01u)
++			wpa = 1;
 +		pos += 2u + (unsigned)elen;
 +	}
 +	for (i = 0; i < sy_d2_results; i++) {
@@ -6409,6 +6508,14 @@
 +		sy_d2_freq[i] = freq;
 +		sy_d2_rssi[i] = rssi;
 +		sy_d2_results++;
++	}
++	if (i < sy_d2_results) {
++		sy_d2_cap[i] = cap;
++		sy_d2_rsn[i] = rsn;
++		sy_d2_wpa[i] = wpa;
++		sy_d2_nrates[i] = nr;
++		if (nr)
++			memcpy(sy_d2_rates[i], rates, nr);
 +	}
 +	printf("PANDORA WLAN: D2 BSS %u: bssid %02x:%02x:%02x:%02x:%02x:%02x ssid '%.*s' "
 +	    "freq %u ch %u rssi %d\n", i, bssid[0], bssid[1], bssid[2], bssid[3],
@@ -6522,8 +6629,12 @@
 +			printf("PANDORA WLAN: D2 mgmt rx dropped status %#x\n", status);
 +			return 1;
 +		}
-+		if (frame && flen)
-+			sy_d2_parse_mgmt(freq, rssi, frame, flen < buf_len ? flen : buf_len);
++		if (frame && flen) {
++			unsigned n = flen < buf_len ? flen : buf_len;
++
++			sy_d3_on_mgmt(frame, n);
++			sy_d2_parse_mgmt(freq, rssi, frame, n);
++		}
 +		return 1;
 +	}
 +	if (cmd == SY_D2_EVT_MGMT_TX_COMPL) {
@@ -6608,6 +6719,8 @@
 +		}
 +	}
 +	freq = sy_d2_freq[bi];
++	sy_d2_conn_idx = bi;
++	sy_d2_conn_valid = 1;
 +	at = sy_d2_build_peer_create(sy_d2_tx, sy_d2_bssid[bi]);
 +	if (sy_d2_send(SY_D2_PEER_CREATE_CMD, at))
 +		return -1;
@@ -6709,6 +6822,9 @@
 +		return;
 +	sy_d2_hw_mode_done = 1;
 +	sy_d2_settle(200u);
++	/* ath12k sends the HTT version right after hw mode (core.c:526-534). */
++	if (sy_step >= 23 && sy_htc_htt_ok)
++		sy_d3_version();
 +
 +	at = sy_d2_build_pdev_param(sy_d2_tx, SY_D2_PDEV_PARAM_TX_CHAIN_MASK, mask);
 +	if (sy_d2_send(SY_D2_PDEV_SET_PARAM_CMD, at))
@@ -6796,6 +6912,413 @@
 +			    "peer map is D3)\n");
 +	}
 +	printf("PANDORA WLAN: D2 DONE\n");
++	sy_log_sync();
++}
++
++/* ---- D3: HTT peer-map, then assoc / peer assoc / vdev up (stage 23) ----------
++ *
++ * HTT_DATA_MSG is service 0x0300, UL CE4 / DL CE1 (hw.c:515-522).  ath12k gives
++ * HTT no TX credits and sets DISABLE_CREDIT_FLOW_CTRL (htc.c:579-607).  The
++ * version word is type 0 (dp.h:395, dp_tx.c:819).  A conf of major 3 is what
++ * dp.h:1204 expects.  Peer-map / map2 / map3 share the first three words
++ * (dp.h:1214-1227, dp_rx.c:1692-1729) and arrive on the HTT HTC endpoint, which
++ * on this chip is CE1, not a REO ring.
++ *
++ * This phone's connect after vdev start is auth, assoc req, assoc rsp, then
++ * vdev_mgr_up with a zero transmitted BSSID and profile 0 (android_dmesg.txt:
++ * 2656-2671).  Peer assoc is the WMI command ath12k sends before vdev up
++ * (mac.c:2291-2321, cmd 0x6005, TLV tag 101).  HE/VHT/HT capability words stay
++ * zero: the beacon IEs are not mapped into those WMI bitfields here.  The
++ * phymode is the legacy band mode (wmi.h:2811-2813).  Legacy rates, the RSN
++ * bit and the WPA vendor bit are copied from the beacon that D2 already parsed.
++ * Listen interval in the assoc frame is 1; peer_listen_intval stays 0, which
++ * is ath12k's value when mac80211 never set hw.conf.listen_interval
++ * (mac.c:1226).
++ */
++static unsigned sy_d3_ver_done;
++static uint32_t sy_d3_ver_major;
++static uint32_t sy_d3_ver_minor;
++static unsigned sy_d3_peer_mapped;
++static uint32_t sy_d3_peer_id;
++static unsigned sy_d3_auth_ok;
++static unsigned sy_d3_assoc_done;
++static uint32_t sy_d3_assoc_status;
++static uint32_t sy_d3_assoc_aid;
++static unsigned sy_d3_ran;
++
++#define SY_D3_HTT_SVC		0x0300u
++#define SY_D3_PEER_MAP		0x3u
++#define SY_D3_PEER_UNMAP	0x4u
++#define SY_D3_PEER_MAP2		0x1eu
++#define SY_D3_PEER_UNMAP2	0x1fu
++#define SY_D3_PEER_MAP3		0x2bu
++#define SY_D3_VDEV_UP_CMD	0x005005u
++#define SY_D3_PEER_ASSOC_CMD	0x006005u
++#define SY_D3_TAG_VDEV_UP	92u
++#define SY_D3_TAG_PEER_ASSOC	101u
++#define SY_D3_TAG_VHT_RATE	102u
++#define SY_D3_PEER_AUTH		0x00000001u
++#define SY_D3_PEER_PTK4		0x00000004u
++#define SY_D3_PEER_GTK2		0x00000010u
++
++static int
++sy_d3_htc_connect(void)
++{
++	uint32_t w[2];
++	unsigned i;
++
++	w[0] = SY_HTC_MSG_CONNECT | (SY_D3_HTT_SVC << 16);
++	w[1] = 0x8u;	/* DISABLE_CREDIT_FLOW_CTRL, recv alloc 0 */
++	sy_htc_htt_ok = 0;
++	if (sy_htc_send(0, w, 8u))
++		return -1;
++	printf("PANDORA WLAN: D3: HTT connect sent\n");
++	sy_log_sync();
++	for (i = 0; i < 100u && !sy_htc_htt_ok; i++) {
++		sy_ce_pump();
++		sy_usleep(10000);
++	}
++	printf("PANDORA WLAN: D3: HTT connect %s eid %u\n",
++	    sy_htc_htt_ok ? "ok" : "no response", sy_htc_htt_eid);
++	sy_log_sync();
++	return sy_htc_htt_ok ? 0 : -1;
++}
++
++static void
++sy_d3_note_peer(uint32_t info, uint32_t mac_l, uint32_t info1, const char *kind)
++{
++	uint32_t vdev = (info >> 8) & 0xffu;
++	uint32_t peer = (info >> 16) & 0xffffu;
++	uint8_t mac[6];
++
++	mac[0] = (uint8_t)mac_l;
++	mac[1] = (uint8_t)(mac_l >> 8);
++	mac[2] = (uint8_t)(mac_l >> 16);
++	mac[3] = (uint8_t)(mac_l >> 24);
++	mac[4] = (uint8_t)info1;
++	mac[5] = (uint8_t)(info1 >> 8);
++	if (sy_d2_conn_valid &&
++	    !memcmp(mac, sy_d2_bssid[sy_d2_conn_idx], 6)) {
++		sy_d3_peer_id = peer;
++		sy_d3_peer_mapped = 1;
++	}
++	printf("PANDORA WLAN: D3: HTT %s vdev %u peer %u mac "
++	    "%02x:%02x:%02x:%02x:%02x:%02x\n", kind, vdev, peer,
++	    mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
++	sy_log_sync();
++}
++
++static void
++sy_d3_htt_rx(const uint8_t *b, uint32_t len)
++{
++	uint32_t w0, w1, w2, typ;
++
++	if (len < 4u)
++		return;
++	w0 = (uint32_t)(b[0] | (b[1] << 8) | (b[2] << 16) | (b[3] << 24));
++	typ = w0 & 0xffu;
++	if (typ == 0u) {
++		sy_d3_ver_minor = (w0 >> 8) & 0xffu;
++		sy_d3_ver_major = (w0 >> 16) & 0xffu;
++		sy_d3_ver_done = 1;
++		printf("PANDORA WLAN: D3: HTT version %u.%u\n",
++		    sy_d3_ver_major, sy_d3_ver_minor);
++		sy_log_sync();
++		return;
++	}
++	if (len < 12u)
++		return;
++	w1 = (uint32_t)(b[4] | (b[5] << 8) | (b[6] << 16) | (b[7] << 24));
++	w2 = (uint32_t)(b[8] | (b[9] << 8) | (b[10] << 16) | (b[11] << 24));
++	if (typ == SY_D3_PEER_MAP || typ == SY_D3_PEER_MAP2 || typ == SY_D3_PEER_MAP3)
++		sy_d3_note_peer(w0, w1, w2, typ == SY_D3_PEER_MAP ? "map" :
++		    (typ == SY_D3_PEER_MAP2 ? "map2" : "map3"));
++	else if (typ == SY_D3_PEER_UNMAP || typ == SY_D3_PEER_UNMAP2)
++		printf("PANDORA WLAN: D3: HTT unmap peer %u\n", (w0 >> 16) & 0xffffu);
++	else
++		printf("PANDORA WLAN: D3: HTT msg %#x (%u B)\n", typ, len);
++}
++
++static void
++sy_d3_version(void)
++{
++	uint32_t word = 0;
++	unsigned i;
++
++	sy_d3_ver_done = 0;
++	if (sy_htc_send(sy_htc_htt_eid, &word, 4u)) {
++		printf("PANDORA WLAN: D3: HTT version request failed\n");
++		sy_log_sync();
++		return;
++	}
++	for (i = 0; i < 300u && !sy_d3_ver_done; i++) {
++		sy_ce_pump();
++		sy_usleep(10000);
++	}
++	if (!sy_d3_ver_done)
++		printf("PANDORA WLAN: D3: HTT version no response (3 s)\n");
++	else if (sy_d3_ver_major != 3u)
++		printf("PANDORA WLAN: D3: HTT major %u, ath12k expects 3\n",
++		    sy_d3_ver_major);
++	sy_log_sync();
++}
++
++static int
++sy_d3_from_bss(const uint8_t *f)
++{
++	if (!sy_d2_conn_valid || sy_d2_conn_idx >= sy_d2_results)
++		return 0;
++	return memcmp(f + 16u, sy_d2_bssid[sy_d2_conn_idx], 6) == 0;
++}
++
++static void
++sy_d3_on_mgmt(const uint8_t *f, unsigned flen)
++{
++	uint16_t fc;
++
++	if (flen < 30u || !sy_d3_from_bss(f))
++		return;
++	fc = (uint16_t)(f[0] | (f[1] << 8));
++	if ((fc & 0x00fcu) == 0x00b0u) {
++		uint16_t alg = (uint16_t)(f[24] | (f[25] << 8));
++		uint16_t seq = (uint16_t)(f[26] | (f[27] << 8));
++		uint16_t st = (uint16_t)(f[28] | (f[29] << 8));
++
++		printf("PANDORA WLAN: D3: auth rx alg %u seq %u status %u\n",
++		    alg, seq, st);
++		sy_log_sync();
++		if (alg == 0u && seq == 2u && st == 0u)
++			sy_d3_auth_ok = 1;
++	} else if ((fc & 0x00fcu) == 0x0010u) {
++		sy_d3_assoc_status = (uint32_t)(f[26] | (f[27] << 8));
++		sy_d3_assoc_aid = (uint32_t)(f[28] | (f[29] << 8)) & 0x3fffu;
++		sy_d3_assoc_done = 1;
++		printf("PANDORA WLAN: D3: assoc rsp status %u aid %u\n",
++		    sy_d3_assoc_status, sy_d3_assoc_aid);
++		sy_log_sync();
++	}
++}
++
++static unsigned
++sy_d3_build_assoc(uint8_t *f, unsigned bi)
++{
++	unsigned at = 0;
++	unsigned i;
++	unsigned nr = sy_d2_nrates[bi];
++	unsigned sl = sy_d2_ssid_len[bi];
++
++	if (nr > 8u)
++		nr = 8u;		/* the basic Supported Rates IE holds 8 */
++	memset(f, 0, 64u);
++	f[at++] = 0x00;			/* assoc request */
++	f[at++] = 0x00;
++	at = 4u;
++	memcpy(f + at, sy_d2_bssid[bi], 6);
++	at += 6u;
++	memcpy(f + at, sy_d2_our_mac, 6);
++	at += 6u;
++	memcpy(f + at, sy_d2_bssid[bi], 6);
++	at += 6u;
++	at += 2u;			/* seq, firmware assigns it */
++	f[at++] = (uint8_t)sy_d2_cap[bi];
++	f[at++] = (uint8_t)(sy_d2_cap[bi] >> 8);
++	f[at++] = 1;			/* listen interval: 1 beacon */
++	f[at++] = 0;
++	f[at++] = 0;			/* SSID */
++	f[at++] = (uint8_t)sl;
++	memcpy(f + at, sy_d2_ssid[bi], sl);
++	at += sl;
++	if (nr) {
++		f[at++] = 1;		/* Supported Rates */
++		f[at++] = (uint8_t)nr;
++		for (i = 0; i < nr; i++)
++			f[at++] = sy_d2_rates[bi][i];
++	}
++	if (sy_d2_nrates[bi] > 8u) {
++		unsigned extra = sy_d2_nrates[bi] - 8u;
++
++		if (extra > 8u)
++			extra = 8u;
++		f[at++] = 50;		/* Extended Supported Rates */
++		f[at++] = (uint8_t)extra;
++		for (i = 0; i < extra; i++)
++			f[at++] = sy_d2_rates[bi][8u + i];
++	}
++	return at;
++}
++
++static unsigned
++sy_d3_build_vdev_up(uint8_t *b, unsigned bi, uint32_t aid)
++{
++	unsigned at = 4;
++	unsigned i;
++
++	at = sy_d2_tlv(b, at, SY_D3_TAG_VDEV_UP, 32);
++	at = sy_d2_le32(b, at, 0);		/* vdev id */
++	at = sy_d2_le32(b, at, aid);
++	for (i = 0; i < 6u; i++)
++		b[at++] = sy_d2_bssid[bi][i];
++	b[at++] = 0;
++	b[at++] = 0;
++	for (i = 0; i < 8u; i++)		/* trans_bssid, phone logged zeros */
++		b[at++] = 0;
++	at = sy_d2_le32(b, at, 0);		/* profile_idx */
++	at = sy_d2_le32(b, at, 0);		/* profile_num */
++	return at;
++}
++
++static unsigned
++sy_d3_zeros(uint8_t *b, unsigned at, unsigned n)
++{
++	while (n--)
++		at = sy_d2_le32(b, at, 0);
++	return at;
++}
++
++static unsigned
++sy_d3_build_peer_assoc(uint8_t *b, unsigned bi, uint32_t aid)
++{
++	unsigned at = 4;
++	unsigned i;
++	unsigned nr = sy_d2_nrates[bi];
++	unsigned align;
++	uint32_t flags;
++	uint32_t mode = (sy_d2_freq[bi] < 2500u) ? 1u : 0u;
++
++	if (nr > 16u)
++		nr = 16u;
++	flags = (sy_d2_rsn[bi] || sy_d2_wpa[bi]) ? SY_D3_PEER_PTK4 : SY_D3_PEER_AUTH;
++	if (sy_d2_wpa[bi])
++		flags |= SY_D3_PEER_GTK2;
++	at = sy_d2_tlv(b, at, SY_D3_TAG_PEER_ASSOC, 244);
++	for (i = 0; i < 6u; i++)
++		b[at++] = sy_d2_bssid[bi][i];
++	b[at++] = 0;
++	b[at++] = 0;
++	at = sy_d2_le32(b, at, 0);		/* vdev */
++	at = sy_d2_le32(b, at, 1);		/* peer_new_assoc */
++	at = sy_d2_le32(b, at, aid);
++	at = sy_d2_le32(b, at, flags);
++	at = sy_d2_le32(b, at, sy_d2_cap[bi]);
++	at = sy_d2_le32(b, at, 0);		/* listen interval */
++	at = sy_d3_zeros(b, at, 4);		/* ht caps, max mpdu, density, rate caps */
++	at = sy_d2_le32(b, at, 1);		/* nss, ath12k_peer_assoc_h_basic */
++	at = sy_d2_le32(b, at, 0);		/* vht caps */
++	at = sy_d2_le32(b, at, mode);		/* legacy phy mode for the band */
++	at = sy_d3_zeros(b, at, 2);		/* ht info */
++	at = sy_d2_le32(b, at, nr);
++	at = sy_d2_le32(b, at, 0);		/* num ht rates */
++	at = sy_d2_le32(b, at, 0);		/* bw rxnss */
++	at = sy_d3_zeros(b, at, 10);		/* PPE */
++	at = sy_d3_zeros(b, at, 15);		/* HE words through punct_bitmap */
++	at = sy_d3_zeros(b, at, 6);		/* EHT mac/phy/ops */
++	at = sy_d3_zeros(b, at, 10);		/* EHT PPE */
++	if (at != 252u) {
++		printf("PANDORA WLAN: D3: peer assoc fixed length %u\n", at);
++		return 0;
++	}
++	align = (nr + 3u) & ~3u;
++	at = sy_d2_tlv(b, at, SY_D2_TAG_ARRAY_BYTE, align);
++	for (i = 0; i < align; i++)
++		b[at++] = (i < nr) ? sy_d2_rates[bi][i] : 0;
++	at = sy_d2_tlv(b, at, SY_D2_TAG_ARRAY_BYTE, 0);	/* no HT rates */
++	at = sy_d2_tlv(b, at, SY_D3_TAG_VHT_RATE, 20);
++	at = sy_d3_zeros(b, at, 5);
++	at = sy_d2_tlv(b, at, SY_D2_TAG_ARRAY_STRUCT, 0);	/* HE rate sets */
++	at = sy_d2_tlv(b, at, SY_D2_TAG_ARRAY_STRUCT, 0);	/* MLO */
++	at = sy_d2_tlv(b, at, SY_D2_TAG_ARRAY_STRUCT, 0);	/* EHT rate sets */
++	at = sy_d2_tlv(b, at, SY_D2_TAG_ARRAY_STRUCT, 0);	/* ML partner links */
++	return at;
++}
++
++static int
++sy_d3_wait(unsigned *flag, unsigned ms)
++{
++	unsigned spent;
++
++	for (spent = 0; spent < ms && !*flag; spent += 10u) {
++		sy_ce_pump();
++		sy_usleep(10000);
++	}
++	return *flag ? 0 : -1;
++}
++
++static void
++sy_d3_run(void)
++{
++	unsigned bi;
++	unsigned at;
++	unsigned flen;
++	unsigned spent;
++
++	if (sy_d3_ran)
++		return;
++	sy_d3_ran = 1;
++	printf("PANDORA WLAN: step %u: D3 HTT/assoc\n", sy_step);
++	sy_log_sync();
++	if (!sy_htc_htt_ok || !sy_d2_conn_valid) {
++		printf("PANDORA WLAN: D3: deferred (htt %u conn %u)\n",
++		    sy_htc_htt_ok, sy_d2_conn_valid);
++		sy_log_sync();
++		return;
++	}
++	bi = sy_d2_conn_idx;
++	if (sy_d3_wait(&sy_d3_peer_mapped, 3000u))
++		printf("PANDORA WLAN: D3: no peer-map (3 s)\n");
++	else
++		printf("PANDORA WLAN: D3: peer-map id %u\n", sy_d3_peer_id);
++	sy_log_sync();
++	if (sy_d3_wait(&sy_d3_auth_ok, 2000u)) {
++		printf("PANDORA WLAN: D3: no open auth response\n");
++		sy_log_sync();
++		return;
++	}
++	if (!sy_d2_cap[bi]) {
++		printf("PANDORA WLAN: D3: beacon had no capability, assoc not sent\n");
++		sy_log_sync();
++		return;
++	}
++	flen = sy_d3_build_assoc(sy_d2_frame, bi);
++	if (flen > SY_D2_FRAME_MAX) {
++		printf("PANDORA WLAN: D3: assoc frame %u too long\n", flen);
++		return;
++	}
++	memcpy((void *)(sy_ce_va + SY_D2_OFF_FRAME), sy_d2_frame, flen);
++	flush_dcache64(sy_pa(sy_ce_va + SY_D2_OFF_FRAME), SY_D2_FRAME_MAX, TRUE);
++	__asm__ volatile("dsb sy" ::: "memory");
++	sy_d2_mgmt_tx_done = 0;
++	sy_d2_desc_id++;
++	at = sy_d2_build_mgmt_tx(sy_d2_tx, flen, flen);
++	if (sy_d2_send(SY_D2_MGMT_TX_SEND_CMD, at))
++		return;
++	for (spent = 0; spent < 1000u && !sy_d2_mgmt_tx_done; spent += 10u) {
++		sy_ce_pump();
++		sy_usleep(10000);
++	}
++	printf("PANDORA WLAN: D3: assoc req tx %s\n",
++	    sy_d2_mgmt_tx_done ? "confirmed" : "no completion");
++	sy_log_sync();
++	if (sy_d3_wait(&sy_d3_assoc_done, 2000u) || sy_d3_assoc_status != 0u) {
++		printf("PANDORA WLAN: D3: assoc not accepted (done %u status %u)\n",
++		    sy_d3_assoc_done, sy_d3_assoc_status);
++		sy_log_sync();
++		return;
++	}
++	if (!sy_d3_peer_mapped) {
++		printf("PANDORA WLAN: D3: assoc ok, peer-map still missing, "
++		    "peer assoc not sent\n");
++		sy_log_sync();
++		return;
++	}
++	at = sy_d3_build_peer_assoc(sy_d2_tx, bi, sy_d3_assoc_aid);
++	if (!at || sy_d2_send(SY_D3_PEER_ASSOC_CMD, at))
++		return;
++	sy_d2_settle(100u);
++	at = sy_d3_build_vdev_up(sy_d2_tx, bi, sy_d3_assoc_aid);
++	if (sy_d2_send(SY_D3_VDEV_UP_CMD, at))
++		return;
++	printf("PANDORA WLAN: D3 DONE peer %u aid %u\n",
++	    sy_d3_peer_id, sy_d3_assoc_aid);
 +	sy_log_sync();
 +}
 +
