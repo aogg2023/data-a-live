@@ -353,7 +353,7 @@
  static int cv_chan;
  
  static void
-@@ -36,6 +359,466 @@ cv_sleep(unsigned ms)
+@@ -36,6 +359,466 @@
  	thread_block(THREAD_CONTINUE_NULL);
  }
  
@@ -820,7 +820,7 @@
  static void
  pandora_cachevol_thread(void *arg, wait_result_t result)
  {
-@@ -51,22 +834,8228 @@ pandora_cachevol_thread(void *arg, wait_result_t result)
+@@ -51,21 +834,8226 @@
  		cv_sleep(100);
  	}
  	if (rootvnode == NULLVP) {
@@ -853,8 +853,6 @@
  	thread_block(THREAD_CONTINUE_NULL);
  }
  
--void
--pandora_cachevol_start(void)
 +#include <sys/param.h>
 +#include <sys/systm.h>
 +#include <sys/errno.h>
@@ -1118,10 +1116,7 @@
 + * songyuan_logsync=0 turns every call off (A/B switch). */
 +static void
 +sy_log_sync(void)
- {
--	thread_t thread;
--	if (kernel_thread_start(pandora_cachevol_thread, NULL, &thread) == KERN_SUCCESS) {
--		thread_deallocate(thread);
++{
 +	static int on = -1;
 +
 +	if (on < 0) {
@@ -1748,7 +1743,7 @@
 +			printf("PANDORA WLAN: branch at GCC %#x stays off\n", branches[i]);
 +			return false;
 +		}
- 	}
++	}
 +	/* Completeness audit: print the exact masks this driver relies on so a missing
 +	 * clock bit is visible in every boot log (the 2026-11-09 ANOC AHB omission was
 +	 * invisible for 20+ builds because only "domains on" was printed). */
@@ -1757,7 +1752,7 @@
 +	    sy_gcc_rd(GCC_VOTE_BRANCH), sy_gcc_rd(GCC_VOTE_BRANCH2), sy_gcc_rd(0x52018));
 +	printf("PANDORA WLAN: domains on; aux, reference and branch clocks running\n");
 +	return true;
- }
++}
 +
 +/* ---- pins (port-proven TLMM CTL layout) ---------------------------------------- */
 +
@@ -9047,16 +9042,14 @@
 +	}
 +}
 +
-+void
-+pandora_cachevol_start(void)
-+{
-+	thread_t thread;
+ void
+ pandora_cachevol_start(void)
+ {
+ 	thread_t thread;
 +	pandora_wlan_init();	/* M1: PCIe RC0 bring-up, boot-arg songyuan_wlan */
-+	if (kernel_thread_start(pandora_cachevol_thread, NULL, &thread) == KERN_SUCCESS) {
-+		thread_deallocate(thread);
-+	}
-+}
-+
+ 	if (kernel_thread_start(pandora_cachevol_thread, NULL, &thread) == KERN_SUCCESS) {
+ 		thread_deallocate(thread);
+ 	}
 diff --git a/iokit/bsddev/pandora_80211.cpp b/iokit/bsddev/pandora_80211.cpp
 new file mode 100644
 index 0000000000000000000000000000000000000000..0000000000000000000000000000000000000000
