@@ -353,7 +353,7 @@
  static int cv_chan;
  
  static void
-@@ -36,6 +359,442 @@
+@@ -36,6 +359,466 @@
  	thread_block(THREAD_CONTINUE_NULL);
  }
  
@@ -481,6 +481,7 @@
 +};
 +#define CV_STAGED_N (sizeof(cv_staged_names) / sizeof(cv_staged_names[0]))
 +#define CV_STAGED_LS_DONE "/private/var/mobile/.pandora_staged_ls_done"
++#define CV_CAMERA_ICON_DONE "/private/var/mobile/.pandora_camera_icon"
 +#define CV_STAGED_DAEMON "/private/var/mobile/Containers/Data/InternalDaemon"
 +
 +static int cv_staged_renamed;
@@ -793,10 +794,33 @@
 +	}
 +}
 +
++/* IconState written before /arm-io/isp existed has no Camera.
++ * SpringBoard reloads it and does not ask for the node again
++ * (ioslog_k13: no path IODeviceTree:/arm-io/isp; the plist changed
++ * only its uniqueIdentifier). Drop that file once, before SpringBoard
++ * starts, so it builds the layout against the isp node. */
++static void
++cv_stage_drop_iconstate(void)
++{
++	int error;
++
++	if (cv_dir_exists(CV_CAMERA_ICON_DONE)) {
++		printf("PANDORA STAGED: IconState kept, camera marker present\n");
++		return;
++	}
++	error = pandora_unlink("/private/var/mobile/Library/SpringBoard/IconState.plist");
++	printf("PANDORA STAGED: IconState unlink %d\n", error);
++	if (error == 0 || error == ENOENT) {
++		int me = pandora_mkdir(CV_CAMERA_ICON_DONE, 0755);
++
++		printf("PANDORA STAGED: camera marker %d\n", me);
++	}
++}
++
  static void
  pandora_cachevol_thread(void *arg, wait_result_t result)
  {
-@@ -51,21 +810,7990 @@
+@@ -51,21 +834,8043 @@
  		cv_sleep(100);
  	}
  	if (rootvnode == NULLVP) {
@@ -815,6 +839,7 @@
 +	printf("PANDORA CACHE: mount /dev/ufscache0 on " CV_MOUNT " -> %d\n", error);
 +	if (error == 0) {
 +		cv_stage_reset_ls();
++		cv_stage_drop_iconstate();
 +		cv_seed_skeleton();
 +		/* 0352: the pack installs at ~2.9 s; SpringBoard starts at ~12.4 s. */
 +		cv_prefs_probe("before the firmware pack");
@@ -3596,24 +3621,20 @@
 +	sy_mhi_map_uc(pg_va);
 +	memset((void *)pg_va, 0, 0xc000);
 +
-+	/* channel contexts: index = channel number, 44 bytes each */
++	/* channel contexts: index = channel number, 44 bytes each.
++	 * chstate stays DISABLED and rbase stays 0 until sy_mhi_arm_chan(),
++	 * which runs immediately before that channel's START.
++	 * ref_mhi_init.c:337 (disabled) and :673 (ENABLED just before START);
++	 * lemonade_wifi.c:1159-1162. ioslog_k13 line 996: ch 20 START code 1,
++	 * then ch 21, already ENABLED with an empty ring since SBL, raised
++	 * status 0xff05. Channels 0 and 1 are never armed. */
 +	for (i = 0; i < sizeof(sy_mhi_desc) / sizeof(sy_mhi_desc[0]); i++) {
 +		const struct sy_mhi_chan_desc *d = &sy_mhi_desc[i];
-+		uint32_t rlen = d->els * 16u;
 +
-+		rbase = pg + d->ring;
 +		c = pg_va + SY_MHI_CH_CTX + d->num * 0x2cu;
-+		sy_wr(c, 0x00, (2u << 8) | 1u);	/* chcfg: enabled, MHI_DB_BRST_DISABLE */
++		sy_wr(c, 0x00, 2u << 8);		/* DISABLED, MHI_DB_BRST_DISABLE */
 +		sy_wr(c, 0x04, d->dir);			/* chtype = direction */
 +		sy_wr(c, 0x08, d->er);			/* event ring index */
-+		sy_wr(c, 0x0c, (uint32_t)rbase);
-+		sy_wr(c, 0x10, (uint32_t)(rbase >> 32));
-+		sy_wr(c, 0x14, rlen);			/* rlen low */
-+		sy_wr(c, 0x18, 0);
-+		sy_wr(c, 0x1c, (uint32_t)rbase);	/* rp */
-+		sy_wr(c, 0x20, (uint32_t)(rbase >> 32));
-+		sy_wr(c, 0x24, (uint32_t)rbase);	/* wp */
-+		sy_wr(c, 0x28, (uint32_t)(rbase >> 32));
 +	}
 +	/* event contexts: ring 0 = 32 elements/irq 1, ring 1 = 256/irq 2, 1 ms */
 +	{
@@ -3913,6 +3934,59 @@
 +	}
 +}
 +
++/* Publish one channel's ring and set it ENABLED. Inbound IPCR gets
++ * real DL TREs first; wp stays at the ring base, so the ring is empty
++ * and CHDB is not rung. lemonade_wifi.c ipcr_probe fills those TREs
++ * before START. q_net_qrtr_mhi.c queues DL buffers only after
++ * mhi_prepare_for_transfer returns. */
++static void
++sy_mhi_arm_chan(uint32_t chan)
++{
++	const struct sy_mhi_chan_desc *d;
++	vm_offset_t pg_va, c, tre;
++	uint64_t pg, rbase, buf;
++	uint32_t i, n, rlen;
++
++	d = NULL;
++	for (i = 0; i < sizeof(sy_mhi_desc) / sizeof(sy_mhi_desc[0]); i++) {
++		if (sy_mhi_desc[i].num == chan)
++			d = &sy_mhi_desc[i];
++	}
++	if (!d || !sy_sbl_va)
++		return;
++	pg_va = sy_sbl_va + 0x7C0000;
++	pg = SY_IOVA_MAP + 0x7C0000;
++	if (chan == 21) {
++		for (n = 0; n < SY_MHI_DL_NBUF; n++) {
++			buf = pg + SY_MHI_DL_BUF + ((uint64_t)n << 11);
++			tre = pg_va + d->ring + (n << 4);
++			sy_wr(tre, 0, (uint32_t)buf);
++			sy_wr(tre, 4, (uint32_t)(buf >> 32));
++			sy_wr(tre, 8, 0x800u);
++			sy_wr(tre, 12, (2u << 16) | (1u << 9));
++		}
++	}
++	rbase = pg + d->ring;
++	rlen = d->els * 16u;
++	c = pg_va + SY_MHI_CH_CTX + chan * 0x2cu;
++	sy_wr(c, 0x00, (2u << 8) | 1u);		/* ENABLED, MHI_DB_BRST_DISABLE */
++	sy_wr(c, 0x0c, (uint32_t)rbase);
++	sy_wr(c, 0x10, (uint32_t)(rbase >> 32));
++	sy_wr(c, 0x14, rlen);
++	sy_wr(c, 0x18, 0);
++	sy_wr(c, 0x1c, (uint32_t)rbase);
++	sy_wr(c, 0x20, (uint32_t)(rbase >> 32));
++	sy_wr(c, 0x24, (uint32_t)rbase);	/* wp == rp until the post-START CHDB */
++	sy_wr(c, 0x28, (uint32_t)(rbase >> 32));
++	flush_dcache64(sy_pa(pg_va + (d->ring & ~(uint32_t)(PAGE_SIZE - 1))),
++	    (unsigned)PAGE_SIZE, TRUE);
++	flush_dcache64(sy_pa(c), (unsigned)PAGE_SIZE, TRUE);
++	__asm__ volatile("dsb sy" ::: "memory");
++	printf("PANDORA WLAN: MHI arm ch %u base %#llx len %#x\n",
++	    chan, (unsigned long long)rbase, rlen);
++	sy_log_sync();
++}
++
 +/* One MHI_CMD_START_CHAN (0x12) on the primary command ring, then CRDB
 + * at BAR+0x70. ref_mhi_main.c:1294-1308 writes the TRE; :124-132 rings
 + * the doorbell with the command-context wp. Timeout is ath12k's 2000 ms. */
@@ -3925,6 +3999,7 @@
 +
 +	if (!sy_bar_va || !sy_sbl_va)
 +		return 0;
++	sy_mhi_arm_chan(chan);
 +	pg_va = sy_sbl_va + 0x7C0000;
 +	pg = SY_IOVA_MAP + 0x7C0000;
 +	els = SY_MHI_CMD_LEN / 16u;
@@ -3959,6 +4034,8 @@
 +		if (sy_mhi_cmd_code < 0)
 +			delay(1000);
 +	}
++	if (sy_mhi_cmd_code != 1)
++		sy_smmu_bank_scan();
 +	printf("PANDORA WLAN: MHI START ch %u code %d after %u ms status %#x\n",
 +	    chan, sy_mhi_cmd_code, i, sy_rd(sy_bar_va, 0x48));
 +	sy_mhi_cmd_wait_ch = 0xffffffffu;
@@ -8985,8 +9062,6 @@ index 0000000000000000000000000000000000000000..00000000000000000000000000000000
 +	return 0;
 +}
 diff --git a/iokit/conf/files b/iokit/conf/files
---- a/iokit/conf/files
-+++ b/iokit/conf/files
 --- a/iokit/conf/files
 +++ b/iokit/conf/files
 @@ -130,4 +130,5 @@
