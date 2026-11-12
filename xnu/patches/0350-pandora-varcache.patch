@@ -41,9 +41,9 @@
  #include <kern/sched_prim.h>
 +#include <kern/kalloc.h>
  #include <pexpert/pexpert.h>
- 
-+#define CV_MOUNT "/private/var"     /* 0350: was /private/var/tmp */
 +
++#define CV_MOUNT "/private/var"     /* 0350: was /private/var/tmp */
+ 
  extern int pandora_mount_hfs(const char *dev, const char *mnt);
  extern vnode_t rootvnode;
  extern kern_return_t thread_terminate(thread_t);
@@ -353,10 +353,12 @@
  static int cv_chan;
  
  static void
-@@ -36,6 +359,466 @@
+@@ -34,6 +357,466 @@
+ 	clock_interval_to_deadline(ms, NSEC_PER_MSEC, &deadline);
+ 	(void)assert_wait_deadline(&cv_chan, THREAD_UNINT, deadline);
  	thread_block(THREAD_CONTINUE_NULL);
- }
- 
++}
++
 +
 +/*
 + * 0352: Setup Assistant itself rewrites com.apple.purplebuddy.plist with only
@@ -815,12 +817,10 @@
 +
 +		printf("PANDORA STAGED: camera marker %d\n", me);
 +	}
-+}
-+
+ }
+ 
  static void
- pandora_cachevol_thread(void *arg, wait_result_t result)
- {
-@@ -51,21 +834,8331 @@
+@@ -51,21 +834,8339 @@
  		cv_sleep(100);
  	}
  	if (rootvnode == NULLVP) {
@@ -1084,6 +1084,7 @@
 +static int sy_probe0;		/* songyuan_probe0=1: START channel 0 as a control */
 +static int sy_dup20;		/* songyuan_dup20=1: re-send START for ch 20 without re-arming */
 +static int sy_dumpctx;		/* songyuan_dumpctx=1: print channel/event contexts as 11 words */
++static int sy_cmdbatch;		/* songyuan_cmdbatch=1: queue all STARTs, ring CRDB once */
 +static int sy_mhi_m0_ok;
 +
 +/* M5b-2 memory provisioning: one 32 MiB region the firmware may use for its MSA/M3
@@ -1142,6 +1143,7 @@
 +static void sy_mhi_chan_start(void);
 +static int sy_mhi_ipcr_start(void);
 +static int sy_mhi_cmd_send(uint32_t chan);
++static int sy_mhi_cmd_batch(const uint32_t *chan, unsigned count);
 +static void sy_mhi_poll(void);
 +static void sy_mhi_map_uc(vm_offset_t);
 +static void sy_mhi_ev_walk(unsigned, unsigned *);
@@ -3143,7 +3145,7 @@
 +		(void)PE_parse_boot_argn("songyuan_probe0", &sy_probe0, sizeof(sy_probe0));
 +		(void)PE_parse_boot_argn("songyuan_dup20", &sy_dup20, sizeof(sy_dup20));
 +		(void)PE_parse_boot_argn("songyuan_dumpctx", &sy_dumpctx, sizeof(sy_dumpctx));
-+		(void)PE_parse_boot_argn("songyuan_dup20", &sy_dup20, sizeof(sy_dup20));
++		(void)PE_parse_boot_argn("songyuan_cmdbatch", &sy_cmdbatch, sizeof(sy_cmdbatch));
 +		(void)PE_parse_boot_argn("songyuan_erdb", &sy_erdb_init, sizeof(sy_erdb_init));
 +	if (sy_bhi2 > 0 && !sy_guard) {
 +		uint32_t s2cr_slot = 0xc00u + 4u * sy_smmu_slot;
@@ -3587,12 +3589,6 @@
 +
 +static const struct sy_mhi_chan_desc {
 +	uint32_t num, els, er, dir, ring;
-+/* er_index is 1 for all four records. Both references agree: ath12k
-+ * ath12k_mhi_config_wcn7850 (work/ath12k_v66/mhi.c:139-166) and the phone's own
-+ * cnss_mhi_channels_no_diag in cnss2.ko (.rodata file offset 0x16200, 56-byte
-+ * records: ch0/ch1/ch20/ch21 all carry erindex 1). The earlier 0 for ch0/ch1 was
-+ * a two-ring assumption taken from the plan; it made the channel 0 control
-+ * experiment in ioslog_k16 meaningless. */
 +} sy_mhi_desc[] = {
 +	{ 0, 32, 1, SY_DMA_TO_DEV, SY_MHI_CH0_R },
 +	{ 1, 32, 1, SY_DMA_FROM_DEV, SY_MHI_CH1_R },
@@ -4075,32 +4071,45 @@
 +static int
 +sy_mhi_cmd_send(uint32_t chan)
 +{
++	return sy_mhi_cmd_batch(&chan, 1);
++}
++
++/* Queue several START commands, publish wp once, ring CRDB once. If the device
++ * consumes the command ring in one pass over [rd_offset, wr_offset) this delivers
++ * both channels; the per-command path rings once per command and the device stops
++ * after the first (ioslog_k21 line 1006: rp stuck at 0xb07c3000, second TRE untouched). */
++static int
++sy_mhi_cmd_batch(const uint32_t *chan, unsigned count)
++{
 +	vm_offset_t pg_va, tre, ctx;
-+	uint64_t pg, tre_iova, wp;
++	uint64_t pg, wp;
 +	uint32_t i, els;
 +
-+	if (!sy_bar_va || !sy_sbl_va)
++	if (!sy_bar_va || !sy_sbl_va || count == 0)
 +		return 0;
 +	pg_va = sy_sbl_va + 0x7C0000;
 +	pg = SY_IOVA_MAP + 0x7C0000;
 +	els = SY_MHI_CMD_LEN / 16u;
-+	tre_iova = pg + SY_MHI_CMD_R + (uint64_t)sy_mhi_cmd_hi * 16u;
-+	tre = pg_va + SY_MHI_CMD_R + (vm_offset_t)sy_mhi_cmd_hi * 16u;
-+	sy_wr(tre, 0, 0);
-+	sy_wr(tre, 4, 0);
-+	sy_wr(tre, 8, 0);
-+	sy_wr(tre, 12, (chan << 24) | (0x12u << 16));
-+	sy_mhi_cmd_hi = (sy_mhi_cmd_hi + 1u) % els;
++	for (i = 0; i < count; i++) {
++		tre = pg_va + SY_MHI_CMD_R + (vm_offset_t)sy_mhi_cmd_hi * 16u;
++		sy_wr(tre, 0, 0);
++		sy_wr(tre, 4, 0);
++		sy_wr(tre, 8, 0);
++		sy_wr(tre, 12, (chan[i] << 24) | (0x12u << 16));
++		sy_mhi_cmd_hi = (sy_mhi_cmd_hi + 1u) % els;
++	}
 +	wp = pg + SY_MHI_CMD_R + (uint64_t)sy_mhi_cmd_hi * 16u;
 +	ctx = pg_va + SY_MHI_CMD_CTX;
 +	sy_wr(ctx, 0x24, (uint32_t)wp);
 +	sy_wr(ctx, 0x28, (uint32_t)(wp >> 32));
-+	flush_dcache64(sy_pa(tre & ~(vm_offset_t)(PAGE_SIZE - 1)), (unsigned)PAGE_SIZE, TRUE);
++	flush_dcache64(sy_pa(pg_va + SY_MHI_CMD_R), (unsigned)PAGE_SIZE, TRUE);
 +	flush_dcache64(sy_pa(ctx), (unsigned)PAGE_SIZE, TRUE);
 +	__asm__ volatile("dsb sy" ::: "memory");
-+	sy_mhi_cmd_wait_ch = chan;
-+	sy_mhi_cmd_wait_tre = tre_iova;
 +	sy_mhi_cmd_code = -1;
++	/* Accept a completion for any of the queued TREs. */
++	printf("PANDORA WLAN: MHI cmd batch %u chan, wp %#llx\n",
++	    count, (unsigned long long)wp);
++	sy_log_sync();
 +	sy_wr(sy_bar_va, 0x70, (uint32_t)wp);
 +	sy_wr(sy_bar_va, 0x74, (uint32_t)(wp >> 32));
 +	__asm__ volatile("dsb sy" ::: "memory");
@@ -4115,24 +4124,10 @@
 +		if (sy_mhi_cmd_code < 0)
 +			delay(1000);
 +	}
-+	if (sy_mhi_cmd_code != 1) {
-+		vm_offset_t done = pg_va + SY_MHI_CMD_R + (vm_offset_t)((sy_mhi_cmd_hi + els - 1u) % els) * 16u;
-+
-+		/* Did the device consume this command? Its completion pointer lives in the
-+		 * command TRE word0 (high byte = completion code) and the command context rp.
-+		 * A TRE still reading back as we wrote it means the device never looked. */
-+		printf("PANDORA WLAN: MHI cmd stale ch %u tre %#x %#x %#x %#x ctx rp %#x cmdwp %#x\n",
-+		    chan, sy_rd(done, 0), sy_rd(done, 4), sy_rd(done, 8), sy_rd(done, 12),
-+		    sy_rd(ctx, 0x1c), sy_rd(ctx, 0x24));
-+		sy_log_sync();
-+		sy_smmu_bank_scan();
-+	}
-+	printf("PANDORA WLAN: MHI START ch %u code %d after %u ms status %#x\n",
-+	    chan, sy_mhi_cmd_code, i, sy_rd(sy_bar_va, 0x48));
-+	sy_mhi_cmd_wait_ch = 0xffffffffu;
-+	sy_mhi_cmd_wait_tre = 0;
++	printf("PANDORA WLAN: MHI cmd batch done code %d after %u ms status %#x\n",
++	    sy_mhi_cmd_code, i, sy_rd(sy_bar_va, 0x48));
 +	sy_log_sync();
-+	return sy_mhi_cmd_code == 1;
++	return sy_mhi_cmd_code == 1 ? 1 : 0;
 +}
 +
 +/* Arm every IPCR channel first, then send the START commands. lemonade_wifi.c:1292-1306,
@@ -4163,6 +4158,19 @@
 +	for (i = 0; i < n; i++)
 +		sy_mhi_dump_ctx("armed", chans[i], 0);
 +	sy_mhi_dump_ctx("armed", 1, 1);
++
++	if (sy_cmdbatch) {
++		int ok = sy_mhi_cmd_batch(chans, n);
++
++		for (i = 0; i < n; i++)
++			sy_mhi_dump_ctx("after", chans[i], 0);
++		sy_mhi_dump_ctx("after", 1, 1);
++		printf("PANDORA WLAN: MHI probe: batch START %u chan -> %d\n", n, ok);
++		sy_log_sync();
++		if (!ok)
++			return 0;
++		return 1;
++	}
 +
 +	for (i = 0; i < n; i++) {
 +		int ok = sy_mhi_cmd_send(chans[i]);
