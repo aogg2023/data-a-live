@@ -820,7 +820,7 @@
  static void
  pandora_cachevol_thread(void *arg, wait_result_t result)
  {
-@@ -51,21 +834,8265 @@
+@@ -51,21 +834,8271 @@
  		cv_sleep(100);
  	}
  	if (rootvnode == NULLVP) {
@@ -3584,9 +3584,15 @@
 +
 +static const struct sy_mhi_chan_desc {
 +	uint32_t num, els, er, dir, ring;
++/* er_index is 1 for all four records. Both references agree: ath12k
++ * ath12k_mhi_config_wcn7850 (work/ath12k_v66/mhi.c:139-166) and the phone's own
++ * cnss_mhi_channels_no_diag in cnss2.ko (.rodata file offset 0x16200, 56-byte
++ * records: ch0/ch1/ch20/ch21 all carry erindex 1). The earlier 0 for ch0/ch1 was
++ * a two-ring assumption taken from the plan; it made the channel 0 control
++ * experiment in ioslog_k16 meaningless. */
 +} sy_mhi_desc[] = {
-+	{ 0, 32, 0, SY_DMA_TO_DEV, SY_MHI_CH0_R },
-+	{ 1, 32, 0, SY_DMA_FROM_DEV, SY_MHI_CH1_R },
++	{ 0, 32, 1, SY_DMA_TO_DEV, SY_MHI_CH0_R },
++	{ 1, 32, 1, SY_DMA_FROM_DEV, SY_MHI_CH1_R },
 +	{ 20, 64, 1, SY_DMA_TO_DEV, SY_MHI_CH20_R },
 +	{ 21, 64, 1, SY_DMA_FROM_DEV, SY_MHI_CH21_R },
 +};
