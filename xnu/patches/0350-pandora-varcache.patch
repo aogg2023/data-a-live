@@ -3694,7 +3694,7 @@
 +	sy_wr(sy_bar_va, 0xa0, 0xffffffffu);
 +	cfg = sy_rd(sy_bar_va, 0x10);
 +	cfg &= ~((0xffu << 16) | (0xffu << 24));
-+	cfg |= (2u << 16);			/* NER = 2, NHWER = 0 */
++	cfg |= (4u << 16);			/* NER = 4, NHWER = 0 */
 +	sy_wr(sy_bar_va, 0x10, cfg);
 +	/* Linux pm.c:239-251 and sheng WifiProbe.cpp:460-478 publish
 +	 * wp = base+len-16 and ring ERDB with that address before M0.
