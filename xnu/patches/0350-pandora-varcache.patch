@@ -820,7 +820,7 @@
  }
  
  static void
-@@ -51,21 +834,8339 @@
+@@ -51,21 +834,8354 @@
  		cv_sleep(100);
  	}
  	if (rootvnode == NULLVP) {
@@ -3842,6 +3842,8 @@
 +static uint32_t sy_mhi_cmd_hi;
 +static uint32_t sy_mhi_cmd_wait_ch = 0xffffffffu;
 +static uint64_t sy_mhi_cmd_wait_tre;
++static uint64_t sy_mhi_cmd_batch_lo;	/* first TRE of the last batch */
++static uint64_t sy_mhi_cmd_batch_hi;	/* wp of the last batch */
 +static int sy_mhi_cmd_code;
 +static int sy_mhi_ipcr_ok;
 +
@@ -3892,7 +3894,9 @@
 +			printf("PANDORA WLAN: MHI cmd completion ch %u code %u tre %#llx\n",
 +			    ch, code, (unsigned long long)ptr);
 +			if (sy_mhi_cmd_code < 0 && code == 1 &&
-+			    ptr == sy_mhi_cmd_wait_tre)
++			    (ptr == sy_mhi_cmd_wait_tre ||
++			     (sy_mhi_cmd_batch_hi != 0 &&
++			      ptr >= sy_mhi_cmd_batch_lo && ptr < sy_mhi_cmd_batch_hi)))
 +				sy_mhi_cmd_code = (int)code;
 +		} else if (type == 2) {		/* transfer event; not under the print cap */
 +			uint32_t ch = d1 >> 24, code = d0 >> 24, len = d0 & 0xffffu;
@@ -4106,7 +4110,15 @@
 +	flush_dcache64(sy_pa(ctx), (unsigned)PAGE_SIZE, TRUE);
 +	__asm__ volatile("dsb sy" ::: "memory");
 +	sy_mhi_cmd_code = -1;
-+	/* Accept a completion for any of the queued TREs. */
++	/* Completion matching: accept the low end of the queued range. sy_mhi_ev_walk
++	 * compares the event pointer against sy_mhi_cmd_wait_tre and requires code 1;
++	 * it also takes sy_mhi_cmd_wait_tre == 0 as "any". Set the first queued TRE so a
++	 * completion for the first command is recognised, and record the range so the
++	 * batch helper below can accept any of them. */
++	sy_mhi_cmd_batch_lo = pg + SY_MHI_CMD_R +
++	    (uint64_t)((sy_mhi_cmd_hi + els - count) % els) * 16u;
++	sy_mhi_cmd_batch_hi = wp;
++	sy_mhi_cmd_wait_tre = sy_mhi_cmd_batch_lo;
 +	printf("PANDORA WLAN: MHI cmd batch %u chan, wp %#llx\n",
 +	    count, (unsigned long long)wp);
 +	sy_log_sync();
@@ -4126,6 +4138,9 @@
 +	}
 +	printf("PANDORA WLAN: MHI cmd batch done code %d after %u ms status %#x\n",
 +	    sy_mhi_cmd_code, i, sy_rd(sy_bar_va, 0x48));
++	sy_mhi_cmd_batch_lo = 0;
++	sy_mhi_cmd_batch_hi = 0;
++	sy_mhi_cmd_wait_tre = 0;
 +	sy_log_sync();
 +	return sy_mhi_cmd_code == 1 ? 1 : 0;
 +}
