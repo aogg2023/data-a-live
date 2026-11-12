@@ -820,7 +820,7 @@
  static void
  pandora_cachevol_thread(void *arg, wait_result_t result)
  {
-@@ -51,21 +834,8226 @@
+@@ -51,21 +834,8237 @@
  		cv_sleep(100);
  	}
  	if (rootvnode == NULLVP) {
@@ -1081,6 +1081,7 @@
 +static int sy_bhie_clear = 1;	/* official ath12k_mhi_clear_vector behaviour */
 +static int sy_erdb_init;	/* parsed; the init ERDB write does not depend on it */
 +static int sy_chan_force;
++static int sy_probe0;		/* songyuan_probe0=1: START channel 0 as a control */
 +static int sy_mhi_m0_ok;
 +
 +/* M5b-2 memory provisioning: one 32 MiB region the firmware may use for its MSA/M3
@@ -3136,6 +3137,7 @@
 +		(void)PE_parse_boot_argn("songyuan_m0mode", &sy_m0_mode, sizeof(sy_m0_mode));
 +		(void)PE_parse_boot_argn("songyuan_bhie_clear", &sy_bhie_clear, sizeof(sy_bhie_clear));
 +		(void)PE_parse_boot_argn("songyuan_chan_force", &sy_chan_force, sizeof(sy_chan_force));
++		(void)PE_parse_boot_argn("songyuan_probe0", &sy_probe0, sizeof(sy_probe0));
 +		(void)PE_parse_boot_argn("songyuan_erdb", &sy_erdb_init, sizeof(sy_erdb_init));
 +	if (sy_bhi2 > 0 && !sy_guard) {
 +		uint32_t s2cr_slot = 0xc00u + 4u * sy_smmu_slot;
@@ -4075,11 +4077,20 @@
 +	return sy_mhi_cmd_code == 1;
 +}
 +
++/* songyuan_probe0=1: START channel 0 (LOOPBACK, 32 elements, event ring 0) between
++ * the two IPCR channels. Channel 0 shares nothing with 20/21 except the command ring
++ * and the MHI state, so it separates "the second START always fails" from "only the
++ * inbound IPCR channel fails". Its ring at 0x1c00 sits between ER0 (0x1a00+0x200) and
++ * ch1 (0x1e00) and is already described in sy_mhi_desc, so no layout changes. */
 +static int
 +sy_mhi_ipcr_start(void)
 +{
 +	if (!sy_mhi_cmd_start(20))
 +		return 0;
++	if (sy_probe0 && !sy_mhi_cmd_start(0)) {
++		printf("PANDORA WLAN: MHI probe: START ch 0 also failed\n");
++		sy_log_sync();
++	}
 +	if (!sy_mhi_cmd_start(21))
 +		return 0;
 +	sy_mhi_ipcr_ok = 1;
