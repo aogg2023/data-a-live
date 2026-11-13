@@ -4023,7 +4023,7 @@
 +			     (sy_mhi_cmd_batch_hi != 0 &&
 +			      ptr >= sy_mhi_cmd_batch_lo && ptr < sy_mhi_cmd_batch_hi)))
 +				sy_mhi_cmd_code = (int)code;
-+		} else if (type == 2) {		/* transfer event; not under the print cap */
++		} else if (type == 2 || type == 0x22) {	/* 0x22 is TX event completion, common.h:217 */
 +			uint32_t ch = d1 >> 24, code = d0 >> 24, len = d0 & 0xffffu;
 +			uint64_t repost = 0;
 +			uint32_t repost_ring = 0, repost_els = 0;
