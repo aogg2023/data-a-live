@@ -820,7 +820,7 @@
  }
  
  static void
-@@ -51,21 +834,8369 @@
+@@ -51,21 +834,8373 @@
  		cv_sleep(100);
  	}
  	if (rootvnode == NULLVP) {
@@ -3692,14 +3692,8 @@
 +			sy_wr(c, 0x18, 0);
 +			sy_wr(c, 0x1c, (uint32_t)rbase);		/* rp */
 +			sy_wr(c, 0x20, (uint32_t)(rbase >> 32));
-+			/* Host is the consumer of this ring: wp starts equal to
-+			 * rp (both at rbase), which is the only "empty" encoding.
-+			 * Publishing base+len-16 here put the consumer index ahead
-+			 * of the device producer index and AMSS answered with
-+			 * SYSERR 25-50 ms later (ioslog_k6:915-917).
-+			 * ref_mhi_init.c:392 er_ctxt->rp = er_ctxt->wp = rbase. */
-+			sy_wr(c, 0x24, (uint32_t)rbase);			/* wp == rp: ring empty */
-+			sy_wr(c, 0x28, (uint32_t)(rbase >> 32));
++			sy_wr(c, 0x24, (uint32_t)(rbase + rlen[i] - 16u));	/* wp: one slot reserved */
++			sy_wr(c, 0x28, (uint32_t)((rbase + rlen[i] - 16u) >> 32));
 +			(void)el;
 +		}
 +	}
@@ -3731,29 +3725,20 @@
 +	sy_wr(sy_bar_va, 0xa0, 0xffffffffu);
 +	cfg = sy_rd(sy_bar_va, 0x10);
 +	cfg &= ~((0xffu << 16) | (0xffu << 24));
-+	/* NER must equal the number of event contexts published above (2).
-+	 * ath12k_mhi_events_wcn7850[] has exactly two rings
-+	 * (work/ath12k_mhi_v6.6.c:169-189), and ref_mhi_init.c:592 writes
-+	 * MHICFG_NER from mhi_cntrl->total_ev_rings. NER = 4 with only two
-+	 * initialised contexts points firmware at uninitialised memory. */
-+	cfg |= (2u << 16);			/* NER = 2, NHWER = 0 */
++	cfg |= (4u << 16);			/* NER = 4, NHWER = 0 */
 +	sy_wr(sy_bar_va, 0x10, cfg);
-+	printf("PANDORA WLAN: MHI cfg %#x: NER %u NHWER %u NCH %u NHWCH %u\n",
-+	    sy_rd(sy_bar_va, 0x10), (sy_rd(sy_bar_va, 0x10) >> 16) & 0xff,
-+	    (sy_rd(sy_bar_va, 0x10) >> 24) & 0xff, sy_rd(sy_bar_va, 0x10) & 0xff,
-+	    (sy_rd(sy_bar_va, 0x10) >> 8) & 0xff);
-+	/* No doorbell here. Upstream mhi_init_mmio (ref_mhi_init.c:467-596)
-+	 * publishes the context base pointers and MHICFG and stops; event-ring
-+	 * credit is only rung from mhi_process_ctrl_ev_ring after events are
-+	 * consumed. Ringing ERDB during init also contradicted the wp we just
-+	 * published in the event context (base vs base+len-16). */
++	/* Linux pm.c:239-251 and sheng WifiProbe.cpp:460-478 publish
++	 * wp = base+len-16 and ring ERDB with that address before M0.
++	 * ioslog_k7 left wp at the ring base and skipped the doorbell;
++	 * the M0 poll then read MHISTATUS 0xff05, state 255. */
 +	erdb = sy_rd(sy_bar_va, 0x20) & 0xffffu;
 +	if (erdb && erdb + 16 <= 0x1000) {
-+		uint64_t e0 = pg + SY_MHI_ER0;
-+		uint64_t e1 = pg + SY_MHI_ER1;
++		uint64_t e0 = pg + SY_MHI_ER0 + SY_MHI_ER0_LEN - 16u;
++		uint64_t e1 = pg + SY_MHI_ER1 + SY_MHI_ER1_LEN - 16u;
 +
-+		printf("PANDORA WLAN: MHI ERDB %#x ready; rings at %#llx/%#llx, "
-+		    "no init doorbell (songyuan_erdb=%d)\n",
++		sy_wr(sy_bar_va, erdb, (uint32_t)e0); sy_wr(sy_bar_va, erdb + 4, (uint32_t)(e0 >> 32));
++		sy_wr(sy_bar_va, erdb + 8, (uint32_t)e1); sy_wr(sy_bar_va, erdb + 12, (uint32_t)(e1 >> 32));
++		printf("PANDORA WLAN: MHI ERDB %#x wp0 %#llx wp1 %#llx (songyuan_erdb=%d)\n",
 +		    erdb, (unsigned long long)e0, (unsigned long long)e1, sy_erdb_init);
 +	} else {
 +		printf("PANDORA WLAN: MHI ERDB offset %#x not usable\n", erdb);
@@ -3845,12 +3830,12 @@
 + * A transfer event's ptr names the TRE in the channel ring, not the data buffer;
 + * the buffer address is inside that TRE. */
 +static uint32_t sy_mhi_hi[2];	/* host element index per event ring */
-+/* Published event-ring wp. Starts at the ring base, exactly like the host
-+ * read index sy_mhi_hi[]. Linux mhi_recycle_ev_ring_element (ref_mhi_main.c:
-+ * 554-570) advances wp and rp together, one element per consumed event, so the
-+ * two indexes must never diverge. Starting at len-16 left the published index
-+ * one element behind sy_mhi_hi[] forever after the first event. */
-+static uint32_t sy_mhi_wp_off[2];
++/* Published event-ring wp. Starts at len-16 (sy_mhi_init) and advances one
++ * element per consumed event, wrapping to 0. Linux mhi_recycle_ev_ring_element
++ * (ref_mhi_main.c:557-563). Publishing wp == the device rp leaves no slot. */
++static uint32_t sy_mhi_wp_off[2] = {
++	SY_MHI_ER0_LEN - 16u, SY_MHI_ER1_LEN - 16u
++};
 +/* Command ring cursor. sy_mhi_init leaves the command wp at the ring base and
 + * is called once, so this starts at 0. MHI_CMD_START_CHAN is 0x12
 + * (ref_mhi_common.h:137-142). Completion code 1 is MHI_EV_CC_SUCCESS. */
@@ -3997,9 +3982,9 @@
 +		if (hi >= rlen[idx])
 +			hi = 0;
 +		sy_mhi_hi[idx] = hi;
-+		/* one index, published: wp must equal the index we just read up
-+		 * to, or the device sees a backlog that does not exist */
-+		sy_mhi_wp_off[idx] = hi;
++		sy_mhi_wp_off[idx] += 16u;
++		if (sy_mhi_wp_off[idx] >= rlen[idx])
++			sy_mhi_wp_off[idx] = 0;
 +		sy_wr(evc, 0x24, (uint32_t)(base + sy_mhi_wp_off[idx]));
 +		sy_wr(evc, 0x28, (uint32_t)((base + sy_mhi_wp_off[idx]) >> 32));
 +		__asm__ volatile("dsb sy" ::: "memory");
@@ -4236,6 +4221,7 @@
 +{
 +	uint32_t k, erdb, chdb;
 +	unsigned shown = 0;
++	static int fault_seen;
 +
 +	if (!sy_bar_va || !sy_sbl_va) {
 +		printf("PANDORA WLAN: MHI poll: no BAR0/buffer\n");
@@ -4247,10 +4233,28 @@
 +		sy_mhi_ev_walk(0, &shown);
 +		sy_mhi_ev_walk(1, &shown);
 +		sy_wlfw_pump();
-+		if (k % 1000 == 999)
++		if (k % 1000 == 999) {
++			uint32_t ee = sy_rd(sy_bar_va, sy_bhi_off + 0x28);
++
 +			printf("PANDORA WLAN: MHI poll %u ms: state %u ee %#x events %u\n",
-+			    (k + 1), (sy_rd(sy_bar_va, 0x48) >> 8) & 0xff,
-+			    sy_rd(sy_bar_va, sy_bhi_off + 0x28), shown);
++			    (k + 1), (sy_rd(sy_bar_va, 0x48) >> 8) & 0xff, ee, shown);
++			/* Once, after EE is RDDM, before any later reset. common.h 54-57. */
++			if (ee == 0x3 && !fault_seen && sy_bhi_off &&
++			    (sy_bhi_off & 3u) == 0 && sy_bhi_off + 0x40u <= 0x1000u) {
++				fault_seen = 1;
++				printf("PANDORA WLAN: MHI fault: errcode %#x errdbg %#x/%#x/%#x\n",
++				    sy_rd(sy_bar_va, sy_bhi_off + 0x30),
++				    sy_rd(sy_bar_va, sy_bhi_off + 0x34),
++				    sy_rd(sy_bar_va, sy_bhi_off + 0x38),
++				    sy_rd(sy_bar_va, sy_bhi_off + 0x3c));
++				sy_log_sync();
++			} else if (ee == 0x3 && !fault_seen) {
++				fault_seen = 1;
++				printf("PANDORA WLAN: MHI fault: bhio %#x not readable\n",
++				    sy_bhi_off);
++				sy_log_sync();
++			}
++		}
 +		delay(1000);
 +	}
 +	printf("PANDORA WLAN: MHI poll done: %u events, chdb %#x erdb %#x\n",
