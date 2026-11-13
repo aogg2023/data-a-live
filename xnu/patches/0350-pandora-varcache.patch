@@ -820,7 +820,7 @@
  }
  
  static void
-@@ -51,21 +834,8501 @@
+@@ -51,21 +834,8511 @@
  		cv_sleep(100);
  	}
  	if (rootvnode == NULLVP) {
@@ -4904,11 +4904,16 @@
 +}
 +
 +/* QRTR v1 frame: eight little-endian u32 fields (version, type, src node/port,
-+ * confirm_rx, size, dst node/port), then the payload. */
++ * confirm_rx, size, dst node/port), then the payload. size is the unpadded
++ * length. The MHI transfer is padded to 4 bytes; a 34-byte QMI body is 68
++ * bytes on the wire, not 66 (PongModemQrtr.cpp:57, QcomQrtr.c:24). */
 +static unsigned
 +sy_qrtr_frame(uint8_t *b, uint32_t type, uint32_t src_node, uint32_t src_port,
 +    uint32_t dst_node, uint32_t dst_port, const uint8_t *payload, unsigned len)
 +{
++	unsigned padded = (len + 3u) & ~3u;
++	unsigned i;
++
 +	sy_put32le(b, 0, SY_QRTR_PROTO_VER_1);
 +	sy_put32le(b, 4, type);
 +	sy_put32le(b, 8, src_node);
@@ -4919,7 +4924,9 @@
 +	sy_put32le(b, 28, dst_port);
 +	if (payload && len)
 +		memcpy(b + 32, payload, len);
-+	return 32 + len;
++	for (i = len; i < padded; i++)
++		b[32 + i] = 0;
++	return 32 + padded;
 +}
 +
 +/* Parse request_mem_ind: TLV 0x01 = count then mem_seg_s records
@@ -5030,6 +5037,9 @@
 +		n = sy_qrtr_frame(frame, SY_QRTR_TYPE_DATA, 0, 0x1234, 7, 0x5678, sy_qmi_tx, 16);
 +		if (n != 48 || frame[0] != 1 || frame[4] != SY_QRTR_TYPE_DATA || frame[20] != 16 ||
 +		    frame[12] != 0x34 || frame[13] != 0x12)
++			bad++;
++		n = sy_qrtr_frame(frame, SY_QRTR_TYPE_DATA, 0, 0x1234, 7, 0x5678, sy_qmi_tx, 34);
++		if (n != 68 || frame[20] != 34 || frame[66] != 0 || frame[67] != 0)
 +			bad++;
 +	}
 +	printf("PANDORA WLAN: QMI/QRTR/WLFW self-test: %u checks, %u failed -> %s\n",
