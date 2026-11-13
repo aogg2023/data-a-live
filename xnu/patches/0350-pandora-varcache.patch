@@ -820,7 +820,7 @@
  }
  
  static void
-@@ -51,21 +834,8646 @@
+@@ -51,21 +834,8642 @@
  		cv_sleep(100);
  	}
  	if (rootvnode == NULLVP) {
@@ -4723,9 +4723,6 @@
 +#define SY_WLFW_MEM_TYPE_BDF 2u
 +#define SY_WLFW_MEM_TYPE_M3 3u
 +#define SY_WLFW_MEM_TYPE_CAL 4u
-+#define SY_WLFW_HOST_CSTATE_BIT 0x04u
-+#define SY_WLFW_SLEEP_CLOCK_INTERNAL_BIT 0x02u
-+#define SY_WLFW_PLATFORM_CAP_GLOBAL_RESET 0x08u
 +#define SY_WLFW_FEATURE_LIST 0x44ull	/* BIT(CNSS_WLAN_EN_SUPPORT)=2 | BIT(CNSS_AUX_UC_SUPPORT)=6 */
 +
 +struct sy_qrtr_hdr {
@@ -4799,17 +4796,16 @@
 +	return at;
 +}
 +
-+/* host_cap: nm_modem still follows ath12k WCN7850 internal_sleep_clock.
-+ * feature_list is peach cnss BIT(2)|BIT(6), not the WCN7850 bitmap 0x18. */
++/* host_cap: no TLV 0x13. cnss qmi.c:409 sends nm_modem only when
++ * qcom,sleep-clk-support is set; canoe-peach-cnss.dtsi does not set it.
++ * feature_list stays peach cnss BIT(2)|BIT(6). */
 +static unsigned
 +sy_wlfw_host_cap(uint8_t *b, uint16_t txn)
 +{
 +	unsigned at = sy_qmi_hdr(b, 0x00, txn, SY_QMI_WLFW_HOST_CAP_REQ);
 +
 +	at = sy_qmi_tlv_u32(b, at, 0x10, 1);			/* num_clients */
-+	at = sy_qmi_tlv_u8(b, at, 0x13,				/* nm_modem */
-+	    SY_WLFW_HOST_CSTATE_BIT | SY_WLFW_SLEEP_CLOCK_INTERNAL_BIT |
-+	    SY_WLFW_PLATFORM_CAP_GLOBAL_RESET);
++	/* TLV 0x13 omitted: 4 bytes, type + u8 0x0E. */
 +	at = sy_qmi_tlv_u8(b, at, 0x14, 1);			/* bdf_support */
 +	at = sy_qmi_tlv_u8(b, at, 0x16, 1);			/* m3_support */
 +	at = sy_qmi_tlv_u8(b, at, 0x17, 1);			/* m3_cache_support */
@@ -5031,11 +5027,11 @@
 +
 +	n = sy_wlfw_host_cap(sy_qmi_tx, 0x1234);
 +	total++;
-+	if (n < 49 || sy_qmi_tx[0] != 0 || sy_qmi_tx[3] != 0x34 || sy_qmi_tx[4] != 0 ||
++	if (n != 45 || sy_qmi_tx[0] != 0 || sy_qmi_tx[3] != 0x34 || sy_qmi_tx[4] != 0 ||
 +	    (sy_qmi_tx[5] | (sy_qmi_tx[6] << 8)) != n - 7 ||
 +	    memcmp(sy_qmi_tx + 7, "\x10\x04\x00\x01\x00\x00", 6) != 0 ||
-+	    sy_qmi_tx[38] != 0x27 || sy_qmi_tx[39] != 8 || sy_qmi_tx[41] != 0x44 ||
-+	    sy_qmi_tx[42] != 0 || sy_qmi_tx[48] != 0)
++	    sy_qmi_tx[34] != 0x27 || sy_qmi_tx[35] != 8 || sy_qmi_tx[37] != 0x44 ||
++	    sy_qmi_tx[38] != 0 || sy_qmi_tx[44] != 0)
 +		bad++;
 +	{
 +		unsigned at = 7;
@@ -5046,7 +5042,7 @@
 +
 +			if (at + 3u + tl > n)
 +				break;
-+			if (sy_qmi_tx[at] == 0x1f)
++			if (sy_qmi_tx[at] == 0x1f || sy_qmi_tx[at] == 0x13)
 +				saw = 1;
 +			at += 3u + tl;
 +		}
@@ -5372,7 +5368,7 @@
 +
 +				sy_wlfw_cap_sent = 1;
 +				at = sy_wlfw_host_cap(sy_wlfw_txbuf, sy_wlfw_txn++);
-+				printf("PANDORA WLAN: WLFW host_cap ddr omitted feature %#x\n",
++				printf("PANDORA WLAN: WLFW host_cap ddr omitted nm omitted feature %#x\n",
 +				    (unsigned)SY_WLFW_FEATURE_LIST);
 +				fl = sy_qrtr_frame(frame, SY_QRTR_TYPE_DATA, 0,
 +				    SY_WLFW_QRTR_PORT, src_node, src_port,
