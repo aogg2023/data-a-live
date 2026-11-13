@@ -820,7 +820,7 @@
  }
  
  static void
-@@ -51,21 +834,8373 @@
+@@ -51,21 +834,8501 @@
  		cv_sleep(100);
  	}
  	if (rootvnode == NULLVP) {
@@ -1112,6 +1112,21 @@
 +#define SY_IOVA_MAP	SY_IOVA_BASE	/* translating SMMU IOVA (BHI/BHIe window) */
 +#define SY_SBL_SIZE	0x80000UL
 +#define SY_FW_BUF	0x00800000UL	/* full amss buffer, reused for BHIe */
++/* RDDM size is qcom,wlan-ramdump-dynamic for cnss-peach (supported-ids 0x110E).
++ * canoe-peach-cnss.dtsi:89 and :106. Segment length is SZ_512K, cnss2 pci.c:8244.
++ * mhi common.h has no BHI_RDDM_BASE. RXVEC offsets are common.h:80-84; completion
++ * is RXVECSTATUS[31:30] == 2 (common.h:100-103). boot.c:40-50 points RXVECADDR at
++ * the vector table, and RXVECSIZE is that table, not the dump. */
++#define SY_RDDM_SIZE	0x780000u
++#define SY_RDDM_SEG	0x80000u
++#define SY_RDDM_NSEGS	(SY_RDDM_SIZE / SY_RDDM_SEG)
++#define SY_RDDM_IOVA	(SY_IOVA_BASE + SY_FW_BUF)
++#define SY_RDDM_VECB	(SY_RDDM_NSEGS * 16u)
++#define SY_RDDM_ALLOC	0x784000u	/* 0x780000 plus one 16 KiB XNU page for the vector */
++#define SY_RDDM_FBLK	2048u	/* ioslog.img block, after the 4 MiB ring and fbdump slot */
++static vm_offset_t sy_rddm_va;
++static int sy_rddm_armed;
++extern int pandora_log_store(uint64_t file_block, const void *src, uint32_t len);
 +extern ppnum_t pmap_find_phys(pmap_t, addr64_t);
 +extern void flush_dcache64(addr64_t addr, unsigned count, int phys);
 +extern bool pandora_log_sync(void);
@@ -2444,6 +2459,33 @@
 +		((uint64_t *)(sy_l3 + ((i >> 9) << 12)))[i & 0x1ff] =
 +		    (pa & 0x0000fffffffff000ull) | 0x0060000000000e43ull;
 +	}
++	/* Same PTE as the firmware window. IOVA starts at 0xB0800000, still inside
++	 * the cnss_pci0 window (0xB0000000, size 0x50000000) and before SY_MEM_IOVA. */
++	sy_rddm_va = 0;
++	if (sy_buf_size == SY_FW_BUF && l3s + 4 <= 16) {
++		kr = kmem_alloc_contig(kernel_map, &sy_rddm_va, SY_RDDM_ALLOC, PAGE_MASK,
++		    0, 0, KMA_DATA | KMA_ZERO | KMA_PERMANENT, VM_KERN_MEMORY_IOKIT);
++		if (kr != KERN_SUCCESS || !sy_rddm_va) {
++			sy_rddm_va = 0;
++			printf("PANDORA WLAN: RDDM: buffer alloc failed %d\n", kr);
++		} else {
++			unsigned r;
++
++			for (r = 0; r < 4; r++)
++				((uint64_t *)sy_l2)[(((SY_IOVA_BASE >> 21) + l3s + r) & 511)] =
++				    sy_pa(sy_l3 + ((vm_offset_t)(l3s + r) << 12)) | 3ull;
++			for (r = 0; r < (SY_RDDM_ALLOC >> 12); r++) {
++				uint32_t idx = (SY_FW_BUF >> 12) + r;
++
++				pa = sy_pa(sy_rddm_va + ((vm_offset_t)r << 12));
++				((uint64_t *)(sy_l3 + ((idx >> 9) << 12)))[idx & 0x1ff] =
++				    (pa & 0x0000fffffffff000ull) | 0x0060000000000e43ull;
++			}
++			printf("PANDORA WLAN: RDDM: iova %#x size %#x vec %#x pages %u\n",
++			    (unsigned)SY_RDDM_IOVA, SY_RDDM_SIZE, SY_RDDM_VECB,
++			    SY_RDDM_ALLOC >> 12);
++		}
++	}
 +	for (i = 0; i < (0x2000u >> 12); i++)
 +		flush_dcache64(sy_pa(sy_l1 + (i << 12)), (unsigned)PAGE_SIZE, TRUE);
 +	for (i = 0; i < (0x10000u >> 12); i++)
@@ -2910,6 +2952,88 @@
 +}
 +
 +static void
++sy_rddm_arm(void)
++{
++	uint64_t *vec;
++	uint32_t i;
++
++	if (!sy_rddm_va || !sy_bar_va || !sy_bhie_off)
++		return;
++	if ((sy_bhie_off & 3u) || sy_bhie_off + 0x7cu > 0x1000u) {
++		printf("PANDORA WLAN: RDDM: bhie %#x not readable\n", sy_bhie_off);
++		return;
++	}
++	vec = (uint64_t *)(sy_rddm_va + SY_RDDM_SIZE);
++	for (i = 0; i < SY_RDDM_NSEGS; i++) {
++		vec[2 * i] = SY_RDDM_IOVA + (uint64_t)i * SY_RDDM_SEG;
++		vec[2 * i + 1] = SY_RDDM_SEG;
++	}
++	for (i = 0; i < (SY_RDDM_ALLOC >> 12); i++)
++		flush_dcache64(sy_pa(sy_rddm_va + ((vm_offset_t)i << 12)),
++		    0x1000u, TRUE);
++	__asm__ volatile("dsb sy" ::: "memory");
++	/* init.c:1214 clears RXVECADDR through RXVECSTATUS; POR values are undefined.
++	 * This range does not include the TX registers at 0x2c..0x44. */
++	for (i = 0x60; i <= 0x78; i += 4)
++		sy_wr(sy_bar_va, sy_bhie_off + i, 0);
++	sy_wr(sy_bar_va, sy_bhie_off + 0x60, (uint32_t)(SY_RDDM_IOVA + SY_RDDM_SIZE));
++	sy_wr(sy_bar_va, sy_bhie_off + 0x64, 0);
++	sy_wr(sy_bar_va, sy_bhie_off + 0x68, SY_RDDM_VECB);
++	sy_wr(sy_bar_va, sy_bhie_off + 0x70, 0x2345u);
++	__asm__ volatile("dsb sy" ::: "memory");
++	sy_rddm_armed = 1;
++	printf("PANDORA WLAN: RDDM armed: rxvec %#x/%#x size %#x db %#x\n",
++	    sy_rd(sy_bar_va, sy_bhie_off + 0x60),
++	    sy_rd(sy_bar_va, sy_bhie_off + 0x64),
++	    sy_rd(sy_bar_va, sy_bhie_off + 0x68),
++	    sy_rd(sy_bar_va, sy_bhie_off + 0x70));
++	sy_log_sync();
++}
++
++static void
++sy_rddm_collect(void)
++{
++	uint32_t st = 0, w, sum, words, hit;
++	uint32_t *p;
++	int rc;
++
++	if (!sy_rddm_armed || !sy_rddm_va)
++		return;
++	sy_rddm_armed = 0;
++	for (w = 0; w < 2000; w++) {
++		st = sy_rd(sy_bar_va, sy_bhie_off + 0x78);
++		if ((st >> 30) == 2 || (st >> 30) == 3)
++			break;
++		delay(1000);
++	}
++	printf("PANDORA WLAN: RDDM status %#x code %u seq %#x after %u ms\n",
++	    st, st >> 30, st & 0x3fffffffu, w);
++	if ((st >> 30) != 2) {
++		sy_log_sync();
++		return;
++	}
++	for (w = 0; w < (SY_RDDM_SIZE >> 12); w++)
++		flush_dcache64(sy_pa(sy_rddm_va + ((vm_offset_t)w << 12)),
++		    0x1000u, TRUE);
++	__asm__ volatile("dsb sy" ::: "memory");
++	p = (uint32_t *)sy_rddm_va;
++	words = SY_RDDM_SIZE / 4u;
++	sum = 0;
++	hit = 0xffffffffu;
++	for (w = 0; w < words; w++) {
++		sum += p[w];
++		if (hit == 0xffffffffu && p[w] == 0x3086u)
++			hit = w * 4u;
++	}
++	printf("PANDORA WLAN: RDDM image: %u bytes sum %#x head %#x %#x %#x %#x hit3086 %#x\n",
++	    SY_RDDM_SIZE, sum, p[0], p[1], p[2], p[3], hit);
++	rc = pandora_log_store(SY_RDDM_FBLK, (const void *)sy_rddm_va, SY_RDDM_SIZE);
++	printf("PANDORA WLAN: RDDM stored: block %u len %#x rc %d\n",
++	    SY_RDDM_FBLK, SY_RDDM_SIZE, rc);
++	sy_log_sync();
++}
++
++static void
 +sy_bhi_sbl(void)
 +{
 +	uint32_t bhio, cmd, hi, lo, size, ivec, st, ee;
@@ -2928,6 +3052,7 @@
 +	sy_bhie_off = sy_rd(sy_bar_va, 0x2c);
 +	if (sy_bhie_off < 0x40 || sy_bhie_off > 0x3fc0 || (sy_bhie_off & 3))
 +		sy_bhie_off = 0;
++	sy_rddm_arm();
 +	if (bhio < 0x40 || bhio > 0x3fc0 || (bhio & 3)) {
 +		printf("PANDORA WLAN: BHI: bad BHIOFF %#x\n", bhio);
 +		return;
@@ -4232,7 +4357,9 @@
 +	for (k = 0; k < 5000; k++) {
 +		sy_mhi_ev_walk(0, &shown);
 +		sy_mhi_ev_walk(1, &shown);
-+		sy_wlfw_pump();
++		/* After SYSERR the device is in RDDM. Do not post another transfer. */
++		if ((((sy_rd(sy_bar_va, 0x48) >> 8) & 0xffu) != 255u))
++			sy_wlfw_pump();
 +		if (k % 1000 == 999) {
 +			uint32_t ee = sy_rd(sy_bar_va, sy_bhi_off + 0x28);
 +
@@ -4248,6 +4375,7 @@
 +				    sy_rd(sy_bar_va, sy_bhi_off + 0x38),
 +				    sy_rd(sy_bar_va, sy_bhi_off + 0x3c));
 +				sy_log_sync();
++				sy_rddm_collect();
 +			} else if (ee == 0x3 && !fault_seen) {
 +				fault_seen = 1;
 +				printf("PANDORA WLAN: MHI fault: bhio %#x not readable\n",

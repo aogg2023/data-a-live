@@ -1,0 +1,53 @@
+diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -2318,6 +2318,49 @@ pandora_part_pread(uint64_t off, void *dst, uint64_t len)
+ 	su.lun = 0;
+ 	lck_mtx_unlock(&sweet_ufs_lock);
+ 	return error;
+ }
++
++/*
++ * Write len bytes at a file-block of the pinned log (ioslog.img, 4096 blocks).
++ * Blocks 0..2047 are the console header, the 4 MiB ring and the framebuffer slot
++ * (0159 PFD_FIRST_BLOCK). Callers pass 2048 or later. pl_map/fx_write_allowed
++ * already confine the write to that file.
++ */
++int pandora_log_store(uint64_t file_block, const void *src, uint32_t len);
++int
++pandora_log_store(uint64_t file_block, const void *src, uint32_t len)
++{
++	const uint8_t *in = src;
++	uint32_t blocks, done = 0;
++	int error = 0;
++
++	if (!pl_ready || !src || len == 0 || file_block < 2048)
++		return EINVAL;
++	blocks = (len + UFS_BLOCK - 1) / UFS_BLOCK;
++	if (file_block + blocks < file_block || file_block + blocks > pl_blocks)
++		return EINVAL;
++	lck_mtx_lock(&sweet_ufs_lock);
++	while (done < blocks && !error) {
++		uint64_t lba, run;
++		uint32_t n, chunk;
++
++		if (!pl_map(file_block + done, &lba, &run)) {
++			error = EINVAL;
++			break;
++		}
++		n = (uint32_t)MIN(MIN((uint64_t)(blocks - done), run),
++		    (uint64_t)(BOUNCE_SIZE / UFS_BLOCK));
++		chunk = (uint32_t)MIN((uint64_t)n * UFS_BLOCK,
++		    (uint64_t)len - (uint64_t)done * UFS_BLOCK);
++		bzero((void *)(su.dma + DMA_BOUNCE), (size_t)n * UFS_BLOCK);
++		memcpy((void *)(su.dma + DMA_BOUNCE), in + (size_t)done * UFS_BLOCK, chunk);
++		error = ufs_write_blocks(lba, n);
++		done += n;
++	}
++	if (!error)
++		error = ufs_sync_cache();
++	lck_mtx_unlock(&sweet_ufs_lock);
++	return error;
++}
+ #endif /* PANDORA */
+ #endif /* ARM64_BOARD_CONFIG_SWEET */
