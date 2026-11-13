@@ -820,7 +820,7 @@
  }
  
  static void
-@@ -51,21 +834,8613 @@
+@@ -51,21 +834,8648 @@
  		cv_sleep(100);
  	}
  	if (rootvnode == NULLVP) {
@@ -4815,6 +4815,20 @@
 +	at = sy_qmi_tlv_u8(b, at, 0x17, 1);			/* m3_cache_support */
 +	at = sy_qmi_tlv_u8(b, at, 0x1a, 0);			/* cal_done */
 +	at = sy_qmi_tlv_u8(b, at, 0x1c, 0);			/* mem_cfg_mode: default */
++	/* ddr_range TLV 0x1F sits before feature_list in the ei. It is a
++	 * static array of 3 {u64 start, u64 size} (v01.h:131, v01.c:4357).
++	 * cnss qmi.c:429-431 fills entry 0 only; the other two stay zero. */
++	{
++		unsigned i;
++
++		at = sy_qmi_tlv_hdr(b, at, 0x1f, 48);
++		for (i = 0; i < 8; i++)
++			b[at++] = (uint8_t)((uint64_t)SY_MEM_IOVA >> (8 * i));
++		for (i = 0; i < 8; i++)
++			b[at++] = (uint8_t)((uint64_t)SY_MEM_SIZE >> (8 * i));
++		for (i = 0; i < 32; i++)
++			b[at++] = 0;
++	}
 +	at = sy_qmi_tlv_u64(b, at, 0x27, SY_WLFW_FEATURE_LIST);
 +	return sy_qmi_finish(b, at);
 +}
@@ -5023,6 +5037,25 @@
 +	    (sy_qmi_tx[5] | (sy_qmi_tx[6] << 8)) != n - 7 ||
 +	    memcmp(sy_qmi_tx + 7, "\x10\x04\x00\x01\x00\x00", 6) != 0)
 +		bad++;
++	{
++		unsigned at = 7;
++		int saw = 0;
++
++		while (at + 3 <= n) {
++			uint16_t tl = (uint16_t)(sy_qmi_tx[at + 1] | (sy_qmi_tx[at + 2] << 8));
++
++			if (at + 3u + tl > n)
++				break;
++			if (sy_qmi_tx[at] == 0x1f && tl == 48 &&
++			    sy_qmi_tx[at + 6] == 0xb1 && sy_qmi_tx[at + 14] == 0x02 &&
++			    sy_qmi_tx[at + 19] == 0 && sy_qmi_tx[at + 50] == 0)
++				saw = 1;
++			at += 3u + tl;
++		}
++		total++;
++		if (!saw)
++			bad++;
++	}
 +	n = sy_wlfw_ind_register(sy_qmi_tx, 0x1235);
 +	total++;
 +	if (n < 7 || sy_qmi_tx[3] != 0x20 || (sy_qmi_tx[5] | (sy_qmi_tx[6] << 8)) != n - 7)
@@ -5341,6 +5374,8 @@
 +
 +				sy_wlfw_cap_sent = 1;
 +				at = sy_wlfw_host_cap(sy_wlfw_txbuf, sy_wlfw_txn++);
++				printf("PANDORA WLAN: WLFW host_cap ddr %#x size %#x\n",
++				    (unsigned)SY_MEM_IOVA, SY_MEM_SIZE);
 +				fl = sy_qrtr_frame(frame, SY_QRTR_TYPE_DATA, 0,
 +				    SY_WLFW_QRTR_PORT, src_node, src_port,
 +				    sy_wlfw_txbuf, at);
