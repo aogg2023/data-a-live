@@ -820,7 +820,7 @@
  }
  
  static void
-@@ -51,21 +834,8637 @@
+@@ -51,21 +834,8646 @@
  		cv_sleep(100);
  	}
  	if (rootvnode == NULLVP) {
@@ -4989,7 +4989,7 @@
 +/* CAP_RESP TLV 0x11 is rf_board_info: one u32 board_id
 + * (ath12k qmi.c:1012, cnss wlan_firmware_service_v01.c:408). */
 +static void
-+sy_wlfw_cap_take(const uint8_t *b, unsigned len)
++sy_wlfw_cap_take(const uint8_t *b, unsigned len, int log)
 +{
 +	unsigned at = 7;
 +
@@ -4998,8 +4998,15 @@
 +		uint8_t type = b[at];
 +		uint16_t tl = (uint16_t)(b[at + 1] | (b[at + 2] << 8));
 +
-+		if (at + 3u + tl > len)
++		if (at + 3u + tl > len) {
++			if (log)
++				printf("PANDORA WLAN: WLFW cap tlv stop at %u type %#x len %u msg %u\n",
++				    at, type, tl, len);
 +			break;
++		}
++		if (log)
++			printf("PANDORA WLAN: WLFW cap tlv type %#x len %u at %u\n",
++			    type, tl, at);
 +		if (type == 0x11 && tl >= 4) {
 +			sy_wlfw_board_id = (uint32_t)b[at + 3] |
 +			    ((uint32_t)b[at + 4] << 8) |
@@ -5009,6 +5016,8 @@
 +		}
 +		at += 3u + tl;
 +	}
++	if (log)
++		printf("PANDORA WLAN: WLFW cap tlv end at %u of %u\n", at, len);
 +}
 +
 +/* Offline self-test: every encoder is checked against its expected byte layout and
@@ -5079,7 +5088,7 @@
 +		at = sy_qmi_tlv_hdr(cap, at, 0x11, 4);
 +		cap[at++] = 0x78; cap[at++] = 0x56; cap[at++] = 0x34; cap[at++] = 0x12;
 +		sy_qmi_finish(cap, at);
-+		sy_wlfw_cap_take(cap, at);
++		sy_wlfw_cap_take(cap, at, 0);
 +		total++;
 +		if (!sy_wlfw_board_valid || sy_wlfw_board_id != 0x12345678u)
 +			bad++;
@@ -5087,7 +5096,7 @@
 +		at = sy_qmi_tlv_hdr(cap, at, 0x02, 4);
 +		cap[at++] = 0; cap[at++] = 0; cap[at++] = 0; cap[at++] = 0;
 +		sy_qmi_finish(cap, at);
-+		sy_wlfw_cap_take(cap, at);
++		sy_wlfw_cap_take(cap, at, 0);
 +		total++;
 +		if (sy_wlfw_board_valid)
 +			bad++;
@@ -5375,7 +5384,7 @@
 +		    msgid == SY_QMI_WLFW_HOST_CAP_REQ || msgid == SY_QMI_WLFW_BDF_DOWNLOAD_REQ ||
 +		    msgid == SY_QMI_WLFW_M3_INFO_REQ || msgid == SY_QMI_WLFW_AUX_UC_INFO_REQ) {
 +			if (msgid == SY_QMI_WLFW_CAP_REQ)
-+				sy_wlfw_cap_take(b + q, (unsigned)qlen + 7);
++				sy_wlfw_cap_take(b + q, (unsigned)qlen + 7, 1);
 +			sy_wlfw_response(b + q, (unsigned)qlen + 7, msgid);
 +		} else if (msgid == 0x0022 || msgid == 0x0023) {
 +			/* D1: QMI_WLANFW_WLAN_MODE_REQ (0x22) / WLAN_CFG_REQ (0x23) */
