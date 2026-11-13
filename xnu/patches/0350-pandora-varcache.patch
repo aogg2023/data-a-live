@@ -820,7 +820,7 @@
  }
  
  static void
-@@ -51,21 +834,8511 @@
+@@ -51,21 +834,8526 @@
  		cv_sleep(100);
  	}
  	if (rootvnode == NULLVP) {
@@ -4929,8 +4929,10 @@
 +	return 32 + padded;
 +}
 +
-+/* Parse request_mem_ind: TLV 0x01 = count then mem_seg_s records
-+ * {size u32, type u32, mem_cfg_len u32, mem_cfg[2] {offset u64, size u32, secure u8}}. */
++/* Parse request_mem_ind: TLV 0x01 is a u8 count then mem_seg records
++ * {size u32, type u32, mem_cfg_len u8, then that many {offset u64, size u32, secure u8}}.
++ * mem_cfg_len is QMI_DATA_LEN, one byte (ath12k qmi.c:842, cnss v01.c:305).
++ * A segment with no mem_cfg is 9 bytes. k25 sent 3 of those, then 23. */
 +static unsigned
 +sy_wlfw_parse_request_mem(const uint8_t *b, unsigned len)
 +{
@@ -4949,16 +4951,16 @@
 +
 +			v++;
 +			for (i = 0; i < n && sy_wlfw_mem_n < (sizeof(sy_wlfw_mem) / sizeof(sy_wlfw_mem[0])); i++) {
-+				uint32_t sz, mt, mc, k;
++				uint32_t sz, mt, k;
++				unsigned mc;
 +
-+				if (v + 12 > at + 3 + tlen)
++				if (v + 9 > at + 3 + tlen)
 +					break;
 +				sz = (uint32_t)(b[v] | (b[v + 1] << 8) | (b[v + 2] << 16) | (b[v + 3] << 24));
 +				v += 4;
 +				mt = (uint32_t)(b[v] | (b[v + 1] << 8) | (b[v + 2] << 16) | (b[v + 3] << 24));
 +				v += 4;
-+				mc = (uint32_t)(b[v] | (b[v + 1] << 8) | (b[v + 2] << 16) | (b[v + 3] << 24));
-+				v += 4;
++				mc = b[v++];			/* QMI_DATA_LEN, not a u32 */
 +				for (k = 0; k < mc; k++)		/* mem_cfg records are 13 bytes */
 +					v += 13;
 +				if (v > at + 3 + tlen)
@@ -5017,17 +5019,30 @@
 +		uint8_t ind[64];
 +		unsigned at = sy_qmi_hdr(ind, 0x04, 0x1, SY_QMI_WLFW_REQUEST_MEM_IND);
 +
-+		at = sy_qmi_tlv_hdr(ind, at, 0x01, (uint16_t)(1 + 12 + 13));
++		at = sy_qmi_tlv_hdr(ind, at, 0x01, (uint16_t)(1 + 9 + 13));
 +		ind[at++] = 1;					/* one segment */
 +		ind[at++] = 0x00; ind[at++] = 0x00; ind[at++] = 0x10; ind[at++] = 0x00;	/* size 1 MiB */
 +		ind[at++] = 1; ind[at++] = 0; ind[at++] = 0; ind[at++] = 0;		/* type DDR */
-+		ind[at++] = 1; ind[at++] = 0; ind[at++] = 0; ind[at++] = 0;		/* mem_cfg_len 1 */
++		ind[at++] = 1;							/* mem_cfg_len u8 */
 +		for (n = 0; n < 13; n++)
 +			ind[at++] = 0;
 +		sy_qmi_finish(ind, at);
 +		total++;
 +		if (sy_wlfw_parse_request_mem(ind, at) != 1 || sy_wlfw_mem_n != 1 ||
 +		    sy_wlfw_mem[0].size != 0x100000 || sy_wlfw_mem[0].type != SY_WLFW_MEM_TYPE_DDR)
++			bad++;
++		at = sy_qmi_hdr(ind, 0x04, 0x2, SY_QMI_WLFW_REQUEST_MEM_IND);
++		at = sy_qmi_tlv_hdr(ind, at, 0x01, (uint16_t)(1 + 3 * 9));
++		ind[at++] = 3;					/* three 9-byte segments, mem_cfg_len 0 */
++		for (n = 0; n < 3; n++) {
++			ind[at++] = 0x00; ind[at++] = 0x00; ind[at++] = 0x10; ind[at++] = 0x00;
++			ind[at++] = 1; ind[at++] = 0; ind[at++] = 0; ind[at++] = 0;
++			ind[at++] = 0;
++		}
++		sy_qmi_finish(ind, at);
++		total++;
++		if (sy_wlfw_parse_request_mem(ind, at) != 3 || sy_wlfw_mem_n != 3 ||
++		    sy_wlfw_mem[2].size != 0x100000 || sy_wlfw_mem[2].type != SY_WLFW_MEM_TYPE_DDR)
 +			bad++;
 +	}
 +	total++;
