@@ -1,7 +1,7 @@
 diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
 --- a/bsd/dev/sweet_ufs.c
 +++ b/bsd/dev/sweet_ufs.c
-@@ -2318,6 +2318,49 @@ pandora_part_pread(uint64_t off, void *dst, uint64_t len)
+@@ -2398,6 +2398,49 @@ pandora_part_pread(uint64_t off, void *dst, uint64_t len)
  	su.lun = 0;
  	lck_mtx_unlock(&sweet_ufs_lock);
  	return error;
