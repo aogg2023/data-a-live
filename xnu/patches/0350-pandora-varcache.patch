@@ -820,7 +820,7 @@
  }
  
  static void
-@@ -51,21 +834,8648 @@
+@@ -51,21 +834,8651 @@
  		cv_sleep(100);
  	}
  	if (rootvnode == NULLVP) {
@@ -4815,17 +4815,19 @@
 +	at = sy_qmi_tlv_u8(b, at, 0x17, 1);			/* m3_cache_support */
 +	at = sy_qmi_tlv_u8(b, at, 0x1a, 0);			/* cal_done */
 +	at = sy_qmi_tlv_u8(b, at, 0x1c, 0);			/* mem_cfg_mode: default */
-+	/* ddr_range TLV 0x1F sits before feature_list in the ei. It is a
-+	 * static array of 3 {u64 start, u64 size} (v01.h:131, v01.c:4357).
-+	 * cnss qmi.c:429-431 fills entry 0 only; the other two stay zero. */
++	/* ddr_range TLV 0x1F is one {u64 start, u64 size} plus two zero
++	 * entries (v01.h:131, v01.c:4357). k28 sent only the 32 MiB carveout
++	 * and the reply ring at 0xb07c3c00 was outside it. Span the mapped
++	 * window [SY_IOVA_BASE, SY_MEM_IOVA + SY_MEM_SIZE). */
 +	{
 +		unsigned i;
++		uint64_t ddr_sz = (uint64_t)SY_MEM_IOVA + SY_MEM_SIZE - SY_IOVA_BASE;
 +
 +		at = sy_qmi_tlv_hdr(b, at, 0x1f, 48);
 +		for (i = 0; i < 8; i++)
-+			b[at++] = (uint8_t)((uint64_t)SY_MEM_IOVA >> (8 * i));
++			b[at++] = (uint8_t)((uint64_t)SY_IOVA_BASE >> (8 * i));
 +		for (i = 0; i < 8; i++)
-+			b[at++] = (uint8_t)((uint64_t)SY_MEM_SIZE >> (8 * i));
++			b[at++] = (uint8_t)(ddr_sz >> (8 * i));
 +		for (i = 0; i < 32; i++)
 +			b[at++] = 0;
 +	}
@@ -5047,7 +5049,7 @@
 +			if (at + 3u + tl > n)
 +				break;
 +			if (sy_qmi_tx[at] == 0x1f && tl == 48 &&
-+			    sy_qmi_tx[at + 6] == 0xb1 && sy_qmi_tx[at + 14] == 0x02 &&
++			    sy_qmi_tx[at + 6] == 0xb0 && sy_qmi_tx[at + 14] == 0x03 &&
 +			    sy_qmi_tx[at + 19] == 0 && sy_qmi_tx[at + 50] == 0)
 +				saw = 1;
 +			at += 3u + tl;
@@ -5375,7 +5377,8 @@
 +				sy_wlfw_cap_sent = 1;
 +				at = sy_wlfw_host_cap(sy_wlfw_txbuf, sy_wlfw_txn++);
 +				printf("PANDORA WLAN: WLFW host_cap ddr %#x size %#x\n",
-+				    (unsigned)SY_MEM_IOVA, SY_MEM_SIZE);
++				    (unsigned)SY_IOVA_BASE,
++				    (unsigned)(SY_MEM_IOVA + SY_MEM_SIZE - SY_IOVA_BASE));
 +				fl = sy_qrtr_frame(frame, SY_QRTR_TYPE_DATA, 0,
 +				    SY_WLFW_QRTR_PORT, src_node, src_port,
 +				    sy_wlfw_txbuf, at);
