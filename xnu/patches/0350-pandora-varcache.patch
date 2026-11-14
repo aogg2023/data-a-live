@@ -820,7 +820,7 @@
  }
  
  static void
-@@ -51,21 +834,13227 @@
+@@ -51,21 +834,13230 @@
  		cv_sleep(100);
  	}
  	if (rootvnode == NULLVP) {
@@ -5481,7 +5481,8 @@
 +			}
 +		} else if (msgid == SY_QMI_WLFW_CAP_REQ ||
 +		    msgid == SY_QMI_WLFW_HOST_CAP_REQ || msgid == SY_QMI_WLFW_BDF_DOWNLOAD_REQ ||
-+		    msgid == SY_QMI_WLFW_M3_INFO_REQ || msgid == SY_QMI_WLFW_AUX_UC_INFO_REQ) {
++		    msgid == SY_QMI_WLFW_M3_INFO_REQ || msgid == SY_QMI_WLFW_AUX_UC_INFO_REQ ||
++		    msgid == SY_QMI_WLFW_TME_LITE_INFO_REQ) {
 +			if (msgid == SY_QMI_WLFW_CAP_REQ)
 +				sy_wlfw_cap_take(b + q, (unsigned)qlen + 7, 1);
 +			sy_wlfw_response(b + q, (unsigned)qlen + 7, msgid);
@@ -10165,7 +10166,7 @@
 +	return sy_qmi_finish(b, at);
 +}
 +
-+static void
++static int
 +sy_wlfw_tme_send(void)
 +{
 +	uint64_t iova;
@@ -10175,12 +10176,12 @@
 +	vm_offset_t va;
 +
 +	if (!sy_mem_va || !sy_wlfw_node || !sy_mem_used) {
-+	printf("PANDORA WLAN: WLFW tme: skipped\n");
-+		return;
++		printf("PANDORA WLAN: WLFW tme: skipped\n");
++		return -1;
 +	}
 +	if ((uint64_t)sy_mem_used + sz > (uint64_t)SY_MEM_SIZE - SY_MEM_FILES) {
-+	printf("PANDORA WLAN: WLFW tme: no room after %u\n", sy_mem_used);
-+		return;
++		printf("PANDORA WLAN: WLFW tme: no room after %u\n", sy_mem_used);
++		return -1;
 +	}
 +	iova = SY_MEM_IOVA + sy_mem_used;
 +	va = sy_mem_va + (vm_offset_t)sy_mem_used;
@@ -10192,7 +10193,7 @@
 +	qlen = sy_wlfw_tme_info(sy_wlfw_txbuf, sy_wlfw_txn++, iova, sz);
 +	printf("PANDORA WLAN: WLFW tme tmel_peach_20.elf: %u B at %#llx\n",
 +	    sz, (unsigned long long)iova);
-+	(void)sy_wlfw_qmi_send(SY_QMI_WLFW_TME_LITE_INFO_REQ, sy_wlfw_txbuf, qlen);
++	return sy_wlfw_qmi_send(SY_QMI_WLFW_TME_LITE_INFO_REQ, sy_wlfw_txbuf, qlen);
 +}
 +
 +static void
@@ -10208,8 +10209,10 @@
 +		sy_wlfw_busy = 0;
 +		return;
 +	}
-+	sy_wlfw_tme_send();
-+	if (!sy_wlfw_alive()) {
++	/* k42 answered 0x5b with result 1. Continuing left the last regdb
++	 * fragment and the board ELF without a reply. */
++	if (sy_wlfw_tme_send() != 0 || !sy_wlfw_alive()) {
++		printf("PANDORA WLAN: WLFW download stopped before regdb\n");
 +		sy_log_sync();
 +		sy_wlfw_busy = 0;
 +		return;
