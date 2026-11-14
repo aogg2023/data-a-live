@@ -1111,7 +1111,7 @@
 +static unsigned sy_guard;	/* songyuan_guard=1: BHI fetch one unmapped guard page, verify SMMU fault */	/* SBL reached BHI code 2; gates stages 16-18 */
 +static vm_offset_t sy_cb_va;
 +#define SY_DMA_SIZE	0x2000000UL
-+#define SY_IOVA_BASE	0xB0000000UL	/* DT cnss_pci0 partition window 2 */
++#define SY_IOVA_BASE	0xAF800000UL	/* 8 MiB ends at 0xb0000000, inside range 0 */
 +#define SY_IOVA_MAP	SY_IOVA_BASE	/* translating SMMU IOVA (BHI/BHIe window) */
 +#define SY_SBL_SIZE	0x80000UL
 +#define SY_FW_BUF	0x00800000UL	/* full amss buffer, reused for BHIe */
@@ -2415,8 +2415,8 @@
 +	sy_log_sync();
 +}
 +
-+/* Stage 14: build an identity 4 KiB page table for the DMA pool (IOVA =
-+ * 0xB0000000, DT cnss_pci0 partition window 2) and install it on the free
++/* Stage 14: build a 4 KiB page table for the DMA pool (IOVA 0xAF800000,
++ * 8 MiB ending at 0xB0000000, inside host_cap range 0) and install it on the free
 + * stream slot/context bank found by sy_smmu_probe(); order mirrors the working
 + * same-card port (SCTLR off, CBA2R/CBAR, TCR2/TCR, TTBR0, MAIR, SCTLR on,
 + * S2CR then SMR, TLBI + sync). Every write is read back. */
@@ -2462,7 +2462,7 @@
 +		((uint64_t *)(sy_l3 + ((i >> 9) << 12)))[i & 0x1ff] =
 +		    (pa & 0x0000fffffffff000ull) | 0x0060000000000e43ull;
 +	}
-+	/* Same PTE as the firmware window. IOVA starts at 0xB0800000, still inside
++	/* Same PTE as the firmware window. RDDM starts at 0xB0000000, inside
 +	 * the cnss_pci0 window (0xB0000000, size 0x50000000). SY_MEM_IOVA is the
 +	 * other gigabyte (L1 index 0), so these L2 slots do not overlap it. */
 +	sy_rddm_va = 0;
@@ -2729,7 +2729,7 @@
 +	if (kr != KERN_SUCCESS || !sy_sbl_va) {
 +		/* This port owns no RAM below 4 GiB: the ADT window starts at 0x1_00000000
 +		 * (see docs REUSE-MATRIX/WIFI-2026-11-01). The 32-bit coherent limit is
-+		 * satisfied through the translating CB instead (32-bit IOVA 0xB0000000,
++		 * satisfied through the translating CB instead (32-bit IOVA 0xAF800000,
 +		 * SMMU OAS 36 bit), so fall back to any contiguous pages. */
 +		sy_sbl_va = 0;
 +		printf("PANDORA WLAN: BHI: no <4 GiB contig buffer (XNU RAM starts above 4 GiB); "
@@ -3696,7 +3696,7 @@
 + * (ath12k_mhi_config_wcn7850): 128 channels, 2 event rings; the QMI/QRTR transport
 + * is "IPCR" on channels 20 (UL) and 21 (DL), both on event ring 1; LOOPBACK uses
 + * channels 0/1 on event ring 0. Context records are 44 (0x2c) bytes, ring elements
-+ * 16 bytes. Rings and buffers live in the already mapped window at IOVA 0xb07c0000.
++ * 16 bytes. Rings and buffers live in the already mapped window at IOVA 0xaffc0000.
 + * Each ring base is aligned to its own length, as mhi_alloc_aligned_ring does
 + * (work/ref_mhi_init.c). Packed offsets fault the device when a channel starts. */
 +#define SY_MHI_CH_CTX	0x0000u
@@ -4855,7 +4855,7 @@
 +
 +/* host_cap is the captured Android message, including TLV 0x1F.
 + * 0x1F is three {start u64, size u64}: 0x18000000/0x98010000,
-+ * 0xb0000000/0x800000, and one zero. k39 SNOC ERRLOG2 was 0xb0462000.
++ * ranges 1 and 2 zero. The 8 MiB window is 0xaf800000, inside the end.
 + * 0x11 wake_msi=13, 0x16 m3_support=1, 0x17 m3_cache_support=1,
 + * 0x20 host_build_type=SECONDARY (2), 0x24 max_mlo_peer=32.
 + * 0x26 is three 6-byte mlo_chip_info records. Chip 0 has two links.
@@ -4869,12 +4869,12 @@
 +		0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
 +		0x00, 0x00, 0x00, 0x00, 0x00, 0x00
 +	};
-+	/* Range 0 is host_cap_full.txt (end 0xb0010000). Range 1 is SY_FW_BUF. */
++	/* Range 0 ends at 0xb0010000. Ranges 1 and 2 stay zero. */
 +	static const uint8_t ddr[48] = {
 +		0x00, 0x00, 0x00, 0x18, 0x00, 0x00, 0x00, 0x00,
 +		0x00, 0x00, 0x01, 0x98, 0x00, 0x00, 0x00, 0x00,
-+		0x00, 0x00, 0x00, 0xb0, 0x00, 0x00, 0x00, 0x00,
-+		0x00, 0x00, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00,
++		0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++		0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
 +		0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
 +		0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00
 +	};
@@ -5115,8 +5115,8 @@
 +		0x20, 0x53, 0x6f, 0x6e, 0x67, 0x79, 0x75, 0x61, 0x6e, 0x20, 0x62, 0x61,
 +		0x73, 0x65, 0x64, 0x20, 0x6f, 0x6e, 0x20, 0x53, 0x4d, 0x38, 0x38, 0x35,
 +		0x30, 0x1f, 0x30, 0x00, 0x00, 0x00, 0x00, 0x18, 0x00, 0x00, 0x00, 0x00,
-+		0x00, 0x00, 0x01, 0x98, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xb0,
-+		0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00,
++		0x00, 0x00, 0x01, 0x98, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++		0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
 +		0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
 +		0x00, 0x00, 0x00, 0x00, 0x20, 0x04, 0x00, 0x02, 0x00, 0x00, 0x00, 0x21, 0x01, 0x00, 0x01,
 +		0x22, 0x02, 0x00, 0x00, 0x00, 0x23, 0x01, 0x00, 0x00, 0x24, 0x02, 0x00,
@@ -5470,7 +5470,7 @@
 +
 +				sy_wlfw_cap_sent = 1;
 +				at = sy_wlfw_host_cap(sy_wlfw_txbuf, sy_wlfw_txn++);
-+				printf("PANDORA WLAN: WLFW host_cap ddr 0x18000000 size 0x98010000 + 0xb0000000 size 0x800000 feature %#x platform 52 qmi %u\n",
++				printf("PANDORA WLAN: WLFW host_cap ddr 0x18000000 size 0x98010000 iova 0xaf800000 feature %#x platform 52 qmi %u\n",
 +				    (unsigned)SY_WLFW_FEATURE_LIST, at);
 +				fl = sy_qrtr_frame(frame, SY_QRTR_TYPE_DATA, 0,
 +				    SY_WLFW_QRTR_PORT, src_node, src_port,
