@@ -820,7 +820,7 @@
  }
  
  static void
-@@ -51,21 +834,8779 @@
+@@ -51,21 +834,8817 @@
  		cv_sleep(100);
  	}
  	if (rootvnode == NULLVP) {
@@ -4723,7 +4723,7 @@
 +#define SY_WLFW_MEM_TYPE_BDF 2u
 +#define SY_WLFW_MEM_TYPE_M3 3u
 +#define SY_WLFW_MEM_TYPE_CAL 4u
-+#define SY_WLFW_FEATURE_LIST 0x44ull	/* BIT(CNSS_WLAN_EN_SUPPORT)=2 | BIT(CNSS_AUX_UC_SUPPORT)=6 */
++#define SY_WLFW_FEATURE_LIST 0x46ull	/* BIT(CNSS_DRV_SUPPORT)=1 | BIT(CNSS_WLAN_EN_SUPPORT)=2 | BIT(CNSS_AUX_UC_SUPPORT)=6 */
 +
 +struct sy_qrtr_hdr {
 +	uint32_t version, type, src_node, src_port, confirm_rx, size, dst_node, dst_port;
@@ -4776,6 +4776,19 @@
 +	return at;
 +}
 +
++static unsigned __attribute__((noinline))
++sy_qmi_tlv_u16(uint8_t *b, unsigned at, uint8_t type, uint16_t v)
++{
++	volatile uint8_t *p = b;
++
++	p[at] = type;
++	p[at + 1] = 2;
++	p[at + 2] = 0;
++	p[at + 3] = (uint8_t)v;
++	p[at + 4] = (uint8_t)(v >> 8);
++	return at + 5;
++}
++
 +static unsigned
 +sy_qmi_tlv_u32(uint8_t *b, unsigned at, uint8_t type, uint32_t v)
 +{
@@ -4815,26 +4828,37 @@
 +	return at + 3 + n;
 +}
 +
-+/* host_cap: no TLV 0x13. cnss qmi.c:409 sends nm_modem only when
-+ * qcom,sleep-clk-support is set; canoe-peach-cnss.dtsi does not set it.
-+ * feature_list stays peach cnss BIT(2)|BIT(6). */
++/* host_cap matches the captured Android message except TLV 0x1F.
++ * 0x11 wake_msi=13, 0x16 m3_support=1, 0x17 m3_cache_support=1,
++ * 0x20 host_build_type=SECONDARY (2), 0x24 max_mlo_peer=32.
++ * 0x26 is three 6-byte mlo_chip_info records. Chip 0 has two links.
++ * 0x27 is DRV|WLAN_EN|AUX_UC. 0x13, 0x1C and 0x1F are not sent.
++ * k28/k29 sent a different ddr_range and entered MHI SYS_ERR. */
 +static unsigned
 +sy_wlfw_host_cap(uint8_t *b, uint16_t txn)
 +{
++	static const uint8_t mlo[18] = {
++		0x00, 0x02, 0x00, 0x01, 0x01, 0x01,
++		0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++		0x00, 0x00, 0x00, 0x00, 0x00, 0x00
++	};
 +	unsigned at = sy_qmi_hdr(b, 0x00, txn, SY_QMI_WLFW_HOST_CAP_REQ);
 +
 +	at = sy_qmi_tlv_u32(b, at, 0x10, 1);			/* num_clients */
-+	/* TLV 0x13 omitted: 4 bytes, type + u8 0x0E. */
++	at = sy_qmi_tlv_u32(b, at, 0x11, 13);			/* wake_msi */
 +	at = sy_qmi_tlv_u8(b, at, 0x14, 1);			/* bdf_support */
 +	at = sy_qmi_tlv_u8(b, at, 0x16, 1);			/* m3_support */
 +	at = sy_qmi_tlv_u8(b, at, 0x17, 1);			/* m3_cache_support */
 +	at = sy_qmi_tlv_u8(b, at, 0x1a, 1);			/* cal_done */
-+	at = sy_qmi_tlv_u8(b, at, 0x1c, 0);			/* mem_cfg_mode: default */
 +	at = sy_qmi_tlv_str(b, at, 0x1e,
 +	    "Qualcomm Technologies, Inc. Songyuan based on SM8850", 52);
-+	/* No ddr_range TLV 0x1F. k28 and k29 sent it and both entered MHI
-+	 * SYS_ERR about 150 ms after respond_mem. k27 omitted it and got
-+	 * msg 0x36 in 1 ms. */
++	at = sy_qmi_tlv_u32(b, at, 0x20, 2);			/* host_build_type */
++	at = sy_qmi_tlv_u8(b, at, 0x21, 1);			/* mlo_capable */
++	at = sy_qmi_tlv_u16(b, at, 0x22, 0);			/* mlo_chip_id */
++	at = sy_qmi_tlv_u8(b, at, 0x23, 0);			/* mlo_group_id */
++	at = sy_qmi_tlv_u16(b, at, 0x24, 32);			/* max_mlo_peer */
++	at = sy_qmi_tlv_u8(b, at, 0x25, 1);			/* mlo_num_chips */
++	at = sy_qmi_tlv_str(b, at, 0x26, (const char *)mlo, 18);
 +	at = sy_qmi_tlv_u64(b, at, 0x27, SY_WLFW_FEATURE_LIST);
 +	return sy_qmi_finish(b, at);
 +}
@@ -5045,14 +5069,28 @@
 +	unsigned total = 0, bad = 0, n;
 +	uint8_t frame[256];
 +	static const uint8_t bdf_data[4] = { 0x7f, 0x45, 0x4c, 0x46 };
++	static const uint8_t cap_tlv[146] = {
++		0x10, 0x04, 0x00, 0x01, 0x00, 0x00, 0x00, 0x11, 0x04, 0x00, 0x0d, 0x00,
++		0x00, 0x00, 0x14, 0x01, 0x00, 0x01, 0x16, 0x01, 0x00, 0x01, 0x17, 0x01,
++		0x00, 0x01, 0x1a, 0x01, 0x00, 0x01, 0x1e, 0x34, 0x00, 0x51, 0x75, 0x61,
++		0x6c, 0x63, 0x6f, 0x6d, 0x6d, 0x20, 0x54, 0x65, 0x63, 0x68, 0x6e, 0x6f,
++		0x6c, 0x6f, 0x67, 0x69, 0x65, 0x73, 0x2c, 0x20, 0x49, 0x6e, 0x63, 0x2e,
++		0x20, 0x53, 0x6f, 0x6e, 0x67, 0x79, 0x75, 0x61, 0x6e, 0x20, 0x62, 0x61,
++		0x73, 0x65, 0x64, 0x20, 0x6f, 0x6e, 0x20, 0x53, 0x4d, 0x38, 0x38, 0x35,
++		0x30, 0x20, 0x04, 0x00, 0x02, 0x00, 0x00, 0x00, 0x21, 0x01, 0x00, 0x01,
++		0x22, 0x02, 0x00, 0x00, 0x00, 0x23, 0x01, 0x00, 0x00, 0x24, 0x02, 0x00,
++		0x20, 0x00, 0x25, 0x01, 0x00, 0x01, 0x26, 0x12, 0x00, 0x00, 0x02, 0x00,
++		0x01, 0x01, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++		0x00, 0x00, 0x00, 0x27, 0x08, 0x00, 0x46, 0x00, 0x00, 0x00, 0x00, 0x00,
++		0x00, 0x00,
++	};
 +
 +	n = sy_wlfw_host_cap(sy_qmi_tx, 0x1234);
 +	total++;
-+	if (n != 45 || sy_qmi_tx[0] != 0 || sy_qmi_tx[3] != 0x34 || sy_qmi_tx[4] != 0 ||
-+	    (sy_qmi_tx[5] | (sy_qmi_tx[6] << 8)) != n - 7 ||
-+	    memcmp(sy_qmi_tx + 7, "\x10\x04\x00\x01\x00\x00", 6) != 0 ||
-+	    sy_qmi_tx[34] != 0x27 || sy_qmi_tx[35] != 8 || sy_qmi_tx[37] != 0x44 ||
-+	    sy_qmi_tx[38] != 0 || sy_qmi_tx[44] != 0)
++	if (n != 7 + 146 || sy_qmi_tx[0] != 0 || sy_qmi_tx[3] != 0x34 ||
++	    sy_qmi_tx[4] != 0 ||
++	    (sy_qmi_tx[5] | (sy_qmi_tx[6] << 8)) != 146 ||
++	    memcmp(sy_qmi_tx + 7, cap_tlv, 146) != 0)
 +		bad++;
 +	{
 +		unsigned at = 7;
