@@ -5167,7 +5167,7 @@
 +#define SY_QRTR_CMD_NEW_SERVER 4u
 +#define SY_QRTR_CMD_NEW_LOOKUP 10u
 +
-+static uint16_t sy_wlfw_txn = 0x100;
++static uint16_t sy_wlfw_txn = 0;
 +static uint32_t sy_wlfw_ul_wp;
 +static uint32_t sy_wlfw_node, sy_wlfw_port;
 +static unsigned sy_wlfw_state;
@@ -5537,7 +5537,7 @@
 +		}
 +		memset(sy_bdf_msg, 0, sizeof(sy_bdf_msg));
 +		qlen = sy_wlfw_bdf_download(sy_bdf_msg, sy_wlfw_txn++, sy_wlfw_board_id,
-+		    (uint32_t)fs, i, sy_bdf_buf, (uint16_t)len,
++		    (uint32_t)(fs - off), i, sy_bdf_buf, (uint16_t)len,
 +		    (i + 1 == segs) ? 1 : 0, bdf_type);
 +		printf("PANDORA WLAN: WLFW bdf %u/%u: off %u len %u end %u\n",
 +		    i + 1, segs, off, len, (i + 1 == segs));
