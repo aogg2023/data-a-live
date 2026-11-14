@@ -820,7 +820,7 @@
  }
  
  static void
-@@ -51,21 +834,8758 @@
+@@ -51,21 +834,8774 @@
  		cv_sleep(100);
  	}
  	if (rootvnode == NULLVP) {
@@ -4796,6 +4796,20 @@
 +	return at;
 +}
 +
++/* QMI_STRING as cnss emitted platform_name: the TLV length is the
++ * character count, with no trailing NUL. These 52 bytes are this
++ * board's /model, and the captured 0x1E TLV is 52 bytes. */
++static unsigned
++sy_qmi_tlv_str(uint8_t *b, unsigned at, uint8_t type, const char *s, unsigned n)
++{
++	unsigned i;
++
++	at = sy_qmi_tlv_hdr(b, at, type, (uint16_t)n);
++	for (i = 0; i < n; i++)
++		b[at++] = (uint8_t)s[i];
++	return at;
++}
++
 +/* host_cap: no TLV 0x13. cnss qmi.c:409 sends nm_modem only when
 + * qcom,sleep-clk-support is set; canoe-peach-cnss.dtsi does not set it.
 + * feature_list stays peach cnss BIT(2)|BIT(6). */
@@ -4811,6 +4825,8 @@
 +	at = sy_qmi_tlv_u8(b, at, 0x17, 1);			/* m3_cache_support */
 +	at = sy_qmi_tlv_u8(b, at, 0x1a, 0);			/* cal_done */
 +	at = sy_qmi_tlv_u8(b, at, 0x1c, 0);			/* mem_cfg_mode: default */
++	at = sy_qmi_tlv_str(b, at, 0x1e,
++	    "Qualcomm Technologies, Inc. Songyuan based on SM8850", 52);
 +	/* No ddr_range TLV 0x1F. k28 and k29 sent it and both entered MHI
 +	 * SYS_ERR about 150 ms after respond_mem. k27 omitted it and got
 +	 * msg 0x36 in 1 ms. */
@@ -5368,8 +5384,8 @@
 +
 +				sy_wlfw_cap_sent = 1;
 +				at = sy_wlfw_host_cap(sy_wlfw_txbuf, sy_wlfw_txn++);
-+				printf("PANDORA WLAN: WLFW host_cap ddr omitted nm omitted feature %#x\n",
-+				    (unsigned)SY_WLFW_FEATURE_LIST);
++				printf("PANDORA WLAN: WLFW host_cap ddr omitted nm omitted feature %#x platform 52 qmi %u\n",
++				    (unsigned)SY_WLFW_FEATURE_LIST, at);
 +				fl = sy_qrtr_frame(frame, SY_QRTR_TYPE_DATA, 0,
 +				    SY_WLFW_QRTR_PORT, src_node, src_port,
 +				    sy_wlfw_txbuf, at);
