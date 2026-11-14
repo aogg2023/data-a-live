@@ -4886,7 +4886,7 @@
 +	at = sy_qmi_tlv_u8(b, at, 0x14, 1);			/* bdf_support */
 +	at = sy_qmi_tlv_u8(b, at, 0x16, 1);			/* m3_support */
 +	at = sy_qmi_tlv_u8(b, at, 0x17, 1);			/* m3_cache_support */
-+	at = sy_qmi_tlv_u8(b, at, 0x1a, 1);			/* cal_done */
++	at = sy_qmi_tlv_u8(b, at, 0x1a, 0);			/* cal_done */
 +	at = sy_qmi_tlv_str(b, at, 0x1e,
 +	    "Qualcomm Technologies, Inc. Songyuan based on SM8850", 52);
 +	at = sy_qmi_tlv_str(b, at, 0x1f, (const char *)ddr, 48);
