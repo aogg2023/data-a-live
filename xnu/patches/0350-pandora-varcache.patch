@@ -820,7 +820,7 @@
  }
  
  static void
-@@ -51,21 +834,13230 @@
+@@ -51,21 +834,13209 @@
  		cv_sleep(100);
  	}
  	if (rootvnode == NULLVP) {
@@ -10155,7 +10155,7 @@
 +	0xff, 0xff, 0xff, 0xff, 0xfe, 0xff, 0xff, 0x7f,
 +};
 +
-+static unsigned
++static unsigned __unused
 +sy_wlfw_tme_info(uint8_t *b, uint16_t txn, uint64_t addr, uint32_t size)
 +{
 +	unsigned at = sy_qmi_hdr(b, 0x00, txn, SY_QMI_WLFW_TME_LITE_INFO_REQ);
@@ -10169,31 +10169,12 @@
 +static int
 +sy_wlfw_tme_send(void)
 +{
-+	uint64_t iova;
-+	uint32_t sz = (uint32_t)sizeof(sy_tme_peach20);
-+	uint32_t off;
-+	unsigned qlen;
-+	vm_offset_t va;
-+
-+	if (!sy_mem_va || !sy_wlfw_node || !sy_mem_used) {
-+		printf("PANDORA WLAN: WLFW tme: skipped\n");
-+		return -1;
-+	}
-+	if ((uint64_t)sy_mem_used + sz > (uint64_t)SY_MEM_SIZE - SY_MEM_FILES) {
-+		printf("PANDORA WLAN: WLFW tme: no room after %u\n", sy_mem_used);
-+		return -1;
-+	}
-+	iova = SY_MEM_IOVA + sy_mem_used;
-+	va = sy_mem_va + (vm_offset_t)sy_mem_used;
-+	memcpy((void *)va, sy_tme_peach20, sz);
-+	for (off = 0; off < sz; off += (uint32_t)PAGE_SIZE)
-+		flush_dcache64(sy_pa(va + off), (unsigned)PAGE_SIZE, TRUE);
-+	__asm__ volatile("dsb sy" ::: "memory");
-+	memset(sy_wlfw_txbuf, 0, 32);
-+	qlen = sy_wlfw_tme_info(sy_wlfw_txbuf, sy_wlfw_txn++, iova, sz);
-+	printf("PANDORA WLAN: WLFW tme tmel_peach_20.elf: %u B at %#llx\n",
-+	    sz, (unsigned long long)iova);
-+	return sy_wlfw_qmi_send(SY_QMI_WLFW_TME_LITE_INFO_REQ, sy_wlfw_txbuf, qlen);
++	/* k43: 0x5b came back result 1 error 83 in 38 ms. k42 then lost the
++	 * last regdb fragment, which k41 finished in 2 ms without this
++	 * request. The bytes stay in the image; they are not sent. */
++	(void)sizeof(sy_tme_peach20);
++	printf("PANDORA WLAN: WLFW tme: not sent\n");
++	return 0;
 +}
 +
 +static void
@@ -10203,16 +10184,14 @@
 +		return;
 +	sy_wlfw_busy = 1;
 +	sy_wlfw_dl_pending = 0;
-+	printf("PANDORA WLAN: WLFW download: cap, tme, regdb, board, m3, aux\n");
++	printf("PANDORA WLAN: WLFW download: cap, regdb, board, m3, aux\n");
 +	if (sy_wlfw_cap_send() != 0) {
 +		sy_log_sync();
 +		sy_wlfw_busy = 0;
 +		return;
 +	}
-+	/* k42 answered 0x5b with result 1. Continuing left the last regdb
-+	 * fragment and the board ELF without a reply. */
-+	if (sy_wlfw_tme_send() != 0 || !sy_wlfw_alive()) {
-+		printf("PANDORA WLAN: WLFW download stopped before regdb\n");
++	(void)sy_wlfw_tme_send();
++	if (!sy_wlfw_alive()) {
 +		sy_log_sync();
 +		sy_wlfw_busy = 0;
 +		return;
