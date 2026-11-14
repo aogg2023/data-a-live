@@ -820,7 +820,7 @@
  }
  
  static void
-@@ -51,21 +834,8817 @@
+@@ -51,21 +834,8859 @@
  		cv_sleep(100);
  	}
  	if (rootvnode == NULLVP) {
@@ -1064,6 +1064,7 @@
 +static uint32_t sy_smmu_slot, sy_smmu_cb;
 +static uint32_t sy_id0, sy_id1, sy_id2, sy_cr0;
 +static vm_offset_t sy_cb_va;
++static uint32_t sy_smmu_asid;
 +static vm_offset_t sy_gr1_va;
 +static vm_offset_t sy_smmu_cbbase, sy_smmu_gr1;
 +static unsigned sy_smmu_pgshift;
@@ -1087,16 +1088,18 @@
 +static int sy_cmdbatch;		/* songyuan_cmdbatch=1: queue all STARTs, ring CRDB once */
 +static int sy_mhi_m0_ok;
 +
-+/* M5b-2 memory provisioning: one 32 MiB region the firmware may use for its MSA/M3
-+ * areas, exposed at a second IOVA window in the same context bank. */
-+#define SY_MEM_IOVA 0xB1000000UL
++/* M5b-2: 32 MiB for the three respond_mem segments. The base is the start of
++ * the Android host DDR window from the captured host_cap TLV 0x1F
++ * (start 0x18000000, size 0x98010000, end 0xb0010000). L1 index of this
++ * IOVA is 0. The MHI rings stay at SY_IOVA_BASE, L1 index 2. */
++#define SY_MEM_IOVA 0x18000000UL
 +#define SY_MEM_SIZE 0x02000000u
 +/* Tail of the window is not given to request_mem. phy_ucode20.elf (290816)
 + * and aux_ucode20.elf (61440) are copied here, the same split ath12k uses
 + * for m3_info / aux_uc_info instead of the firmware's own segments. */
 +#define SY_MEM_FILES 0x100000u
 +static vm_offset_t sy_mem_va;
-+static vm_offset_t sy_mem_l3;
++static vm_offset_t sy_mem_l2, sy_mem_l3;
 +static unsigned sy_mem_used;		/* stage 20: WLFW QRTR/QMI handshake (songyuan_wlfw=1) */
 +static volatile uint32_t sy_mhi_dl_posted;	/* BHIe got through: do not reset the chip at exit */
 +static uint32_t sy_mhi_dl_hi;		/* next inbound TRE to post on channel 21 */
@@ -2460,7 +2463,8 @@
 +		    (pa & 0x0000fffffffff000ull) | 0x0060000000000e43ull;
 +	}
 +	/* Same PTE as the firmware window. IOVA starts at 0xB0800000, still inside
-+	 * the cnss_pci0 window (0xB0000000, size 0x50000000) and before SY_MEM_IOVA. */
++	 * the cnss_pci0 window (0xB0000000, size 0x50000000). SY_MEM_IOVA is the
++	 * other gigabyte (L1 index 0), so these L2 slots do not overlap it. */
 +	sy_rddm_va = 0;
 +	if (sy_buf_size == SY_FW_BUF && l3s + 4 <= 16) {
 +		kr = kmem_alloc_contig(kernel_map, &sy_rddm_va, SY_RDDM_ALLOC, PAGE_MASK,
@@ -2625,6 +2629,7 @@
 +	sy_smmu_slot = slot;
 +	sy_smmu_cb = cb;
 +	sy_cb_va = cbp;
++	sy_smmu_asid = asid;
 +	sy_gr1_va = gr1;
 +	printf("PANDORA WLAN: SMMU install: start slot %u bank %u asid %#llx old sctlr %#x tcr2 %#x\n",
 +	    slot, cb, (unsigned long long)asid, sctlr, tcr2);
@@ -4653,7 +4658,7 @@
 +
 +	if (sy_mem_va)
 +		return 0;
-+	if (!sy_l2 || !sy_l3) {
++	if (!sy_l1 || !sy_l2 || !sy_l3) {
 +		printf("PANDORA WLAN: MEM: page tables absent\n");
 +		return 1;
 +	}
@@ -4670,8 +4675,16 @@
 +		printf("PANDORA WLAN: MEM: L3 tables allocation failed %d\n", kr);
 +		return 1;
 +	}
++	/* 0x18000000 is L1 index 0. sy_l2 is the L2 for SY_IOVA_BASE (index 2). */
++	kr = kmem_alloc(kernel_map, &sy_mem_l2, 0x1000,
++	    KMA_DATA | KMA_ZERO | KMA_NOPAGEWAIT, VM_KERN_MEMORY_IOKIT);
++	if (kr != KERN_SUCCESS) {
++		printf("PANDORA WLAN: MEM: L2 table allocation failed %d\n", kr);
++		return 1;
++	}
++	((uint64_t *)sy_l1)[(SY_MEM_IOVA >> 30) & 511] = sy_pa(sy_mem_l2) | 3ull;
 +	for (i = 0; i < (SY_MEM_SIZE >> 21); i++)
-+		((uint64_t *)sy_l2)[(((SY_MEM_IOVA >> 21) + i) & 511)] =
++		((uint64_t *)sy_mem_l2)[(((SY_MEM_IOVA >> 21) + i) & 511)] =
 +		    sy_pa(sy_mem_l3 + ((vm_offset_t)i << 12)) | 3ull;
 +	for (i = 0; i < (SY_MEM_SIZE >> 12); i++) {
 +		pa = sy_pa(sy_mem_va + ((vm_offset_t)i << 12));
@@ -4681,11 +4694,23 @@
 +	for (i = 0; i < 16; i++)
 +		flush_dcache64(sy_pa(sy_mem_l3 + ((vm_offset_t)i << 12)),
 +		    (unsigned)PAGE_SIZE, TRUE);
-+	flush_dcache64(sy_pa(sy_l2), (unsigned)PAGE_SIZE, TRUE);
++	flush_dcache64(sy_pa(sy_mem_l2), (unsigned)PAGE_SIZE, TRUE);
++	flush_dcache64(sy_pa(sy_l1), (unsigned)PAGE_SIZE, TRUE);
 +	__asm__ volatile("dsb sy" ::: "memory");
-+	printf("PANDORA WLAN: MEM: %u MiB at iova %#x (va %#lx l3 %#lx)\n",
++	if (sy_cb_va && sy_smmu_asid) {
++		sy_wr(sy_cb_va, 0x610, sy_smmu_asid);
++		sy_wr(sy_cb_va, 0x7f0, 0xffffffffu);
++		for (i = 0; i < 100u; i++) {
++			if (sy_rd(sy_cb_va, 0x7f4) & 1u)
++				break;
++			sy_usleep(1000);
++		}
++		printf("PANDORA WLAN: MEM: tlbi asid %#x sync %#x\n",
++		    sy_smmu_asid, sy_rd(sy_cb_va, 0x7f4));
++	}
++	printf("PANDORA WLAN: MEM: %u MiB at iova %#x (va %#lx l2 %#lx l3 %#lx)\n",
 +	    SY_MEM_SIZE >> 20, (unsigned)SY_MEM_IOVA, (unsigned long)sy_mem_va,
-+	    (unsigned long)sy_mem_l3);
++	    (unsigned long)sy_mem_l2, (unsigned long)sy_mem_l3);
 +	sy_log_sync();
 +	return 0;
 +}
@@ -4828,12 +4853,13 @@
 +	return at + 3 + n;
 +}
 +
-+/* host_cap matches the captured Android message except TLV 0x1F.
++/* host_cap is the captured Android message, including TLV 0x1F.
++ * 0x1F is three {start u64, size u64}: 0x18000000/0x98010000 and two zeros.
 + * 0x11 wake_msi=13, 0x16 m3_support=1, 0x17 m3_cache_support=1,
 + * 0x20 host_build_type=SECONDARY (2), 0x24 max_mlo_peer=32.
 + * 0x26 is three 6-byte mlo_chip_info records. Chip 0 has two links.
-+ * 0x27 is DRV|WLAN_EN|AUX_UC. 0x13, 0x1C and 0x1F are not sent.
-+ * k28/k29 sent a different ddr_range and entered MHI SYS_ERR. */
++ * 0x27 is DRV|WLAN_EN|AUX_UC. 0x13 and 0x1C are not sent.
++ * k28/k29 sent 0xb1000000/0xb0000000 and entered MHI SYS_ERR. */
 +static unsigned
 +sy_wlfw_host_cap(uint8_t *b, uint16_t txn)
 +{
@@ -4841,6 +4867,15 @@
 +		0x00, 0x02, 0x00, 0x01, 0x01, 0x01,
 +		0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
 +		0x00, 0x00, 0x00, 0x00, 0x00, 0x00
++	};
++	/* host_cap_full.txt: 1f 30 00 then 48 bytes. End of the window is 0xb0010000. */
++	static const uint8_t ddr[48] = {
++		0x00, 0x00, 0x00, 0x18, 0x00, 0x00, 0x00, 0x00,
++		0x00, 0x00, 0x01, 0x98, 0x00, 0x00, 0x00, 0x00,
++		0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++		0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++		0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++		0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00
 +	};
 +	unsigned at = sy_qmi_hdr(b, 0x00, txn, SY_QMI_WLFW_HOST_CAP_REQ);
 +
@@ -4852,6 +4887,7 @@
 +	at = sy_qmi_tlv_u8(b, at, 0x1a, 1);			/* cal_done */
 +	at = sy_qmi_tlv_str(b, at, 0x1e,
 +	    "Qualcomm Technologies, Inc. Songyuan based on SM8850", 52);
++	at = sy_qmi_tlv_str(b, at, 0x1f, (const char *)ddr, 48);
 +	at = sy_qmi_tlv_u32(b, at, 0x20, 2);			/* host_build_type */
 +	at = sy_qmi_tlv_u8(b, at, 0x21, 1);			/* mlo_capable */
 +	at = sy_qmi_tlv_u16(b, at, 0x22, 0);			/* mlo_chip_id */
@@ -5069,7 +5105,7 @@
 +	unsigned total = 0, bad = 0, n;
 +	uint8_t frame[256];
 +	static const uint8_t bdf_data[4] = { 0x7f, 0x45, 0x4c, 0x46 };
-+	static const uint8_t cap_tlv[146] = {
++	static const uint8_t cap_tlv[197] = {
 +		0x10, 0x04, 0x00, 0x01, 0x00, 0x00, 0x00, 0x11, 0x04, 0x00, 0x0d, 0x00,
 +		0x00, 0x00, 0x14, 0x01, 0x00, 0x01, 0x16, 0x01, 0x00, 0x01, 0x17, 0x01,
 +		0x00, 0x01, 0x1a, 0x01, 0x00, 0x01, 0x1e, 0x34, 0x00, 0x51, 0x75, 0x61,
@@ -5077,7 +5113,11 @@
 +		0x6c, 0x6f, 0x67, 0x69, 0x65, 0x73, 0x2c, 0x20, 0x49, 0x6e, 0x63, 0x2e,
 +		0x20, 0x53, 0x6f, 0x6e, 0x67, 0x79, 0x75, 0x61, 0x6e, 0x20, 0x62, 0x61,
 +		0x73, 0x65, 0x64, 0x20, 0x6f, 0x6e, 0x20, 0x53, 0x4d, 0x38, 0x38, 0x35,
-+		0x30, 0x20, 0x04, 0x00, 0x02, 0x00, 0x00, 0x00, 0x21, 0x01, 0x00, 0x01,
++		0x30, 0x1f, 0x30, 0x00, 0x00, 0x00, 0x00, 0x18, 0x00, 0x00, 0x00, 0x00,
++		0x00, 0x00, 0x01, 0x98, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++		0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++		0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++		0x00, 0x00, 0x00, 0x00, 0x20, 0x04, 0x00, 0x02, 0x00, 0x00, 0x00, 0x21, 0x01, 0x00, 0x01,
 +		0x22, 0x02, 0x00, 0x00, 0x00, 0x23, 0x01, 0x00, 0x00, 0x24, 0x02, 0x00,
 +		0x20, 0x00, 0x25, 0x01, 0x00, 0x01, 0x26, 0x12, 0x00, 0x00, 0x02, 0x00,
 +		0x01, 0x01, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
@@ -5087,26 +5127,28 @@
 +
 +	n = sy_wlfw_host_cap(sy_qmi_tx, 0x1234);
 +	total++;
-+	if (n != 7 + 146 || sy_qmi_tx[0] != 0 || sy_qmi_tx[3] != 0x34 ||
++	if (n != 7 + 197 || sy_qmi_tx[0] != 0 || sy_qmi_tx[3] != 0x34 ||
 +	    sy_qmi_tx[4] != 0 ||
-+	    (sy_qmi_tx[5] | (sy_qmi_tx[6] << 8)) != 146 ||
-+	    memcmp(sy_qmi_tx + 7, cap_tlv, 146) != 0)
++	    (sy_qmi_tx[5] | (sy_qmi_tx[6] << 8)) != 197 ||
++	    memcmp(sy_qmi_tx + 7, cap_tlv, 197) != 0)
 +		bad++;
 +	{
 +		unsigned at = 7;
-+		int saw = 0;
++		int saw = 0, saw_1f = 0;
 +
 +		while (at + 3 <= n) {
 +			uint16_t tl = (uint16_t)(sy_qmi_tx[at + 1] | (sy_qmi_tx[at + 2] << 8));
 +
 +			if (at + 3u + tl > n)
 +				break;
-+			if (sy_qmi_tx[at] == 0x1f || sy_qmi_tx[at] == 0x13)
++			if (sy_qmi_tx[at] == 0x13)
 +				saw = 1;
++			if (sy_qmi_tx[at] == 0x1f && tl == 48)
++				saw_1f = 1;
 +			at += 3u + tl;
 +		}
 +		total++;
-+		if (saw)
++		if (saw || !saw_1f)
 +			bad++;
 +	}
 +	n = sy_wlfw_ind_register(sy_qmi_tx, 0x1235);
@@ -5427,7 +5469,7 @@
 +
 +				sy_wlfw_cap_sent = 1;
 +				at = sy_wlfw_host_cap(sy_wlfw_txbuf, sy_wlfw_txn++);
-+				printf("PANDORA WLAN: WLFW host_cap ddr omitted nm omitted feature %#x platform 52 qmi %u\n",
++				printf("PANDORA WLAN: WLFW host_cap ddr 0x18000000 size 0x98010000 feature %#x platform 52 qmi %u\n",
 +				    (unsigned)SY_WLFW_FEATURE_LIST, at);
 +				fl = sy_qrtr_frame(frame, SY_QRTR_TYPE_DATA, 0,
 +				    SY_WLFW_QRTR_PORT, src_node, src_port,
