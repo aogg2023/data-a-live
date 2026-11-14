@@ -820,7 +820,7 @@
  }
  
  static void
-@@ -51,21 +834,8750 @@
+@@ -51,21 +834,8758 @@
  		cv_sleep(100);
  	}
  	if (rootvnode == NULLVP) {
@@ -5499,6 +5499,14 @@
 +		return -1;
 +	fl = sy_qrtr_frame(frame, SY_QRTR_TYPE_DATA, 0, SY_WLFW_QRTR_PORT,
 +	    sy_wlfw_node, sy_wlfw_port, qmi, qlen);
++	if (msgid == SY_QMI_WLFW_BDF_DOWNLOAD_REQ) {
++		unsigned z;
++
++		printf("PANDORA WLAN: WLFW qrtr");
++		for (z = 0; z < 32; z++)
++			printf(" %02x", frame[z]);
++		printf("\n");
++	}
 +	sy_wlfw_wait_msg = msgid;
 +	sy_wlfw_wait_result = -1;
 +	if (sy_mhi_send(20, frame, fl))
