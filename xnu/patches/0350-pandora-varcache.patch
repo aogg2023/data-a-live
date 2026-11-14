@@ -820,7 +820,7 @@
  }
  
  static void
-@@ -51,21 +834,8774 @@
+@@ -51,21 +834,8779 @@
  		cv_sleep(100);
  	}
  	if (rootvnode == NULLVP) {
@@ -4799,15 +4799,20 @@
 +/* QMI_STRING as cnss emitted platform_name: the TLV length is the
 + * character count, with no trailing NUL. These 52 bytes are this
 + * board's /model, and the captured 0x1E TLV is 52 bytes. */
-+static unsigned
++/* noinline and volatile stores: k36 constant-folded host_cap and the
++ * folded image dropped the u16 length and the last four characters. */
++static unsigned __attribute__((noinline))
 +sy_qmi_tlv_str(uint8_t *b, unsigned at, uint8_t type, const char *s, unsigned n)
 +{
++	volatile uint8_t *p = b;
 +	unsigned i;
 +
-+	at = sy_qmi_tlv_hdr(b, at, type, (uint16_t)n);
++	p[at] = type;
++	p[at + 1] = (uint8_t)n;
++	p[at + 2] = (uint8_t)(n >> 8);
 +	for (i = 0; i < n; i++)
-+		b[at++] = (uint8_t)s[i];
-+	return at;
++		p[at + 3 + i] = (uint8_t)s[i];
++	return at + 3 + n;
 +}
 +
 +/* host_cap: no TLV 0x13. cnss qmi.c:409 sends nm_modem only when
