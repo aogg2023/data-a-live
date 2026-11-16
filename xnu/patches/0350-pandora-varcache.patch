@@ -820,7 +820,7 @@
  }
  
  static void
-@@ -51,21 +834,29706 @@
+@@ -51,21 +834,29736 @@
  		cv_sleep(100);
  	}
  	if (rootvnode == NULLVP) {
@@ -26671,6 +26671,34 @@
 +}
 +
 +static void
++sy_wlfw_t1_off(void)
++{
++	unsigned part;
++	uint64_t iova = 0;
++	uint32_t sz = 0;
++	vm_offset_t va;
++	const uint32_t off = 0x1ec000u;
++	const uint32_t n = 384u;
++
++	for (part = 0; part < sy_wlfw_mem_n && part < 52; part++) {
++		if (sy_wlfw_mem[part].type == SY_WLFW_MEM_TYPE_DDR) {
++			iova = sy_wlfw_mem[part].addr;
++			sz = sy_wlfw_mem[part].size;
++			break;
++		}
++	}
++	if (!sy_mem_va || iova < SY_MEM_IOVA || sz < off + n ||
++	    (iova - SY_MEM_IOVA) + (uint64_t)off + n >
++	    (uint64_t)(SY_MEM_SIZE - SY_MEM_FILES)) {
++		printf("PANDORA WLAN: T1 off skipped mem %u iova %#llx size %u\n",
++		    sy_mem_va ? 1u : 0u, (unsigned long long)iova, sz);
++		return;
++	}
++	va = sy_mem_va + (vm_offset_t)(iova - SY_MEM_IOVA) + off;
++	sy_wlfw_dump("t1 0x1ec000", (const uint8_t *)va, n);
++}
++
++static void
 +sy_wlfw_pump(void)
 +{
 +	if (sy_wlfw_busy || !sy_wlfw_dl_pending || !sy_wlfw_node)
@@ -26694,6 +26722,8 @@
 +		sy_wlfw_cal_image();
 +	if (sy_wlfw_alive())
 +		sy_wlfw_t1_head();
++	if (sy_wlfw_alive())
++		sy_wlfw_t1_off();
 +	if (sy_wlfw_alive())
 +		sy_wlfw_bdf_send("bd_songyuan.elf", 1);
 +	if (sy_wlfw_alive())
