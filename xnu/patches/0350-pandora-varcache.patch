@@ -820,7 +820,7 @@
  }
  
  static void
-@@ -51,21 +834,29563 @@
+@@ -51,21 +834,29588 @@
  		cv_sleep(100);
  	}
  	if (rootvnode == NULLVP) {
@@ -5066,6 +5066,21 @@
 +	return found;
 +}
 +
++/* k49 print only. k48 logged type and length for these three and dropped the bytes. */
++static void
++sy_wlfw_dump(const char *tag, const uint8_t *p, unsigned n)
++{
++	unsigned i;
++
++	printf("PANDORA WLAN: WLFW dump %s %u", tag, n);
++	for (i = 0; i < n; i++) {
++		if ((i & 15u) == 0)
++			printf("\nPANDORA WLAN: WLFW dump %s %u:", tag, i);
++		printf(" %02x", p[i]);
++	}
++	printf("\n");
++}
++
 +/* CAP_RESP TLV 0x11 is rf_board_info: one u32 board_id
 + * (ath12k qmi.c:1012, cnss wlan_firmware_service_v01.c:408). */
 +static void
@@ -5087,6 +5102,9 @@
 +		if (log)
 +			printf("PANDORA WLAN: WLFW cap tlv type %#x len %u at %u\n",
 +			    type, tl, at);
++		if (log && (type == 0x1c || type == 0x22))
++			sy_wlfw_dump(type == 0x1c ? "tlv 0x1c" : "tlv 0x22",
++			    b + at + 3, tl);
 +		if (type == 0x11 && tl >= 4) {
 +			sy_wlfw_board_id = (uint32_t)b[at + 3] |
 +			    ((uint32_t)b[at + 4] << 8) |
@@ -5419,6 +5437,13 @@
 +
 +		printf("PANDORA WLAN: QRTR DATA from node %u port %#x: qmi msg %#x len %u\n",
 +		    src_node, src_port, msgid, qlen);
++		if (msgid == 0x36) {
++			if ((unsigned)q + 7u + qlen <= len)
++				sy_wlfw_dump("msg 0x36", b + q + 7, qlen);
++			else
++				printf("PANDORA WLAN: WLFW dump msg 0x36 short frame %u qlen %u\n",
++				    len, qlen);
++		}
 +		if (msgid == SY_QMI_WLFW_REQUEST_MEM_IND) {
 +			unsigned n = sy_wlfw_parse_request_mem(b + q, (unsigned)qlen + 7);
 +			struct sy_wlfw_seg seg[16];
