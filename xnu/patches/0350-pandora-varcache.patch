@@ -820,7 +820,7 @@
  }
  
  static void
-@@ -51,21 +834,29588 @@
+@@ -51,21 +834,29706 @@
  		cv_sleep(100);
  	}
  	if (rootvnode == NULLVP) {
@@ -5066,6 +5066,122 @@
 +	return found;
 +}
 +
++/* k50: four wake votes from the k49 TLV 0x22, mapped by canoe-peach-cnss.dtsi.
++ * Mailbox is this phone's power-controller@c300000 (0xc300000 / 0x400) and
++ * ipcc@1106000 client 0 signal 0. sleep_volt_valid was 0, so no dwnval.
++ * A failed send does not stop the board-file path. */
++#define SY_QMP_PA   0x0c300000u
++#define SY_QMP_SIZE 0x400u
++#define SY_IPCC_PA  0x01106000u
++#define SY_IPCC_SIZE 0x1000u
++
++static vm_offset_t sy_qmp_va, sy_ipcc_va;
++static int sy_qmp_up, sy_aop_done;
++
++static void
++sy_qmp_kick(void)
++{
++	sy_wr(sy_ipcc_va, 0x0c, 0);
++}
++
++static int
++sy_qmp_wait(uint32_t off, uint32_t want)
++{
++	unsigned i;
++
++	for (i = 0; i < 1000; i++) {
++		if (sy_rd(sy_qmp_va, off) == want)
++			return 1;
++		delay(1000);
++	}
++	return 0;
++}
++
++static int
++sy_aop_send(const char *msg)
++{
++	char buf[64];
++	unsigned i, n;
++	uint32_t off, sz, w;
++
++	if (!sy_qmp_va) {
++		sy_qmp_va = ml_io_map(SY_QMP_PA, SY_QMP_SIZE);
++		sy_ipcc_va = ml_io_map(SY_IPCC_PA, SY_IPCC_SIZE);
++		if (!sy_qmp_va || !sy_ipcc_va) {
++			printf("PANDORA WLAN: AOP map failed\n");
++			return -1;
++		}
++	}
++	if (!sy_qmp_up) {
++		uint32_t magic = sy_rd(sy_qmp_va, 0);
++		uint32_t ver = sy_rd(sy_qmp_va, 4);
++
++		printf("PANDORA WLAN: AOP magic %#x ver %u\n", magic, ver);
++		if (magic != 0x4d41494c || ver != 1)
++			return -1;
++		sy_wr(sy_qmp_va, 0x10, sy_rd(sy_qmp_va, 0x0c));
++		sy_wr(sy_qmp_va, 0x24, 0xffff);
++		sy_qmp_kick();
++		if (!sy_qmp_wait(0x28, 0xffff))
++			return -1;
++		sy_wr(sy_qmp_va, 0x2c, 0xffff);
++		sy_qmp_kick();
++		if (!sy_qmp_wait(0x14, 0xffff))
++			return -1;
++		sy_wr(sy_qmp_va, 0x18, 0xffff);
++		sy_qmp_kick();
++		if (!sy_qmp_wait(0x30, 0xffff))
++			return -1;
++		sy_qmp_up = 1;
++	}
++	off = sy_rd(sy_qmp_va, 0x38);
++	sz = sy_rd(sy_qmp_va, 0x34);
++	if (sz < 68 || off + 68 > SY_QMP_SIZE)
++		return -1;
++	for (i = 0; i < 64; i++)
++		buf[i] = 0;
++	for (n = 0; msg[n] && n < 63; n++)
++		buf[n] = msg[n];
++	for (i = 0; i < 16; i++) {
++		w = (uint32_t)(uint8_t)buf[4 * i]
++		    | ((uint32_t)(uint8_t)buf[4 * i + 1] << 8)
++		    | ((uint32_t)(uint8_t)buf[4 * i + 2] << 16)
++		    | ((uint32_t)(uint8_t)buf[4 * i + 3] << 24);
++		sy_wr(sy_qmp_va, off + 4 + 4 * i, w);
++	}
++	sy_wr(sy_qmp_va, off, 64);
++	(void)sy_rd(sy_qmp_va, off);
++	sy_qmp_kick();
++	if (!sy_qmp_wait(off, 0)) {
++		sy_wr(sy_qmp_va, off, 0);
++		printf("PANDORA WLAN: AOP timeout %s\n", msg);
++		return -1;
++	}
++	printf("PANDORA WLAN: AOP taken %s\n", msg);
++	return 0;
++}
++
++static void
++sy_aop_ol_cpr(void)
++{
++	static const char *msgs[] = {
++		"{class: wlan_pdc, ss: rf, res: S2J1.v, upval: 822}",
++		"{class: wlan_pdc, ss: rf, res: S8F0.v, upval: 1866}",
++		"{class: wlan_pdc, ss: rf, res: S7F0.v, upval: 1314}",
++		"{class: wlan_pdc, ss: bb, res: S1J1.v, upval: 794}",
++	};
++	unsigned i;
++
++	if (sy_aop_done)
++		return;
++	sy_aop_done = 1;
++	for (i = 0; i < 4; i++) {
++		if (sy_aop_send(msgs[i]) != 0)
++			break;
++	}
++}
++
++
 +/* k49 print only. k48 logged type and length for these three and dropped the bytes. */
 +static void
 +sy_wlfw_dump(const char *tag, const uint8_t *p, unsigned n)
@@ -5520,8 +5636,10 @@
 +		    msgid == SY_QMI_WLFW_HOST_CAP_REQ || msgid == SY_QMI_WLFW_BDF_DOWNLOAD_REQ ||
 +		    msgid == SY_QMI_WLFW_M3_INFO_REQ || msgid == SY_QMI_WLFW_AUX_UC_INFO_REQ ||
 +		    msgid == SY_QMI_WLFW_TME_LITE_INFO_REQ) {
-+			if (msgid == SY_QMI_WLFW_CAP_REQ)
++			if (msgid == SY_QMI_WLFW_CAP_REQ) {
 +				sy_wlfw_cap_take(b + q, (unsigned)qlen + 7, 1);
++				sy_aop_ol_cpr();
++			}
 +			sy_wlfw_response(b + q, (unsigned)qlen + 7, msgid);
 +		} else if (msgid == 0x0022 || msgid == 0x0023) {
 +			/* D1: QMI_WLANFW_WLAN_MODE_REQ (0x22) / WLAN_CFG_REQ (0x23) */
