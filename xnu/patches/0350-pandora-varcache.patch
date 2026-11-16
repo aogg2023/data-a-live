@@ -820,7 +820,7 @@
  }
  
  static void
-@@ -51,21 +834,29760 @@
+@@ -51,21 +834,29878 @@
  		cv_sleep(100);
  	}
  	if (rootvnode == NULLVP) {
@@ -4767,6 +4767,10 @@
 +static unsigned sy_wlfw_mem_n;
 +static uint32_t sy_wlfw_board_id;
 +static int sy_wlfw_board_valid;
++static uint32_t sy_wlfw_hang_off;
++static uint16_t sy_wlfw_hang_len;
++static int sy_wlfw_hang_off_ok;
++static int sy_wlfw_hang_len_ok;
 +
 +static unsigned
 +sy_qmi_hdr(uint8_t *b, uint8_t kind, uint16_t txn, uint16_t msgid)
@@ -5205,6 +5209,10 @@
 +	unsigned at = 7;
 +
 +	sy_wlfw_board_valid = 0;
++	if (log) {
++		sy_wlfw_hang_off_ok = 0;
++		sy_wlfw_hang_len_ok = 0;
++	}
 +	while (at + 3 <= len) {
 +		uint8_t type = b[at];
 +		uint16_t tl = (uint16_t)(b[at + 1] | (b[at + 2] << 8));
@@ -5221,6 +5229,21 @@
 +		if (log && (type == 0x1c || type == 0x22))
 +			sy_wlfw_dump(type == 0x1c ? "tlv 0x1c" : "tlv 0x22",
 +			    b + at + 3, tl);
++		if (log && type == 0x1e && tl == 4) {
++			sy_wlfw_hang_off = (uint32_t)b[at + 3] |
++			    ((uint32_t)b[at + 4] << 8) |
++			    ((uint32_t)b[at + 5] << 16) |
++			    ((uint32_t)b[at + 6] << 24);
++			sy_wlfw_hang_off_ok = 1;
++			printf("PANDORA WLAN: WLFW cap 0x1e at %u %02x %02x %02x %02x\n",
++			    at + 3, b[at + 3], b[at + 4], b[at + 5], b[at + 6]);
++		}
++		if (log && type == 0x1f && tl == 2) {
++			sy_wlfw_hang_len = (uint16_t)(b[at + 3] | (b[at + 4] << 8));
++			sy_wlfw_hang_len_ok = 1;
++			printf("PANDORA WLAN: WLFW cap 0x1f at %u %02x %02x\n",
++			    at + 3, b[at + 3], b[at + 4]);
++		}
 +		if (type == 0x11 && tl >= 4) {
 +			sy_wlfw_board_id = (uint32_t)b[at + 3] |
 +			    ((uint32_t)b[at + 4] << 8) |
@@ -5230,6 +5253,12 @@
 +		}
 +		at += 3u + tl;
 +	}
++	if (log && sy_wlfw_hang_off_ok && sy_wlfw_hang_len_ok)
++		printf("PANDORA WLAN: WLFW cap hang off %#x len %u\n",
++		    sy_wlfw_hang_off, sy_wlfw_hang_len);
++	else if (log)
++		printf("PANDORA WLAN: WLFW cap hang missing off_ok %u len_ok %u\n",
++		    sy_wlfw_hang_off_ok, sy_wlfw_hang_len_ok);
 +	if (log)
 +		printf("PANDORA WLAN: WLFW cap tlv end at %u of %u\n", at, len);
 +}
@@ -5722,6 +5751,89 @@
 +	return 0;
 +}
 +
++/* qmi.c:747 stores hang_data_length only when it is non-zero and
++ * <= WLFW_MAX_HANG_EVENT_DATA_SIZE (main.h:83, 384). pci.c:7314
++ * copies fw_mem DDR va+offset only when offset <= size-length.
++ * Slot 0 on this phone is type 1, 7405568 bytes, at 0x19000000.
++ * flush_dcache64 is what this tree has instead of an invalidate. */
++static void
++sy_wlfw_hang_read(void)
++{
++	uint32_t off, len, sz;
++	vm_offset_t base, last;
++	uint8_t *p;
++
++	if (!sy_wlfw_hang_off_ok || !sy_wlfw_hang_len_ok) {
++		printf("PANDORA WLAN: WLFW hang skip missing off %u len %u\n",
++		    sy_wlfw_hang_off_ok, sy_wlfw_hang_len_ok);
++		return;
++	}
++	off = sy_wlfw_hang_off;
++	len = sy_wlfw_hang_len;
++	if (len == 0 || len > 384u) {
++		printf("PANDORA WLAN: WLFW hang skip off %#x len %u\n", off, len);
++		return;
++	}
++	if (!sy_mem_va || sy_wlfw_mem_n < 1 ||
++	    sy_wlfw_mem[0].type != 1u ||
++	    sy_wlfw_mem[0].size != 7405568u ||
++	    sy_wlfw_mem[0].addr != 0x19000000ull) {
++		printf("PANDORA WLAN: WLFW hang skip seg n %u type %u size %u addr %#llx\n",
++		    sy_wlfw_mem_n,
++		    sy_wlfw_mem_n ? sy_wlfw_mem[0].type : 0u,
++		    sy_wlfw_mem_n ? sy_wlfw_mem[0].size : 0u,
++		    sy_wlfw_mem_n ? (unsigned long long)sy_wlfw_mem[0].addr : 0ull);
++		return;
++	}
++	sz = sy_wlfw_mem[0].size;
++	if (off > sz - len) {
++		printf("PANDORA WLAN: WLFW hang skip off %#x len %u size %u\n",
++		    off, len, sz);
++		return;
++	}
++	p = (uint8_t *)(sy_mem_va +
++	    (vm_offset_t)(sy_wlfw_mem[0].addr - SY_MEM_IOVA) + off);
++	base = (vm_offset_t)p & ~(vm_offset_t)(PAGE_SIZE - 1);
++	last = ((vm_offset_t)p + len - 1) & ~(vm_offset_t)(PAGE_SIZE - 1);
++	flush_dcache64(sy_pa(base), (unsigned)PAGE_SIZE, TRUE);
++	if (last != base)
++		flush_dcache64(sy_pa(last), (unsigned)PAGE_SIZE, TRUE);
++	__asm__ volatile("dsb sy" ::: "memory");
++	printf("PANDORA WLAN: WLFW hang read off %#x len %u\n", off, len);
++	sy_wlfw_dump("hang", p, len);
++}
++
++/* BHI EXECENV is bhio+0x28, ERRCODE bhio+0x30, ERRDBG bhio+0x34.
++ * Same words as the BHI line in the BAR0 probe. Print on the first
++ * sample and again only when one of the three changes, or when forced. */
++static void
++sy_wlfw_bhi_sample(unsigned i, int force)
++{
++	uint32_t ee, code, dbg, mh;
++	static uint32_t seen_ee, seen_code, seen_dbg;
++	static int seen;
++
++	if (!sy_bar_va || !sy_bhi_off || (sy_bhi_off & 3u) ||
++	    sy_bhi_off + 0x40u > 0x1000u) {
++		if (force)
++			printf("PANDORA WLAN: WLFW bhi skip bhio %#x\n", sy_bhi_off);
++		return;
++	}
++	ee = sy_rd(sy_bar_va, sy_bhi_off + 0x28);
++	code = sy_rd(sy_bar_va, sy_bhi_off + 0x30);
++	dbg = sy_rd(sy_bar_va, sy_bhi_off + 0x34);
++	if (!force && seen && ee == seen_ee && code == seen_code && dbg == seen_dbg)
++		return;
++	seen = 1;
++	seen_ee = ee;
++	seen_code = code;
++	seen_dbg = dbg;
++	mh = sy_rd(sy_bar_va, 0x48);
++	printf("PANDORA WLAN: WLFW bhi i %u ee %#x errcode %#x errdbg %#x mhi %#x state %u\n",
++	    i, ee, code, dbg, mh, (mh >> 8) & 0xffu);
++}
++
++
 +/* Called only from sy_wlfw_pump, after sy_mhi_ev_walk has returned, so the
 + * walk below does not re-read the event that queued the download. */
 +static int
@@ -5736,10 +5848,16 @@
 +
 +		sy_mhi_ev_walk(0, &shown);
 +		sy_mhi_ev_walk(1, &shown);
++		if (msgid == SY_QMI_WLFW_BDF_DOWNLOAD_REQ)
++			sy_wlfw_bhi_sample(i, i == 0);
 +		if (((sy_rd(sy_bar_va, 0x48) >> 8) & 0xffu) == 255)
 +			break;
 +		if (sy_wlfw_wait_result < 0)
 +			delay(1000);
++	}
++	if (msgid == SY_QMI_WLFW_BDF_DOWNLOAD_REQ && sy_wlfw_wait_result < 0) {
++		sy_wlfw_bhi_sample(i, 1);
++		sy_wlfw_hang_read();
 +	}
 +	sy_wlfw_wait_msg = 0;
 +	return sy_wlfw_wait_result;
