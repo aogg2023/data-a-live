@@ -4689,7 +4689,7 @@
 +	for (i = 0; i < (SY_MEM_SIZE >> 12); i++) {
 +		pa = sy_pa(sy_mem_va + ((vm_offset_t)i << 12));
 +		((uint64_t *)(sy_mem_l3 + (((vm_offset_t)i >> 9) << 12)))[i & 0x1ff] =
-+		    (pa & 0x0000fffffffff000ull) | 0x0060000000000f47ull;
++		    (pa & 0x0000fffffffff000ull) | 0x0060000000000e47ull;
 +	}
 +	for (i = 0; i < 16; i++)
 +		flush_dcache64(sy_pa(sy_mem_l3 + ((vm_offset_t)i << 12)),
@@ -4710,7 +4710,7 @@
 +	}
 +	printf("PANDORA WLAN: MEM: %u MiB at iova %#x pte %#llx (va %#lx l2 %#lx l3 %#lx)\n",
 +	    SY_MEM_SIZE >> 20, (unsigned)SY_MEM_IOVA,
-+	    (unsigned long long)0x0060000000000f47ull, (unsigned long)sy_mem_va,
++	    (unsigned long long)0x0060000000000e47ull, (unsigned long)sy_mem_va,
 +	    (unsigned long)sy_mem_l2, (unsigned long)sy_mem_l3);
 +	sy_log_sync();
 +	return 0;
