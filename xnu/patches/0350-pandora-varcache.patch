@@ -820,7 +820,7 @@
  }
  
  static void
-@@ -51,21 +834,29741 @@
+@@ -51,21 +834,29751 @@
  		cv_sleep(100);
  	}
  	if (rootvnode == NULLVP) {
@@ -26701,6 +26701,16 @@
 +	flush_dcache64(sy_pa(va), (unsigned)PAGE_SIZE, TRUE);
 +	__asm__ volatile("dsb sy" ::: "memory");
 +	sy_wlfw_dump("t1 0x1ec000", (const uint8_t *)va, n);
++	if (sz < 0x1ec580u + 64u ||
++	    (iova - SY_MEM_IOVA) + 0x1ec580ull + 64u >
++	    (uint64_t)(SY_MEM_SIZE - SY_MEM_FILES)) {
++		printf("PANDORA WLAN: T1 rc skipped size %u\n", sz);
++	} else {
++		sy_wlfw_dump("t1 0x1ec580",
++		    (const uint8_t *)(sy_mem_va +
++		    (vm_offset_t)(iova - SY_MEM_IOVA) + 0x1ec580u),
++		    64u);
++	}
 +}
 +
 +static void
