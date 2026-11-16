@@ -820,7 +820,7 @@
  }
  
  static void
-@@ -51,21 +834,29736 @@
+@@ -51,21 +834,29741 @@
  		cv_sleep(100);
  	}
  	if (rootvnode == NULLVP) {
@@ -26677,6 +26677,7 @@
 +	uint64_t iova = 0;
 +	uint32_t sz = 0;
 +	vm_offset_t va;
++	unsigned i;
 +	const uint32_t off = 0x1ec000u;
 +	const uint32_t n = 384u;
 +
@@ -26695,6 +26696,10 @@
 +		return;
 +	}
 +	va = sy_mem_va + (vm_offset_t)(iova - SY_MEM_IOVA) + off;
++	for (i = 0; i < n; i++)
++		((uint8_t *)va)[i] = 0xaa;
++	flush_dcache64(sy_pa(va), (unsigned)PAGE_SIZE, TRUE);
++	__asm__ volatile("dsb sy" ::: "memory");
 +	sy_wlfw_dump("t1 0x1ec000", (const uint8_t *)va, n);
 +}
 +
