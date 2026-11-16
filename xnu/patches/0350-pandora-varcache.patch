@@ -820,7 +820,7 @@
  }
  
  static void
-@@ -51,21 +834,29878 @@
+@@ -51,21 +834,29945 @@
  		cv_sleep(100);
  	}
  	if (rootvnode == NULLVP) {
@@ -5833,6 +5833,69 @@
 +	    i, ee, code, dbg, mh, (mh >> 8) & 0xffu);
 +}
 +
++/* K57 read-only observation of the ch21 outbound path. The 0x25 handler
++ * disassembly (work/QMI_0x25_HANDLER.md) proved every path there calls the
++ * send function 0x1249da8, so the 2355 ms silence is not inside the handler.
++ * Two options remain: (a) the request was never dispatched to callback
++ * 0x1872c14, or (b) a response was produced but never reached ch21. This
++ * prints ch20/ch21 channel context rp/wp, event ring 1 device producer index,
++ * and the OR of the first word of the 8 posted ch21 DL buffers. All reads go
++ * through the write-combined aliases and cached pages that sy_mhi_ev_walk and
++ * sy_mhi_chan_start already use. Prints only on change or when forced; writes
++ * nothing, adds no delay, does not touch the send path or the 2000 iterations. */
++static void
++sy_wlfw_ch21_sample(unsigned i, int force)
++{
++	static uint32_t seen_dev, seen_c20, seen_rp, seen_wp, seen_b0, seen;
++	uint32_t dev, c20, rp, wp, b0, n;
++	vm_offset_t u;
++
++	if (!sy_bar_va || !sy_sbl_va)
++		return;
++	u = sy_mhi_ucva(SY_MHI_EV_CTX + 0x2cu + 0x1cu);
++	dev = u ? sy_rd(u, 0) : 0;
++	u = sy_mhi_ucva(SY_MHI_CH_CTX + 20u * 0x2cu + 0x1cu);
++	c20 = u ? sy_rd(u, 0) : 0;
++	u = sy_mhi_ucva(SY_MHI_CH_CTX + 21u * 0x2cu + 0x1cu);
++	rp = u ? sy_rd(u, 0) : 0;
++	u = sy_mhi_ucva(SY_MHI_CH_CTX + 21u * 0x2cu + 0x24u);
++	wp = u ? sy_rd(u, 0) : 0;
++	b0 = 0;
++	for (n = 0; n < SY_MHI_DL_NBUF; n++)
++		b0 |= sy_rd(sy_sbl_va + 0x7C0000u + SY_MHI_DL_BUF + n * 0x800u, 0);
++	if (!force && seen && dev == seen_dev && c20 == seen_c20 &&
++	    rp == seen_rp && wp == seen_wp && b0 == seen_b0)
++		return;
++	seen = 1;
++	seen_dev = dev; seen_c20 = c20; seen_rp = rp; seen_wp = wp; seen_b0 = b0;
++	printf("PANDORA WLAN: WLFW ch21 i %u er1dev %#x c20rp %#x rp %#x wp %#x dl0 %#x\n",
++	    i, dev, c20, rp, wp, b0);
++}
++
++/* The firmware 0x25 handler advances a progress word at VA 0x154cd90
++ * (Hexagon RAM, the 0x1511000 segment). It is host-readable only if a CAP
++ * segment maps that address. On this phone TLV 0x1c dev_mem_info is
++ * 0x113000/0x5000 (AOP) and respond_mem is host DDR from 0x19000000; neither
++ * covers 0x154cd90, so a direct read would fault. Record the reachability once
++ * instead of issuing an invalid read. */
++static void
++sy_wlfw_progress_check(void)
++{
++	unsigned i;
++	int reachable = 0;
++
++	for (i = 0; i < sy_wlfw_mem_n; i++) {
++		uint64_t a = sy_wlfw_mem[i].addr, z = sy_wlfw_mem[i].size;
++
++		if (a && z && 0x154cd90ull >= a && 0x154cd90ull < a + z)
++			reachable = 1;
++	}
++	if (0x154cd90ull >= 0x113000ull && 0x154cd90ull < 0x118000ull)
++		reachable = 1;
++	printf("PANDORA WLAN: WLFW progress 0x154cd90 %s (segs %u, devmem 0x113000+0x5000)\n",
++	    reachable ? "IN host window" : "NOT reachable from host", sy_wlfw_mem_n);
++}
++
 +
 +/* Called only from sy_wlfw_pump, after sy_mhi_ev_walk has returned, so the
 + * walk below does not re-read the event that queued the download. */
@@ -5848,8 +5911,10 @@
 +
 +		sy_mhi_ev_walk(0, &shown);
 +		sy_mhi_ev_walk(1, &shown);
-+		if (msgid == SY_QMI_WLFW_BDF_DOWNLOAD_REQ)
++		if (msgid == SY_QMI_WLFW_BDF_DOWNLOAD_REQ) {
 +			sy_wlfw_bhi_sample(i, i == 0);
++			sy_wlfw_ch21_sample(i, i == 0);
++		}
 +		if (((sy_rd(sy_bar_va, 0x48) >> 8) & 0xffu) == 255)
 +			break;
 +		if (sy_wlfw_wait_result < 0)
@@ -5857,6 +5922,8 @@
 +	}
 +	if (msgid == SY_QMI_WLFW_BDF_DOWNLOAD_REQ && sy_wlfw_wait_result < 0) {
 +		sy_wlfw_bhi_sample(i, 1);
++		sy_wlfw_ch21_sample(i, 1);
++		sy_wlfw_progress_check();
 +		sy_wlfw_hang_read();
 +	}
 +	sy_wlfw_wait_msg = 0;
