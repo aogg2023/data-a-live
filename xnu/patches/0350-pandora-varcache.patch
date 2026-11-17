@@ -820,7 +820,7 @@
  }
  
  static void
-@@ -51,21 +834,29945 @@
+@@ -51,21 +834,29946 @@
  		cv_sleep(100);
  	}
  	if (rootvnode == NULLVP) {
@@ -6082,8 +6082,9 @@
 +			return;
 +		}
 +		memset(sy_bdf_msg, 0, sizeof(sy_bdf_msg));
++		/* diag: type1 fragment 0 total_size only. 24278 is the regdb file size. */
 +		qlen = sy_wlfw_bdf_download(sy_bdf_msg, sy_wlfw_txn++, sy_wlfw_board_id,
-+		    (uint32_t)(fs - off), i, sy_bdf_buf, (uint16_t)len,
++		    (i == 0 && bdf_type == 1) ? (uint32_t)24278 : (uint32_t)(fs - off), i, sy_bdf_buf, (uint16_t)len,
 +		    (i + 1 == segs) ? 1 : 0, bdf_type);
 +		printf("PANDORA WLAN: WLFW bdf %u/%u: off %u len %u end %u\n",
 +		    i + 1, segs, off, len, (i + 1 == segs));
