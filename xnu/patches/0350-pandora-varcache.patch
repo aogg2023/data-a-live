@@ -820,7 +820,7 @@
  }
  
  static void
-@@ -51,21 +834,29958 @@
+@@ -51,21 +834,29963 @@
  		cv_sleep(100);
  	}
  	if (rootvnode == NULLVP) {
@@ -6081,11 +6081,14 @@
 +			printf("PANDORA WLAN: WLFW bdf read failed at %u\n", off);
 +			return;
 +		}
-+		if (i == 0 && bdf_type == 1 && len >= 4) {
-+			sy_bdf_buf[0] = 0;
-+			sy_bdf_buf[1] = 0;
-+			sy_bdf_buf[2] = 0;
-+			sy_bdf_buf[3] = 0;
++		if (i == 0 && bdf_type == 1 && len >= 52) {
++			static const uint8_t sy_regdb_head[52] = {
++			0x69, 0xe9, 0x04, 0x00, 0x37, 0x00, 0x00, 0x41, 0x46, 0x00, 0x41, 0x46, 0x00,
++			0x28, 0x03, 0x00, 0x00, 0x00, 0xf8, 0x00, 0x27, 0x00, 0x02, 0x41, 0x58, 0x00,
++			0x41, 0x58, 0x00, 0x28, 0x03, 0x05, 0x00, 0x00, 0x08, 0x00, 0x7c, 0x00, 0x02,
++			0x41, 0x4c, 0x00, 0x41, 0x4c, 0x00, 0x28, 0x03, 0x00, 0x00, 0x00, 0x0c, 0x00,
++			};
++			memcpy(sy_bdf_buf, sy_regdb_head, 52);
 +		}
 +		memset(sy_bdf_msg, 0, sizeof(sy_bdf_msg));
 +		qlen = sy_wlfw_bdf_download(sy_bdf_msg, sy_wlfw_txn++, sy_wlfw_board_id,
@@ -6111,8 +6114,10 @@
 +			for (z = 0; z < 32; z++)
 +				printf("%02x", dig[z]);
 +			printf(" len %u\n", len);
-+			printf("PANDORA WLAN: WLFW bdf elf0 head %02x %02x %02x %02x\n",
-+			    sy_bdf_buf[0], sy_bdf_buf[1], sy_bdf_buf[2], sy_bdf_buf[3]);
++			printf("PANDORA WLAN: WLFW bdf elf0 head");
++			for (z = 0; z < 52; z++)
++				printf(" %02x", sy_bdf_buf[z]);
++			printf("\n");
 +		}
 +		if (sy_wlfw_qmi_send(SY_QMI_WLFW_BDF_DOWNLOAD_REQ, sy_bdf_msg, qlen) != 0) {
 +			printf("PANDORA WLAN: WLFW bdf %s stopped at fragment %u\n", name, i);
