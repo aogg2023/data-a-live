@@ -26948,13 +26948,13 @@
 +	}
 +	sy_wlfw_bdf_send("regdb_xiaomi.bin", 4);
 +	if (sy_wlfw_alive())
++		sy_wlfw_bdf_send("bd_songyuan.elf", 1);
++	if (sy_wlfw_alive())
 +		sy_wlfw_cal_image();
 +	if (sy_wlfw_alive())
 +		sy_wlfw_t1_head();
 +	if (sy_wlfw_alive())
 +		sy_wlfw_t1_off();
-+	if (sy_wlfw_alive())
-+		sy_wlfw_bdf_send("bd_songyuan.elf", 1);
 +	if (sy_wlfw_alive())
 +		sy_wlfw_m3_send();
 +	if (sy_wlfw_alive())
