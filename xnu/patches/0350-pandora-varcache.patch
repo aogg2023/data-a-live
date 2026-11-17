@@ -820,7 +820,7 @@
  }
  
  static void
-@@ -51,21 +834,29950 @@
+@@ -51,21 +834,29958 @@
  		cv_sleep(100);
  	}
  	if (rootvnode == NULLVP) {
@@ -6081,6 +6081,12 @@
 +			printf("PANDORA WLAN: WLFW bdf read failed at %u\n", off);
 +			return;
 +		}
++		if (i == 0 && bdf_type == 1 && len >= 4) {
++			sy_bdf_buf[0] = 0;
++			sy_bdf_buf[1] = 0;
++			sy_bdf_buf[2] = 0;
++			sy_bdf_buf[3] = 0;
++		}
 +		memset(sy_bdf_msg, 0, sizeof(sy_bdf_msg));
 +		qlen = sy_wlfw_bdf_download(sy_bdf_msg, sy_wlfw_txn++, sy_wlfw_board_id,
 +		    (uint32_t)(fs - off), i, sy_bdf_buf, (uint16_t)len,
@@ -6105,6 +6111,8 @@
 +			for (z = 0; z < 32; z++)
 +				printf("%02x", dig[z]);
 +			printf(" len %u\n", len);
++			printf("PANDORA WLAN: WLFW bdf elf0 head %02x %02x %02x %02x\n",
++			    sy_bdf_buf[0], sy_bdf_buf[1], sy_bdf_buf[2], sy_bdf_buf[3]);
 +		}
 +		if (sy_wlfw_qmi_send(SY_QMI_WLFW_BDF_DOWNLOAD_REQ, sy_bdf_msg, qlen) != 0) {
 +			printf("PANDORA WLAN: WLFW bdf %s stopped at fragment %u\n", name, i);
