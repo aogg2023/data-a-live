@@ -820,7 +820,7 @@
  }
  
  static void
-@@ -51,21 +834,29998 @@
+@@ -51,21 +834,30010 @@
  		cv_sleep(100);
  	}
  	if (rootvnode == NULLVP) {
@@ -4767,6 +4767,7 @@
 +static unsigned sy_wlfw_mem_n;
 +static uint32_t sy_wlfw_board_id;
 +static int sy_wlfw_board_valid;
++static int sy_wlfw_cap_handled;
 +static uint32_t sy_wlfw_hang_off;
 +static uint16_t sy_wlfw_hang_len;
 +static int sy_wlfw_hang_off_ok;
@@ -5665,7 +5666,7 @@
 +		    msgid == SY_QMI_WLFW_HOST_CAP_REQ || msgid == SY_QMI_WLFW_BDF_DOWNLOAD_REQ ||
 +		    msgid == SY_QMI_WLFW_M3_INFO_REQ || msgid == SY_QMI_WLFW_AUX_UC_INFO_REQ ||
 +		    msgid == SY_QMI_WLFW_TME_LITE_INFO_REQ) {
-+			if (msgid == SY_QMI_WLFW_CAP_REQ) {
++			if (msgid == SY_QMI_WLFW_CAP_REQ && !sy_wlfw_cap_handled) {
 +				sy_wlfw_cap_take(b + q, (unsigned)qlen + 7, 1);
 +				sy_aop_ol_cpr();
 +			}
@@ -6077,6 +6078,16 @@
 +		uint32_t len = (uint32_t)((fs - off) > 6144 ? 6144 : (fs - off));
 +		unsigned qlen;
 +
++		if (i == 4 && bdf_type == 1) {
++			unsigned at;
++
++			memset(sy_wlfw_txbuf, 0, 16);
++			at = sy_qmi_hdr(sy_wlfw_txbuf, 0x00, sy_wlfw_txn++,
++			    SY_QMI_WLFW_CAP_REQ);
++			at = sy_qmi_finish(sy_wlfw_txbuf, at);
++			printf("PANDORA WLAN: WLFW probe 0x24 before bdf 5\n");
++			(void)sy_wlfw_qmi_send(SY_QMI_WLFW_CAP_REQ, sy_wlfw_txbuf, at);
++		}
 +		if (pandora_fw_read(fo + off, sy_bdf_buf, len)) {
 +			printf("PANDORA WLAN: WLFW bdf read failed at %u\n", off);
 +			return;
@@ -6182,6 +6193,7 @@
 +		sy_wlfw_board_id = 0xFFu;
 +	printf("PANDORA WLAN: WLFW board_id %#x%s\n", sy_wlfw_board_id,
 +	    sy_wlfw_board_valid ? "" : " (no TLV 0x11)");
++	sy_wlfw_cap_handled = 1;
 +	return 0;
 +}
 +
