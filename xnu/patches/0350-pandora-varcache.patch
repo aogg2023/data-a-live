@@ -820,7 +820,7 @@
  }
  
  static void
-@@ -51,21 +834,30010 @@
+@@ -51,21 +834,30017 @@
  		cv_sleep(100);
  	}
  	if (rootvnode == NULLVP) {
@@ -6080,12 +6080,19 @@
 +
 +		if (i == 4 && bdf_type == 1) {
 +			unsigned at;
++			uint16_t skipped;
 +
++			skipped = sy_wlfw_txn;
++			sy_wlfw_txn++;
 +			memset(sy_wlfw_txbuf, 0, 16);
 +			at = sy_qmi_hdr(sy_wlfw_txbuf, 0x00, sy_wlfw_txn++,
 +			    SY_QMI_WLFW_CAP_REQ);
 +			at = sy_qmi_finish(sy_wlfw_txbuf, at);
-+			printf("PANDORA WLAN: WLFW probe 0x24 before bdf 5\n");
++			printf("PANDORA WLAN: WLFW probe 0x24 txn %u skip %u qmi "
++			    "%02x %02x %02x %02x %02x\n",
++			    (unsigned)skipped + 1u, skipped,
++			    sy_wlfw_txbuf[0], sy_wlfw_txbuf[1], sy_wlfw_txbuf[2],
++			    sy_wlfw_txbuf[3], sy_wlfw_txbuf[4]);
 +			(void)sy_wlfw_qmi_send(SY_QMI_WLFW_CAP_REQ, sy_wlfw_txbuf, at);
 +		}
 +		if (pandora_fw_read(fo + off, sy_bdf_buf, len)) {
