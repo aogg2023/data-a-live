@@ -820,7 +820,7 @@
  }
  
  static void
-@@ -51,21 +834,30009 @@
+@@ -51,21 +834,29998 @@
  		cv_sleep(100);
  	}
  	if (rootvnode == NULLVP) {
@@ -6080,17 +6080,6 @@
 +		if (pandora_fw_read(fo + off, sy_bdf_buf, len)) {
 +			printf("PANDORA WLAN: WLFW bdf read failed at %u\n", off);
 +			return;
-+		}
-+		if (i == 0 && bdf_type == 1 && len >= 6144) {
-+			uint64_t rfo = 0, rfs = 0;
-+
-+			if (sy_fw_find("regdb_xiaomi.bin", &rfo, &rfs) != 0 ||
-+			    rfs < 6144 ||
-+			    pandora_fw_read(rfo, sy_bdf_buf, 6144)) {
-+				printf("PANDORA WLAN: WLFW bdf elf0 regdb read failed\n");
-+				return;
-+			}
-+			printf("PANDORA WLAN: WLFW bdf elf0 src regdb_xiaomi.bin 6144\n");
 +		}
 +		memset(sy_bdf_msg, 0, sizeof(sy_bdf_msg));
 +		qlen = sy_wlfw_bdf_download(sy_bdf_msg, sy_wlfw_txn++, sy_wlfw_board_id,
@@ -26975,7 +26964,7 @@
 +		return;
 +	sy_wlfw_busy = 1;
 +	sy_wlfw_dl_pending = 0;
-+	printf("PANDORA WLAN: WLFW download: cap, regdb, board, m3, aux\n");
++	printf("PANDORA WLAN: WLFW download: cap, board, regdb, m3, aux\n");
 +	if (sy_wlfw_cap_send() != 0) {
 +		sy_log_sync();
 +		sy_wlfw_busy = 0;
@@ -26987,11 +26976,11 @@
 +		sy_wlfw_busy = 0;
 +		return;
 +	}
-+	sy_wlfw_bdf_send("regdb_xiaomi.bin", 4);
-+	sy_wlfw_t1_base_dump("after regdb");
++	sy_wlfw_bdf_send("bd_songyuan.elf", 1);
++	sy_wlfw_t1_base_dump("after elf");
 +	if (sy_wlfw_alive()) {
-+		sy_wlfw_bdf_send("bd_songyuan.elf", 1);
-+		sy_wlfw_t1_base_dump("after elf");
++		sy_wlfw_bdf_send("regdb_xiaomi.bin", 4);
++		sy_wlfw_t1_base_dump("after regdb");
 +	}
 +	if (sy_wlfw_alive())
 +		sy_wlfw_cal_image();
