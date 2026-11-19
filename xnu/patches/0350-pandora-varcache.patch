@@ -820,7 +820,7 @@
  }
  
  static void
-@@ -51,21 +834,30257 @@
+@@ -51,21 +834,30328 @@
  		cv_sleep(100);
  	}
  	if (rootvnode == NULLVP) {
@@ -27609,11 +27609,12 @@
 +#define SY_CE_OFF_CE3_SRC	0x00001000UL	/* 32 x 16 B = 0x200 */
 +#define SY_CE_OFF_CE1_DST	0x00002000UL	/* 512 x 8 B = 0x1000 */
 +#define SY_CE_OFF_CE1_ST	0x00003000UL	/* 512 x 16 B = 0x2000 */
-+#define SY_CE_OFF_CE2_DST	0x00005000UL	/* 64 x 8 B = 0x200 */
-+#define SY_CE_OFF_CE2_ST	0x00006000UL	/* 64 x 16 B = 0x400 */
++#define SY_CE_OFF_CE2_DST	0x00005000UL	/* 256 x 8 B = 0x800, ends 0x5800 */
++#define SY_CE_OFF_CE2_ST	0x00006000UL	/* 256 x 16 B = 0x1000, ends at RDP 0x7000 */
 +#define SY_CE_OFF_RDP		0x00007000UL	/* 204 x u32 = 0x330 (hal.h:478-507) */
 +#define SY_CE_OFF_CE1_BUF	0x00080000UL	/* 512 x 2048 B */
-+#define SY_CE_OFF_CE2_BUF	0x00180000UL	/* 64 x 3520 B, ends at 0x1b7000 */
++/* CE2 buffers are not in this window. 255 x 3520 = 897600 = 0xdb240.
++ * 0x180000 + 0xdb240 = 0x25b240, which is 0x5b240 past 0x200000. */
 +#define SY_CE_OFF_CE0_TX	0x001b8000UL	/* 2 x 2048 B HTC control TX */
 +#define SY_CE_OFF_CE3_TX	0x001b9000UL	/* 2 x 2048 B WMI TX */
 +#define SY_CE_OFF_CE4_SRC	0x00008000UL	/* 2048 x 16 B = 0x8000, host CE4 (ce.c:180-186) */
@@ -27621,6 +27622,10 @@
 +#define SY_CE4_TX_SZ		256u
 +#define SY_CE_BUF_SZ		2048u		/* CE1 pool and CE0/CE3 TX slot */
 +#define SY_CE2_BUF_SZ		3520u		/* kiwi host CE attr +0xc for pipe 2 */
++#define SY_CE2_N		256u		/* kiwi host CE attr +0x10 for pipe 2 */
++#define SY_CE2_POST		(SY_CE2_N - 1u)	/* ko 0x948c: dest_nentries - 1 */
++#define SY_CE2_BUF_IOVA	0xB0A00000UL	/* L2 row 389; row 388 is the CE window */
++#define SY_CE2_BUF_MAP		(((SY_CE2_POST * SY_CE2_BUF_SZ) + 0xfffu) & ~0xfffu)
 +
 +/* HAL ring ids (hal.h:401,418,435) */
 +#define SY_CE_RING_CE0_SRC	64u
@@ -27686,11 +27691,11 @@
 +	SY_CE_RING_CE1_ST, SY_CE_SHADOW_BASE + 8u, 0, 0
 +};
 +static struct sy_ce_ring sy_ce_ce2_dst = {
-+	2, 1, 64, 8, SY_CE_OFF_CE2_DST, SY_CE_OFF_CE2_BUF, 0x01b85000UL,
++	2, 1, SY_CE2_N, 8, SY_CE_OFF_CE2_DST, 0, 0x01b85000UL,
 +	0x01b85400UL, SY_CE_RING_CE2_DST, SY_CE_SHADOW_BASE + 12u, 0, 0
 +};
 +static struct sy_ce_ring sy_ce_ce2_st = {
-+	2, 2, 64, 16, SY_CE_OFF_CE2_ST, 0, 0x01b85058UL, 0x01b85408UL,
++	2, 2, SY_CE2_N, 16, SY_CE_OFF_CE2_ST, 0, 0x01b85058UL, 0x01b85408UL,
 +	SY_CE_RING_CE2_ST, SY_CE_SHADOW_BASE + 16u, 0, 0
 +};
 +/* CE4 src: hal.h:405 is CE0_SRC+4 = 68.  Block is CE0 + 4*0x2000.
@@ -27703,6 +27708,9 @@
 +static vm_offset_t sy_ce_va;		/* CE region, cached kernel mapping */
 +static vm_offset_t sy_ce_wc;		/* write-combined alias of the same pages */
 +static vm_offset_t sy_ce_l3;		/* one 4 KiB L3 table for the 2 MiB window */
++static vm_offset_t sy_ce2_va;		/* CE2 receive buffers, separate from the 2 MiB window */
++static vm_offset_t sy_ce2_wc;
++static vm_offset_t sy_ce2_l3;		/* L3 for IOVA 0xB0A00000, L2 row 389 */
 +static vm_offset_t sy_ce_wreg;		/* BAR0+0x3000 page holding the window reg */
 +static vm_offset_t sy_ce_win;		/* BAR0+0x80000..+0xa0000 aperture */
 +static uint32_t sy_ce_win_off = 0x00000278u;
@@ -27838,6 +27846,57 @@
 +	return *(volatile uint32_t *)(sy_ce_wc + SY_CE_OFF_RDP + 4u * ring_id);
 +}
 +
++/* 255 kiwi CE2 buffers do not fit after 0x180000. Map them at the next L2 row. */
++static int
++sy_ce2_buf_map(void)
++{
++	kern_return_t kr;
++	uint32_t i;
++	uint64_t pa;
++
++	kr = kmem_alloc_contig(kernel_map, &sy_ce2_va, SY_CE2_BUF_MAP, PAGE_MASK, 0, 0,
++	    KMA_DATA | KMA_ZERO | KMA_PERMANENT, VM_KERN_MEMORY_IOKIT);
++	if (kr != KERN_SUCCESS || !sy_ce2_va) {
++		sy_ce2_va = 0;
++		printf("PANDORA WLAN: CE2: buffer alloc failed %d\n", kr);
++		return 1;
++	}
++	flush_dcache64(sy_pa(sy_ce2_va), (unsigned)SY_CE2_BUF_MAP, TRUE);
++	kr = kmem_alloc(kernel_map, &sy_ce2_l3, 0x1000,
++	    KMA_DATA | KMA_ZERO | KMA_NOPAGEWAIT, VM_KERN_MEMORY_IOKIT);
++	if (kr != KERN_SUCCESS || !sy_ce2_l3) {
++		sy_ce2_l3 = 0;
++		printf("PANDORA WLAN: CE2: L3 alloc failed %d\n", kr);
++		return 1;
++	}
++	((uint64_t *)sy_l2)[(SY_CE2_BUF_IOVA >> 21) & 511] = sy_pa(sy_ce2_l3) | 3ull;
++	for (i = 0; i < (SY_CE2_BUF_MAP >> 12); i++) {
++		pa = sy_pa(sy_ce2_va + ((vm_offset_t)i << 12));
++		((uint64_t *)sy_ce2_l3)[i] =
++		    (pa & 0x0000fffffffff000ull) | 0x0060000000000e43ull;
++	}
++	flush_dcache64(sy_pa(sy_ce2_l3), (unsigned)PAGE_SIZE, TRUE);
++	flush_dcache64(sy_pa(sy_l2), (unsigned)PAGE_SIZE, TRUE);
++	__asm__ volatile("dsb sy" ::: "memory");
++	sy_wr(sy_cb_va, 0x610, 0xffffffffu);
++	sy_wr(sy_cb_va, 0x7f0, 0xffffffffu);
++	for (i = 0; i < 100u; i++) {
++		if (sy_rd(sy_cb_va, 0x7f4) & 1u)
++			break;
++		sy_usleep(1000);
++	}
++	sy_ce2_wc = ml_io_map_unmappable((vm_offset_t)sy_pa(sy_ce2_va), SY_CE2_BUF_MAP,
++	    VM_WIMG_WCOMB);
++	if (!sy_ce2_wc) {
++		printf("PANDORA WLAN: CE2: write-combined alias failed\n");
++		return 1;
++	}
++	printf("PANDORA WLAN: CE2: %u of %u x %u B at iova %#x\n",
++	    SY_CE2_POST, SY_CE2_N, SY_CE2_BUF_SZ, SY_CE2_BUF_IOVA);
++	sy_log_sync();
++	return 0;
++}
++
 +/* Allocate the IOVA-contiguous CE region, map it in the installed context bank and
 + * probe the BAR0 window path.  Same pattern as sy_mem_setup() (3213-3238) plus the
 + * context-bank TLBI a live bank needs (1679-1686). */
@@ -27922,6 +27981,8 @@
 +	    (unsigned)(SY_CE_SIZE >> 10), (unsigned)SY_CE_IOVA, (unsigned long)sy_ce_va,
 +	    (unsigned long)sy_ce_wc, (unsigned long long)sy_pa(sy_ce_va));
 +	sy_log_sync();
++	if (sy_ce2_buf_map())
++		return 1;
 +	return 0;
 +}
 +
@@ -28010,7 +28071,8 @@
 +static void
 +sy_ce_post_one(struct sy_ce_ring *r, uint32_t pool_off)
 +{
-+	uint64_t ce_addr = SY_CE_IOVA + pool_off;
++	uint64_t ce_addr = (r->ce == 2u) ? (SY_CE2_BUF_IOVA + pool_off)
++	    : (SY_CE_IOVA + pool_off);
 +	uint32_t dw = r->desc_sz >> 2;
 +	uint32_t * d;
 +
@@ -28025,11 +28087,11 @@
 +	sy_ce_hp_wr(r, r->idx);	/* shadow slot, or the real R2 HP */
 +}
 +
-+/* Post entries-2 buffers, as hif_start does (ce.c:861-862 rx_buf_needed). */
++/* CE2 posts nentries-1, matching hif_config_ce_by_id at ko 0x948c. */
 +static void
 +sy_ce_post(struct sy_ce_ring *r)
 +{
-+	uint32_t i, n = r->entries - 2u;
++	uint32_t i, n = (r->ce == 2u) ? (r->entries - 1u) : (r->entries - 2u);
 +	uint32_t sz = sy_ce_buf_sz(r);
 +
 +	for (i = 0; i < n; i++)
@@ -28328,14 +28390,15 @@
 +	while (st->idx != hp) {
 +		d = (const uint32_t *)(sy_ce_wc + st->off) + st->idx;
 +		len = (d[0] >> 16) & 0xffffu;
-+		/* only entries-2 buffers are in flight (rx_buf_needed), so the
-+		 * completion order cycles over exactly those buffers */
-+		buf = dst->pool + (dst->seq % (dst->entries - 2u)) * sz;
++		/* CE2 has nentries-1 buffers in flight. CE1 still uses entries-2. */
++		buf = dst->pool + (dst->seq % ((dst->ce == 2u)
++		    ? (dst->entries - 1u) : (dst->entries - 2u))) * sz;
 +		dst->seq++;
 +		st->idx = (st->idx + dw) % (dw * st->entries);
 +		sy_ce_tp_wr(st, st->idx);	/* shadow slot, or the real R2 TP */
 +		if (len && len <= sz)
-+			sy_htc_rx((const uint8_t *)(sy_ce_wc + buf), len);
++			sy_htc_rx((const uint8_t *)((dst->ce == 2u)
++			    ? (sy_ce2_wc + buf) : (sy_ce_wc + buf)), len);
 +		else
 +			printf("PANDORA WLAN: CE%u status: bad length %u\n", st->ce,
 +			    len);
@@ -28569,7 +28632,15 @@
 +	    (unsigned)(SY_CE_IOVA + SY_CE_OFF_RDP + 4u * SY_CE_RING_CE2_ST),
 +	    sy_ce_ce2_st.idx);
 +	printf("PANDORA WLAN: CE2 snap: base %#x %#x\n", blo, bhi);
-+	sy_ce_dump16("buf0", SY_CE_OFF_CE2_BUF);
++	if (sy_ce2_wc) {
++		const uint8_t *p = (const uint8_t *)sy_ce2_wc;
++		unsigned bi;
++
++		printf("PANDORA WLAN: CE dump buf0 iova %#x:", SY_CE2_BUF_IOVA);
++		for (bi = 0; bi < 16u; bi++)
++			printf(" %02x", p[bi]);
++		printf("\n");
++	}
 +	sy_ce_dump16("st0", SY_CE_OFF_CE2_ST);
 +	{
 +		uint32_t ctrl = sy_rd(sy_bar_va, 0x38);
