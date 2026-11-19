@@ -27617,9 +27617,10 @@
 + * 0x180000 + 0xdb240 = 0x25b240, which is 0x5b240 past 0x200000. */
 +#define SY_CE_OFF_CE0_TX	0x001b8000UL	/* 2 x 2048 B HTC control TX */
 +#define SY_CE_OFF_CE3_TX	0x001b9000UL	/* 2 x 2048 B WMI TX */
-+#define SY_CE_OFF_CE4_SRC	0x00008000UL	/* 2048 x 16 B = 0x8000, host CE4 (ce.c:180-186) */
++#define SY_CE_OFF_CE4_SRC	0x00008000UL	/* 256 x 16 B = 0x1000, ends 0x9000 */
 +#define SY_CE_OFF_CE4_TX	0x001ba000UL	/* 2 x 256 B HTT TX; src_sz_max is 256 */
-+#define SY_CE4_TX_SZ		256u
++#define SY_CE4_N		256u		/* kiwi host CE attr +0x8 for pipe 4 */
++#define SY_CE4_TX_SZ		256u		/* kiwi host CE attr +0xc for pipe 4 */
 +#define SY_CE_BUF_SZ		2048u		/* CE1 pool and CE0/CE3 TX slot */
 +#define SY_CE2_BUF_SZ		3520u		/* kiwi host CE attr +0xc for pipe 2 */
 +#define SY_CE2_N		256u		/* kiwi host CE attr +0x10 for pipe 2 */
@@ -27701,7 +27702,7 @@
 +/* CE4 src: hal.h:405 is CE0_SRC+4 = 68.  Block is CE0 + 4*0x2000.
 + * Not in the v3 list, so its doorbell stays on the real R2 register. */
 +static struct sy_ce_ring sy_ce_ce4_src = {
-+	4, 0, 2048, 16, SY_CE_OFF_CE4_SRC, 0, 0x01b88000UL, 0x01b88400UL,
++	4, 0, SY_CE4_N, 16, SY_CE_OFF_CE4_SRC, 0, 0x01b88000UL, 0x01b88400UL,
 +	68, 0, 0, 0
 +};
 +
@@ -28713,6 +28714,7 @@
 +	sy_ce_ring_hw(&sy_ce_ce1_st);
 +	sy_ce_ring_hw(&sy_ce_ce2_dst);
 +	sy_ce_ring_hw(&sy_ce_ce2_st);
++	sy_ce_ring_hw(&sy_ce_ce4_src);
 +	{
 +		uint32_t win, c0, c1;
 +
@@ -28751,10 +28753,8 @@
 +		sy_log_sync();
 +		return;
 +	}
-+	/* HTT before SETUP_COMPLETE, same place as ath12k_dp_htt_connect (core.c:470).
-+	 * Only when this boot is going on to D3; the ring is the host CE4 from ce.c. */
++	/* HTT connect before SETUP_COMPLETE. CE4 was programmed with the other rings. */
 +	if (sy_step >= 23) {
-+		sy_ce_ring_hw(&sy_ce_ce4_src);
 +		if (sy_d3_htc_connect())
 +			printf("PANDORA WLAN: D3: HTT connect failed\n");
 +		sy_log_sync();
