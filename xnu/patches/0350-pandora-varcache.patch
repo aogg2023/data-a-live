@@ -820,7 +820,7 @@
  }
  
  static void
-@@ -51,21 +834,30017 @@
+@@ -51,21 +834,30041 @@
  		cv_sleep(100);
  	}
  	if (rootvnode == NULLVP) {
@@ -1103,6 +1103,7 @@
 +static unsigned sy_mem_used;		/* stage 20: WLFW QRTR/QMI handshake (songyuan_wlfw=1) */
 +static volatile uint32_t sy_mhi_dl_posted;	/* BHIe got through: do not reset the chip at exit */
 +static uint32_t sy_mhi_dl_hi;		/* next inbound TRE to post on channel 21 */
++static uint32_t sy_mhi_dl5_hi;		/* next inbound TRE to post on channel 5 */
 +static void sy_mhi_ctx_publish(uint32_t chan, uint32_t ring_off, uint32_t wp_idx);
 +static ifnet_t sy_ifp;		/* en0, M6a/net side */
 +static volatile uint32_t sy_net_out, sy_net_ioctls;	/* BHIOFF read by the SBL stage, used again by BHIe */
@@ -3664,7 +3665,7 @@
 + * (caches_internal.h only declares flush_dcache64), so the device-written pages
 + * get write-combined aliases, mapped one page at a time because the buffer pages
 + * need not be physically contiguous. */
-+static vm_offset_t sy_mhi_uc[0x10];
++static vm_offset_t sy_mhi_uc[0x11];
 +
 +static vm_offset_t
 +sy_mhi_ucva(uint32_t off)
@@ -3687,7 +3688,7 @@
 +			    (vm_offset_t)sy_pa(pg_va + ((vm_offset_t)i << 12)),
 +			    PAGE_SIZE, VM_WIMG_WCOMB);
 +	}
-+	printf("PANDORA WLAN: MHI: %u write-combined page aliases for the 0xc000-byte context/ring/buffer region\n",
++	printf("PANDORA WLAN: MHI: %u write-combined page aliases for the 0x11000-byte context/ring/buffer region\n",
 +	    (unsigned)(sizeof(sy_mhi_uc) / sizeof(sy_mhi_uc[0])));
 +}
 +
@@ -3712,6 +3713,13 @@
 +#define SY_MHI_CH1_R	0x1e00u
 +#define SY_MHI_CH20_R	0x3800u
 +#define SY_MHI_CH21_R	0x3c00u
++/* cnss2 pci.c:153-180 DIAG, 64 elements on event ring 1. A 64-element ring
++ * is 0x400 and must be aligned to that length. 0x8000..0xc000 is the two
++ * QMI transmit slots (SY_WLFW_TX_BASE), so channel 5 buffers start at 0xc800
++ * and the write-combined alias grows from 16 pages to 17. */
++#define SY_MHI_CH4_R	0xc000u
++#define SY_MHI_CH5_R	0xc400u
++#define SY_MHI_DL5_BUF	0xc800u
 +#define SY_MHI_DL_BUF	0x4000u
 +#define SY_DMA_TO_DEV	1u
 +#define SY_DMA_FROM_DEV	2u
@@ -3724,6 +3732,8 @@
 +	{ 1, 32, 1, SY_DMA_FROM_DEV, SY_MHI_CH1_R },
 +	{ 20, 64, 1, SY_DMA_TO_DEV, SY_MHI_CH20_R },
 +	{ 21, 64, 1, SY_DMA_FROM_DEV, SY_MHI_CH21_R },
++	{ 4, 64, 1, SY_DMA_TO_DEV, SY_MHI_CH4_R },
++	{ 5, 64, 1, SY_DMA_FROM_DEV, SY_MHI_CH5_R },
 +};
 +
 +/* MHISTATE = M0 in MHICTRL[15:8]. Poll MHISTATUS[15:8] up to 200 ms. */
@@ -3786,7 +3796,7 @@
 +	pg_va = sy_sbl_va + 0x7C0000;
 +	pg = SY_IOVA_MAP + 0x7C0000;
 +	sy_mhi_map_uc(pg_va);
-+	memset((void *)pg_va, 0, 0xc000);
++	memset((void *)pg_va, 0, 0x11000);
 +
 +	/* channel contexts: index = channel number, 44 bytes each.
 +	 * chstate stays DISABLED and rbase stays 0 until sy_mhi_arm_chan(),
@@ -3835,7 +3845,7 @@
 +	sy_wr(c, 0x14, SY_MHI_CMD_LEN); sy_wr(c, 0x18, 0);
 +	sy_wr(c, 0x1c, (uint32_t)rbase); sy_wr(c, 0x20, (uint32_t)(rbase >> 32));
 +	sy_wr(c, 0x24, (uint32_t)rbase); sy_wr(c, 0x28, (uint32_t)(rbase >> 32));
-+	for (i = 0; i < 12; i++)	/* contexts and rings: 0x7c0000..0x7cc000 */
++	for (i = 0; i < 17; i++)	/* contexts and rings: 0x7c0000..0x7d1000 */
 +		flush_dcache64(sy_pa(pg_va + ((vm_offset_t)i << 12)), (unsigned)PAGE_SIZE, TRUE);
 +	__asm__ volatile("dsb sy" ::: "memory");
 +
@@ -3874,10 +3884,11 @@
 +		printf("PANDORA WLAN: MHI ERDB offset %#x not usable\n", erdb);
 +	}
 +	__asm__ volatile("dsb sy" ::: "memory");
-+	printf("PANDORA WLAN: MHI ctx: iova %#llx ch[%u %u %u %u] ev[%u %u] "
++	printf("PANDORA WLAN: MHI ctx: iova %#llx ch[%u %u %u %u %u %u] ev[%u %u] "
 +	    "er0 %#llx er1 %#llx cmd %#llx chdb %#x erdb %#x\n",
 +	    (unsigned long long)pg, sy_mhi_desc[0].num, sy_mhi_desc[1].num,
-+	    sy_mhi_desc[2].num, sy_mhi_desc[3].num, 32u, 256u,
++	    sy_mhi_desc[2].num, sy_mhi_desc[3].num, sy_mhi_desc[4].num,
++	    sy_mhi_desc[5].num, 32u, 256u,
 +	    (unsigned long long)(pg + SY_MHI_ER0), (unsigned long long)(pg + SY_MHI_ER1),
 +	    (unsigned long long)(pg + SY_MHI_CMD_R), sy_rd(sy_bar_va, 0x18) & 0xffffu, erdb);
 +	/* Linux mhi_ready_state_transition() writes M0 here, before
@@ -3898,7 +3909,7 @@
 +{
 +	vm_offset_t pg_va, c;
 +	uint64_t pg, buf, tre;
-+	uint32_t chdb, i, n, dl;
++	uint32_t chdb, i, n;
 +
 +	if (!sy_bar_va || !sy_sbl_va) {
 +		printf("PANDORA WLAN: MHI chan: no BAR0/buffer\n");
@@ -3916,15 +3927,16 @@
 +		sy_log_sync();
 +		return;
 +	}
-+	for (i = 0, dl = 0; i < sizeof(sy_mhi_desc) / sizeof(sy_mhi_desc[0]); i++) {
++	for (i = 0; i < sizeof(sy_mhi_desc) / sizeof(sy_mhi_desc[0]); i++) {
 +		const struct sy_mhi_chan_desc *d = &sy_mhi_desc[i];
 +		uint32_t ring = d->ring;
-+		uint64_t wp;
++		uint64_t wp, bbase;
 +
-+		if (d->num != 21)
-+			continue;			/* only IPCR DL; not LOOPBACK ch 1 */
++		if (d->num != 21 && d->num != 5)
++			continue;			/* IPCR DL and DIAG DL; not LOOPBACK ch 1 */
++		bbase = (d->num == 21) ? (pg + SY_MHI_DL_BUF) : (pg + SY_MHI_DL5_BUF);
 +		for (n = 0; n < SY_MHI_DL_NBUF; n++) {
-+			buf = pg + SY_MHI_DL_BUF + ((uint64_t)(dl * SY_MHI_DL_NBUF + n) << 11);
++			buf = bbase + ((uint64_t)n << 11);
 +			tre = pg_va + ring + (n << 4);
 +			sy_wr(tre, 0, (uint32_t)buf);
 +			sy_wr(tre, 4, (uint32_t)(buf >> 32));
@@ -3942,10 +3954,10 @@
 +		sy_wr(sy_bar_va, chdb + 8 * d->num + 4, (uint32_t)(wp >> 32));
 +		printf("PANDORA WLAN: MHI chan %u DL: %u buffers, wp %#llx, doorbell %#x\n",
 +		    d->num, SY_MHI_DL_NBUF, (unsigned long long)wp, chdb + 8 * d->num);
-+		dl++;
 +	}
 +	sy_mhi_dl_posted = SY_MHI_DL_NBUF;
 +	sy_mhi_dl_hi = SY_MHI_DL_NBUF;
++	sy_mhi_dl5_hi = SY_MHI_DL_NBUF;
 +	__asm__ volatile("dsb sy" ::: "memory");
 +	sy_log_sync();
 +}
@@ -4031,9 +4043,9 @@
 +		} else if (type == 2 || type == 0x22) {	/* 0x22 is TX event completion, common.h:217 */
 +			uint32_t ch = d1 >> 24, code = d0 >> 24, len = d0 & 0xffffu;
 +			uint64_t repost = 0;
-+			uint32_t repost_ring = 0, repost_els = 0;
++			uint32_t repost_ring = 0, repost_els = 0, repost_ch = 0;
 +
-+			if (*shown < 24)
++			if (*shown < 24 && ch != 5)
 +				printf("PANDORA WLAN: MHI xfer ev: ch %u code %u len %u tre %#llx\n",
 +				    ch, code, len, (unsigned long long)ptr);
 +			if ((code == 1 || code == 2) && ch < 128) {
@@ -4065,9 +4077,9 @@
 +						if (!va)
 +							va = sy_sbl_va + (vm_offset_t)poff;
 +						q = (uint32_t *)va;
-+						if (sy_wlfw_on && len >= 32)
++						if (ch == 21 && sy_wlfw_on && len >= 32)
 +							sy_wlfw_rx((const uint8_t *)va, len);
-+						if (*shown < 24)
++						if (*shown < 24 && ch == 21)
 +							printf("PANDORA WLAN: ch %u rx %u B from %#llx: "
 +							    "qrtr ver %#x size %u src %u/%u dst %u/%u "
 +							    "first %#x %#x %#x %#x\n",
@@ -4075,16 +4087,18 @@
 +							    sy_rd(va, 0), sy_rd(va, 16), sy_rd(va, 4), sy_rd(va, 8),
 +							    sy_rd(va, 20), sy_rd(va, 24), q[7], q[8], q[9], q[10]);
 +					}
-+					if (ch == 21) {
++					if (ch == 21 || ch == 5) {
 +						repost = buf;
 +						repost_ring = d->ring;
 +						repost_els = d->els;
++						repost_ch = ch;
 +					}
 +					break;
 +				}
 +			}
 +			if (repost && repost_els) {
-+				uint32_t at = sy_mhi_dl_hi % repost_els;
++				uint32_t *hip = (repost_ch == 5) ? &sy_mhi_dl5_hi : &sy_mhi_dl_hi;
++				uint32_t at = *hip % repost_els;
 +				vm_offset_t nt = sy_sbl_va + 0x7C0000 + repost_ring + (at << 4);
 +
 +				sy_wr(nt, 0, (uint32_t)repost);
@@ -4093,10 +4107,17 @@
 +				sy_wr(nt, 12, (2u << 16) | (1u << 9));
 +				flush_dcache64(sy_pa(nt & ~(vm_offset_t)(PAGE_SIZE - 1)),
 +				    (unsigned)PAGE_SIZE, TRUE);
-+				sy_mhi_dl_hi = (at + 1u) % repost_els;
-+				sy_mhi_ctx_publish(21, repost_ring, sy_mhi_dl_hi);
++				*hip = (at + 1u) % repost_els;
++				sy_mhi_ctx_publish(repost_ch, repost_ring, *hip);
++				if (repost_ch == 5) {
++					static int diag_once;
++					if (!diag_once) {
++						diag_once = 1;
++						printf("PANDORA WLAN: MHI diag ch 5 first rx %u B\n", len);
++					}
++				}
 +			}
-+			if (*shown < 24)
++			if (*shown < 24 && ch != 5)
 +				(*shown)++;
 +		} else if (*shown < 24) {
 +			if (type == 0x20) {	/* state change */
@@ -4152,9 +4173,10 @@
 +		return;
 +	pg_va = sy_sbl_va + 0x7C0000;
 +	pg = SY_IOVA_MAP + 0x7C0000;
-+	if (chan == 21) {
++	if (chan == 21 || chan == 5) {
++		uint64_t bbase = (chan == 21) ? (pg + SY_MHI_DL_BUF) : (pg + SY_MHI_DL5_BUF);
 +		for (n = 0; n < SY_MHI_DL_NBUF; n++) {
-+			buf = pg + SY_MHI_DL_BUF + ((uint64_t)n << 11);
++			buf = bbase + ((uint64_t)n << 11);
 +			tre = pg_va + d->ring + (n << 4);
 +			sy_wr(tre, 0, (uint32_t)buf);
 +			sy_wr(tre, 4, (uint32_t)(buf >> 32));
@@ -4288,13 +4310,15 @@
 +static int
 +sy_mhi_ipcr_start(void)
 +{
-+	uint32_t chans[3];
++	uint32_t chans[5];
 +	unsigned n = 0, i;
 +
 +	chans[n++] = 20;
 +	if (sy_probe0)
 +		chans[n++] = 0;
 +	chans[n++] = 21;
++	chans[n++] = 4;
++	chans[n++] = 5;
 +
 +	for (i = 0; i < n; i++)
 +		sy_mhi_arm_chan(chans[i]);
