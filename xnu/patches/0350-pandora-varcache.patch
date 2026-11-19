@@ -27726,19 +27726,19 @@
 +static uint8_t sy_wmi_mac[6];
 +static uint32_t sy_wmi_abi[6];
 +
-+/* QMI WLAN_CFG tables: the target copy-engine config and the service->CE map of
-+ * WCN7850, verbatim from hw.c:245-336 and hw.c:453-532.  The map array has a
-+ * terminating {0,0,0}; svc_to_ce_map_len is 14, so only 14 entries are sent
-+ * (hw.c:930-935, qmi.c:2676-2683). */
++/* QMI WLAN_CFG target rows from qca_cld3_peach_v2.ko.  Device 0x110e takes
++ * target type 0x25 (hif_get_device_type text 0x1438c) and the kiwi table at
++ * .data 0x3da8.  CE2/CE3 nbytes_max are 3520 and CE5 nentries is 0.  CE7 in
++ * that table is a 32-entry IN ring this host does not program, so it stays. */
 +static const uint32_t sy_ce_tgt_cfg[9][5] = {
 +	{ 0, 2, 32, 2048, 0 },		/* CE0 OUT HTC control/raw */
 +	{ 1, 1, 32, 2048, 0 },		/* CE1 IN  HTT + HTC control */
-+	{ 2, 1, 32, 2048, 0 },		/* CE2 IN  WMI */
-+	{ 3, 2, 32, 2048, 0 },		/* CE3 OUT WMI */
++	{ 2, 1, 32, 3520, 0 },		/* CE2 IN  WMI */
++	{ 3, 2, 32, 3520, 0 },		/* CE3 OUT WMI */
 +	{ 4, 2, 256, 256, 8 },		/* CE4 OUT HTT, CE_ATTR_DIS_INTR */
-+	{ 5, 1, 32, 2048, 0 },		/* CE5 IN  pktlog */
++	{ 5, 1, 0, 2048, 0 },		/* CE5 IN  pktlog, kiwi nentries 0 */
 +	{ 6, 3, 32, 16384, 0 },		/* CE6 INOUT hif_memcpy */
-+	{ 7, 4, 0, 0, 8 },		/* CE7 INOUT_H2H host only */
++	{ 7, 4, 0, 0, 8 },		/* CE7 left host-only; kiwi row is not programmed */
 +	{ 8, 3, 32, 16384, 0 },		/* CE8 INOUT IPA */
 +};
 +
@@ -30002,10 +30002,10 @@
 + * parsers are hal_rx_*_peach.  The three getters stage 25 uses are counted
 + * in the F comment below.
 + *
-+ * target_ce_config_wlan in the same ko (9 x 6 words, 216 bytes) is not what
-+ * D1's WLAN_CFG sends.  hif_ce_prepare_config picks a table from the target
-+ * type; only the out-of-range fallback stores this unsuffixed table.  The
-+ * running target type was not printed, so the QMI CE list is left as it was.
++ * target_ce_config_wlan in the same ko (9 x 6 words, 216 bytes) is the
++ * out-of-range fallback, not the table D1 sends.  Device 0x110e is type
++ * 0x25 and hif_ce_prepare_config loads target_ce_config_wlan_kiwi.  D1's
++ * WLAN_CFG uses that kiwi list, except the CE7 row, which is not programmed.
 + */
 +#define SY_E_TCL_DEV		0x00a44918u
 +#define SY_E_TCL_R2		0x00a46000u
