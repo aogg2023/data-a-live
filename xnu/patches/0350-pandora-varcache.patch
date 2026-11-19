@@ -820,7 +820,7 @@
  }
  
  static void
-@@ -51,21 +834,30214 @@
+@@ -51,21 +834,30220 @@
  		cv_sleep(100);
  	}
  	if (rootvnode == NULLVP) {
@@ -28523,7 +28523,13 @@
 +sy_ce_htc_snap(void)
 +{
 +	uint32_t sh, hp, tp, shp, stp, blo, bhi, rdp_dst, rdp_st;
++	uint32_t win, c0, c1;
 +
++	win = sy_rd(sy_ce_wreg, sy_ce_win_off);
++	c0 = sy_ce_rd(SY_CE_BASE_OFF);
++	c1 = sy_ce_rd(SY_CE_BASE_OFF + 4u);
++	printf("PANDORA WLAN: CE2 snap: win @%#x hw %#x sw %#x ce0 %#x %#x\n",
++	    0x3000u + sy_ce_win_off, win, sy_ce_win_cur, c0, c1);
 +	sh = sy_ce_rd(SY_CE_SHADOW_BASE + 12u);
 +	hp = sy_ce_rd(0x01b85400u);
 +	tp = sy_ce_rd(0x01b85404u);
