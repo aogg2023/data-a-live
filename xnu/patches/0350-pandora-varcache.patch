@@ -820,7 +820,7 @@
  }
  
  static void
-@@ -51,21 +834,30130 @@
+@@ -51,21 +834,30169 @@
  		cv_sleep(100);
  	}
  	if (rootvnode == NULLVP) {
@@ -27581,12 +27581,11 @@
 + *    0x310c is logged and not selected.
 + *
 + * Design choices for this first pass, stated so a later stage can change them:
-+ *  1. No shadow registers: WLAN_CFG carries no shadow_reg_v3 list and the rings
-+ *     use the ordinary SRNG HP/TP path of hal.c:1933-1991.  The src-direction
-+ *     rings (CE0/CE1-dst/CE3) write HP to the R2 register and read TP from the
-+ *     RDP DMA page; the status rings read HP from RDP and write TP to R2+4.
-+ *     This keeps D1 independent of the 40-entry shadow list (hal.h:36-41), which
-+ *     cannot be validated offline.
++ *  1. Shadow doorbells: WLAN_CFG TLV 0x17 lists the six R2 addresses D1 uses.
++ *     The host writes BAR0+0x8fc+4*index.  That add is in
++ *     qca_cld3_peach_v2.ko hal_set_one_shadow_config at file offset 0x6b71b0.
++ *     Ring init still clears the real R2 pair.  Status HP is still read from
++ *     the RDP page.  CE4 is not in this list.
 + *  2. No interrupts: the CE status rings are polled, like the existing MHI
 + *     stages; this driver tree has no interrupt handler yet.
 + *  3. Device-written memory (status descriptors, RDP indices, received buffers)
@@ -27598,6 +27597,8 @@
 +#define SY_CE_WIN_AP	0x00080000UL	/* pci.c:22 WINDOW_START */
 +#define SY_CE_WIN_EN	0x40000000UL	/* pci.c:22 WINDOW_ENABLE_BIT */
 +#define SY_CE_WIN_MASK	0x0007ffffUL	/* pci.c:22 WINDOW_RANGE_MASK */
++/* peach ko hal_set_one_shadow_config, file offset 0x6b71b0: add #0x8fc */
++#define SY_CE_SHADOW_BASE	0x000008fcu
 +/* BAR0+0x3000 page offset of the window register.  0x278 is BAR0+0x3278,
 + * the register hif_*_mb_reg_window in qca_cld3_peach_v2.ko writes. */
 +#define SY_CE_IOVA	0xB0800000UL	/* L2 row 388 of the installed SMMU tables */
@@ -27662,38 +27663,40 @@
 +	uint32_t dev;		/* device offset of the R0 register block */
 +	uint32_t dev_r2;	/* device offset of the R2 HP/TP pair */
 +	uint32_t ring_id;	/* HAL ring id, selects the RDP u32 slot */
++	uint32_t shadow;	/* BAR0 doorbell for shadow_reg_v3, 0 if unused */
 +	uint32_t idx;		/* host dword index: src/dst HP, status TP */
 +	uint32_t seq;		/* dst rings: completed receive buffers so far */
 +};
 +
 +static struct sy_ce_ring sy_ce_ce0_src = {
 +	0, 0, 16, 16, SY_CE_OFF_CE0_SRC, 0, 0x01b80000UL, 0x01b80400UL,
-+	SY_CE_RING_CE0_SRC, 0, 0
++	SY_CE_RING_CE0_SRC, SY_CE_SHADOW_BASE + 0u, 0, 0
 +};
 +static struct sy_ce_ring sy_ce_ce3_src = {
 +	3, 0, 32, 16, SY_CE_OFF_CE3_SRC, 0, 0x01b86000UL, 0x01b86400UL,
-+	67, 0, 0
++	67, SY_CE_SHADOW_BASE + 20u, 0, 0
 +};
 +static struct sy_ce_ring sy_ce_ce1_dst = {
 +	1, 1, 512, 8, SY_CE_OFF_CE1_DST, SY_CE_OFF_CE1_BUF, 0x01b83000UL,
-+	0x01b83400UL, SY_CE_RING_CE1_DST, 0, 0
++	0x01b83400UL, SY_CE_RING_CE1_DST, SY_CE_SHADOW_BASE + 4u, 0, 0
 +};
 +static struct sy_ce_ring sy_ce_ce1_st = {
 +	1, 2, 512, 16, SY_CE_OFF_CE1_ST, 0, 0x01b83058UL, 0x01b83408UL,
-+	SY_CE_RING_CE1_ST, 0, 0
++	SY_CE_RING_CE1_ST, SY_CE_SHADOW_BASE + 8u, 0, 0
 +};
 +static struct sy_ce_ring sy_ce_ce2_dst = {
 +	2, 1, 64, 8, SY_CE_OFF_CE2_DST, SY_CE_OFF_CE2_BUF, 0x01b85000UL,
-+	0x01b85400UL, SY_CE_RING_CE2_DST, 0, 0
++	0x01b85400UL, SY_CE_RING_CE2_DST, SY_CE_SHADOW_BASE + 12u, 0, 0
 +};
 +static struct sy_ce_ring sy_ce_ce2_st = {
 +	2, 2, 64, 16, SY_CE_OFF_CE2_ST, 0, 0x01b85058UL, 0x01b85408UL,
-+	SY_CE_RING_CE2_ST, 0, 0
++	SY_CE_RING_CE2_ST, SY_CE_SHADOW_BASE + 16u, 0, 0
 +};
-+/* CE4 src: hal.h:405 is CE0_SRC+4 = 68.  Block is CE0 + 4*0x2000. */
++/* CE4 src: hal.h:405 is CE0_SRC+4 = 68.  Block is CE0 + 4*0x2000.
++ * Not in the v3 list, so its doorbell stays on the real R2 register. */
 +static struct sy_ce_ring sy_ce_ce4_src = {
 +	4, 0, 2048, 16, SY_CE_OFF_CE4_SRC, 0, 0x01b88000UL, 0x01b88400UL,
-+	68, 0, 0
++	68, 0, 0, 0
 +};
 +
 +static vm_offset_t sy_ce_va;		/* CE region, cached kernel mapping */
@@ -27750,6 +27753,18 @@
 +	{ 0x0100, 2, 3 }, { 0x0100, 1, 2 },	/* WMI_CONTROL */
 +	{ 0x0001, 2, 0 }, { 0x0001, 1, 2 },	/* RSVD_CTRL (ep0) */
 +	{ 0x0300, 2, 4 }, { 0x0300, 1, 1 },	/* HTT_DATA_MSG */
++};
++
++/* Target registers named by TLV 0x17.  Slot i is BAR0+SY_CE_SHADOW_BASE+4*i.
++ * Order is ce.c:787-799 for the rings D1 programs: src HP, then dst HP and
++ * status TP.  CE_DST is a host-producer ring, so its doorbell is the HP. */
++static const uint32_t sy_ce_shadow_addr[6] = {
++	0x01b80400u,	/* 0 CE0 src HP */
++	0x01b83400u,	/* 1 CE1 dst HP */
++	0x01b8340cu,	/* 2 CE1 status TP */
++	0x01b85400u,	/* 3 CE2 dst HP */
++	0x01b8540cu,	/* 4 CE2 status TP */
++	0x01b86400u,	/* 5 CE3 src HP */
 +};
 +
 +static int sy_ce_mem(void);
@@ -27960,6 +27975,19 @@
 +	    r->entries, r->desc_sz, (unsigned)(SY_CE_IOVA + r->off));
 +}
 +
++/* Host doorbell.  A ring in the v3 list writes its shadow slot; CE4 does not. */
++static void
++sy_ce_hp_wr(struct sy_ce_ring *r, uint32_t val)
++{
++	sy_ce_wr(r->shadow ? r->shadow : r->dev_r2, val);
++}
++
++static void
++sy_ce_tp_wr(struct sy_ce_ring *r, uint32_t val)
++{
++	sy_ce_wr(r->shadow ? r->shadow : r->dev_r2 + 4u, val);
++}
++
 +/* Submit one receive buffer to a destination ring and publish the new HP. */
 +static void
 +sy_ce_post_one(struct sy_ce_ring *r, uint32_t pool_off)
@@ -27976,7 +28004,7 @@
 +	    r->desc_sz, TRUE);
 +	__asm__ volatile("dsb sy" ::: "memory");
 +	r->idx = (r->idx + dw) % (dw * r->entries);
-+	sy_ce_wr(r->dev_r2, r->idx);	/* HP (dword index) is the host doorbell */
++	sy_ce_hp_wr(r, r->idx);	/* shadow slot, or the real R2 HP */
 +}
 +
 +/* Post entries-2 buffers, as hif_start does (ce.c:861-862 rx_buf_needed). */
@@ -28017,7 +28045,7 @@
 +	    r->desc_sz, TRUE);
 +	__asm__ volatile("dsb sy" ::: "memory");
 +	r->idx = next;
-+	sy_ce_wr(r->dev_r2, r->idx);
++	sy_ce_hp_wr(r, r->idx);
 +	return 0;
 +}
 +
@@ -28285,7 +28313,7 @@
 +		buf = dst->pool + (dst->seq % (dst->entries - 2u)) * SY_CE_BUF_SZ;
 +		dst->seq++;
 +		st->idx = (st->idx + dw) % (dw * st->entries);
-+		sy_ce_wr(st->dev_r2 + 4u, st->idx);	/* TP (dword index) back */
++		sy_ce_tp_wr(st, st->idx);	/* shadow slot, or the real R2 TP */
 +		if (len && len <= SY_CE_BUF_SZ)
 +			sy_htc_rx((const uint8_t *)(sy_ce_wc + buf), len);
 +		else
@@ -28317,7 +28345,7 @@
 +}
 +
 +/* QMI_WLANFW_WLAN_CFG_REQ (qmi.c:2643-2728): host version, target CE config and
-+ * service map.  shadow_reg_v3 is deliberately absent (see the block comment). */
++ * service map, plus TLV 0x17 shadow_reg_v3 for the six D1 doorbells. */
 +static unsigned
 +sy_wlfw_wlan_cfg(uint8_t *b, uint16_t txn)
 +{
@@ -28355,6 +28383,17 @@
 +			b[at++] = (uint8_t)(v >> 16);
 +			b[at++] = (uint8_t)(v >> 24);
 +		}
++	}
++	/* TLV 0x17 shadow_reg_v3: u8 count + 6 little-endian target addresses. */
++	at = sy_qmi_tlv_hdr(b, at, 0x17, (uint16_t)(1u + 6u * 4u));
++	b[at++] = 6;
++	for (i = 0; i < 6u; i++) {
++		uint32_t v = sy_ce_shadow_addr[i];
++
++		b[at++] = (uint8_t)v;
++		b[at++] = (uint8_t)(v >> 8);
++		b[at++] = (uint8_t)(v >> 16);
++		b[at++] = (uint8_t)(v >> 24);
 +	}
 +	return sy_qmi_finish(b, at);
 +}
