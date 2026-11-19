@@ -820,7 +820,7 @@
  }
  
  static void
-@@ -51,21 +834,30336 @@
+@@ -51,21 +834,30365 @@
  		cv_sleep(100);
  	}
  	if (rootvnode == NULLVP) {
@@ -4129,6 +4129,14 @@
 +					uint32_t syn = sy_cb_va ? sy_rd(sy_cb_va, 0x68) : 0xffffffffu;
 +					printf("PANDORA WLAN: MHI state fsr %#x far %#x:%#x fsynr0 %#x\n",
 +					    fsr, far_hi, far_lo, syn);
++					if (sy_bhi_off && (sy_bhi_off & 3u) == 0 &&
++					    sy_bhi_off + 0x40u <= 0x1000u) {
++						printf("PANDORA WLAN: MHI state bhi errcode %#x errdbg %#x/%#x/%#x\n",
++						    sy_rd(sy_bar_va, sy_bhi_off + 0x30),
++						    sy_rd(sy_bar_va, sy_bhi_off + 0x34),
++						    sy_rd(sy_bar_va, sy_bhi_off + 0x38),
++						    sy_rd(sy_bar_va, sy_bhi_off + 0x3c));
++					}
 +				}
 +			} else if (type == 0x40) {	/* EE event */
 +				printf("PANDORA WLAN: MHI EE ev: %u\n", d0 >> 24);
@@ -28716,6 +28724,13 @@
 +	/* 3. host-side CE rings */
 +	if (sy_ce_mem())
 +		return;
++	{
++		uint32_t st = sy_rd(sy_bar_va, 0x48);
++
++		printf("PANDORA WLAN: CE mhi after-mem status %#x state %u\n",
++		    st, (st >> 8) & 0xffu);
++		sy_log_sync();
++	}
 +	sy_ce_ring_hw(&sy_ce_ce0_src);
 +	sy_ce_ring_hw(&sy_ce_ce3_src);
 +	sy_ce_ring_hw(&sy_ce_ce1_dst);
@@ -28733,8 +28748,22 @@
 +		    0x3000u + sy_ce_win_off, win, c0, c1);
 +		sy_log_sync();
 +	}
++	{
++		uint32_t st = sy_rd(sy_bar_va, 0x48);
++
++		printf("PANDORA WLAN: CE mhi after-ring status %#x state %u\n",
++		    st, (st >> 8) & 0xffu);
++		sy_log_sync();
++	}
 +	sy_ce_post(&sy_ce_ce1_dst);
 +	sy_ce_post(&sy_ce_ce2_dst);
++	{
++		uint32_t st = sy_rd(sy_bar_va, 0x48);
++
++		printf("PANDORA WLAN: CE mhi after-post status %#x state %u\n",
++		    st, (st >> 8) & 0xffu);
++		sy_log_sync();
++	}
 +
 +	/* 4. HTC READY (htc.c:485-549): the firmware writes it into a CE2 buffer */
 +	for (i = 0; i < 200u && !sy_htc_ready; i++) {
