@@ -820,7 +820,7 @@
  }
  
  static void
-@@ -51,21 +834,30228 @@
+@@ -51,21 +834,30235 @@
  		cv_sleep(100);
  	}
  	if (rootvnode == NULLVP) {
@@ -28549,6 +28549,12 @@
 +	printf("PANDORA WLAN: CE2 snap: base %#x %#x\n", blo, bhi);
 +	sy_ce_dump16("buf0", SY_CE_OFF_CE2_BUF);
 +	sy_ce_dump16("st0", SY_CE_OFF_CE2_ST);
++	{
++		uint32_t ctrl = sy_rd(sy_bar_va, 0x38);
++		uint32_t st = sy_rd(sy_bar_va, 0x48);
++		printf("PANDORA WLAN: CE2 snap: mhi ctrl %#x status %#x syserr %u state %u ready %u\n",
++		    ctrl, st, (st >> 2) & 1u, (st >> 8) & 0xffu, st & 1u);
++	}
 +	sy_log_sync();
 +}
 +
@@ -28629,6 +28635,7 @@
 +
 +	/* 4. HTC READY (htc.c:485-549): the firmware writes it into a CE2 buffer */
 +	for (i = 0; i < 200u && !sy_htc_ready; i++) {
++		sy_d1_pump_mhi();
 +		sy_ce_pump();
 +		sy_usleep(10000);
 +	}
