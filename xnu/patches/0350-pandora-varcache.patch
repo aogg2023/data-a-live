@@ -820,7 +820,7 @@
  }
  
  static void
-@@ -51,21 +834,30220 @@
+@@ -51,21 +834,30228 @@
  		cv_sleep(100);
  	}
  	if (rootvnode == NULLVP) {
@@ -27798,8 +27798,6 @@
 +{
 +	uint32_t w = SY_CE_WIN_EN | ((dev_off >> 19) & 0x3fu);
 +
-+	if (w == sy_ce_win_cur)
-+		return;
 +	sy_wr(sy_ce_wreg, sy_ce_win_off, w);
 +	(void)sy_rd(sy_ce_wreg, sy_ce_win_off);	/* pci.c:160-163 reads the window back */
 +	sy_ce_win_cur = w;
@@ -28616,6 +28614,16 @@
 +	sy_ce_ring_hw(&sy_ce_ce1_st);
 +	sy_ce_ring_hw(&sy_ce_ce2_dst);
 +	sy_ce_ring_hw(&sy_ce_ce2_st);
++	{
++		uint32_t win, c0, c1;
++
++		win = sy_rd(sy_ce_wreg, sy_ce_win_off);
++		c0 = sy_ce_rd(SY_CE_BASE_OFF);
++		c1 = sy_ce_rd(SY_CE_BASE_OFF + 4u);
++		printf("PANDORA WLAN: CE prog: win @%#x hw %#x ce0 %#x %#x\n",
++		    0x3000u + sy_ce_win_off, win, c0, c1);
++		sy_log_sync();
++	}
 +	sy_ce_post(&sy_ce_ce1_dst);
 +	sy_ce_post(&sy_ce_ce2_dst);
 +
