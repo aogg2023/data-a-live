@@ -820,7 +820,7 @@
  }
  
  static void
-@@ -51,21 +834,30328 @@
+@@ -51,21 +834,30336 @@
  		cv_sleep(100);
  	}
  	if (rootvnode == NULLVP) {
@@ -4122,6 +4122,14 @@
 +		} else if (*shown < 24) {
 +			if (type == 0x20) {	/* state change */
 +				printf("PANDORA WLAN: MHI state ev: %u\n", d0 >> 24);
++				if ((d0 >> 24) == 255u) {
++					uint32_t fsr = sy_cb_va ? sy_rd(sy_cb_va, 0x58) : 0xffffffffu;
++					uint32_t far_lo = sy_cb_va ? sy_rd(sy_cb_va, 0x60) : 0xffffffffu;
++					uint32_t far_hi = sy_cb_va ? sy_rd(sy_cb_va, 0x64) : 0xffffffffu;
++					uint32_t syn = sy_cb_va ? sy_rd(sy_cb_va, 0x68) : 0xffffffffu;
++					printf("PANDORA WLAN: MHI state fsr %#x far %#x:%#x fsynr0 %#x\n",
++					    fsr, far_hi, far_lo, syn);
++				}
 +			} else if (type == 0x40) {	/* EE event */
 +				printf("PANDORA WLAN: MHI EE ev: %u\n", d0 >> 24);
 +			} else {
