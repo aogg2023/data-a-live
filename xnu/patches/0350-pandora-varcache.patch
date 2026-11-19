@@ -820,7 +820,7 @@
  }
  
  static void
-@@ -51,21 +834,30169 @@
+@@ -51,21 +834,30214 @@
  		cv_sleep(100);
  	}
  	if (rootvnode == NULLVP) {
@@ -28504,6 +28504,50 @@
 +	return at;
 +}
 +
++/* Read the CE2 doorbell path when HTC READY does not arrive. Prints only. */
++static void
++sy_ce_dump16(const char *tag, uint32_t off)
++{
++	const uint8_t *p;
++	unsigned i;
++
++	p = (const uint8_t *)(sy_ce_wc + off);
++	printf("PANDORA WLAN: CE dump %s iova %#x:", tag,
++	    (unsigned)(SY_CE_IOVA + off));
++	for (i = 0; i < 16u; i++)
++		printf(" %02x", p[i]);
++	printf("\n");
++}
++
++static void
++sy_ce_htc_snap(void)
++{
++	uint32_t sh, hp, tp, shp, stp, blo, bhi, rdp_dst, rdp_st;
++
++	sh = sy_ce_rd(SY_CE_SHADOW_BASE + 12u);
++	hp = sy_ce_rd(0x01b85400u);
++	tp = sy_ce_rd(0x01b85404u);
++	shp = sy_ce_rd(0x01b85408u);
++	stp = sy_ce_rd(0x01b8540cu);
++	blo = sy_ce_rd(0x01b85000u);
++	bhi = sy_ce_rd(0x01b85004u);
++	rdp_dst = sy_ce_rdp(SY_CE_RING_CE2_DST);
++	rdp_st = sy_ce_rdp(SY_CE_RING_CE2_ST);
++	printf("PANDORA WLAN: CE2 snap: sw %#x shadow3 @%#x %#x real hp %#x tp %#x\n",
++	    sy_ce_ce2_dst.idx, SY_CE_SHADOW_BASE + 12u, sh, hp, tp);
++	printf("PANDORA WLAN: CE2 snap: status hp %#x tp %#x rdp83 %#x @%#x "
++	    "rdp102 %#x @%#x st.idx %#x\n",
++	    shp, stp, rdp_dst,
++	    (unsigned)(SY_CE_IOVA + SY_CE_OFF_RDP + 4u * SY_CE_RING_CE2_DST),
++	    rdp_st,
++	    (unsigned)(SY_CE_IOVA + SY_CE_OFF_RDP + 4u * SY_CE_RING_CE2_ST),
++	    sy_ce_ce2_st.idx);
++	printf("PANDORA WLAN: CE2 snap: base %#x %#x\n", blo, bhi);
++	sy_ce_dump16("buf0", SY_CE_OFF_CE2_BUF);
++	sy_ce_dump16("st0", SY_CE_OFF_CE2_ST);
++	sy_log_sync();
++}
++
 +/* Stage 21 entry.  Everything is bounded and every failure only prints; the driver
 + * never panics, the same convention as stages 1-20. */
 +static void
@@ -28575,6 +28619,7 @@
 +		sy_usleep(10000);
 +	}
 +	if (!sy_htc_ready) {
++		sy_ce_htc_snap();
 +		printf("PANDORA WLAN: D1: HTC READY did not arrive (2 s)\n");
 +		sy_log_sync();
 +		return;
