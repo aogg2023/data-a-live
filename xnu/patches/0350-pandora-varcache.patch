@@ -820,7 +820,7 @@
  }
  
  static void
-@@ -51,21 +834,30041 @@
+@@ -51,21 +834,30061 @@
  		cv_sleep(100);
  	}
  	if (rootvnode == NULLVP) {
@@ -4754,6 +4754,7 @@
 +#define SY_QRTR_TYPE_DATA 1u
 +#define SY_QRTR_TYPE_HELLO 2u
 +#define SY_QRTR_TYPE_NEW_SERVER 4u
++#define SY_QRTR_TYPE_RESUME_TX 7u
 +#define SY_QRTR_TYPE_NEW_LOOKUP 10u
 +#define SY_QRTR_PORT_CTRL 0xfffffffeu
 +#define SY_QRTR_NODE_BCAST 0xffffffffu
@@ -5577,6 +5578,25 @@
 +	src_node = (uint32_t)(b[8] | (b[9] << 8) | (b[10] << 16) | (b[11] << 24));
 +	src_port = (uint32_t)(b[12] | (b[13] << 8) | (b[14] << 16) | (b[15] << 24));
 +	size = (uint32_t)(b[20] | (b[21] << 8) | (b[22] << 16) | (b[23] << 24));
++	{
++		uint32_t confirm = (uint32_t)(b[16] | (b[17] << 8) | (b[18] << 16) | (b[19] << 24));
++		uint32_t dst_node = (uint32_t)(b[24] | (b[25] << 8) | (b[26] << 16) | (b[27] << 24));
++		uint32_t dst_port = (uint32_t)(b[28] | (b[29] << 8) | (b[30] << 16) | (b[31] << 24));
++
++		/* af_qrtr.c sets confirm_rx when pending hits QRTR_TX_FLOW_LOW (5)
++		 * and waits once pending reaches QRTR_TX_FLOW_HIGH (10). Reply the
++		 * way qrtr_send_resume_tx does, before handling the payload. */
++		if (confirm && type == SY_QRTR_TYPE_DATA) {
++			uint8_t frame[64];
++			unsigned fl = sy_qrtr_ctrl(frame, SY_QRTR_TYPE_RESUME_TX,
++			    dst_node, dst_port, src_node, src_port,
++			    dst_node, dst_port, 0, 0);
++
++			printf("PANDORA WLAN: WLFW qrtr resume_tx node %u port %#x %u B\n",
++			    src_node, src_port, fl);
++			(void)sy_mhi_send(20, frame, fl);
++		}
++	}
 +	if (type == SY_QRTR_CMD_NEW_SERVER && size >= 20 && len >= 52) {
 +		uint32_t service = (uint32_t)(b[36] | (b[37] << 8) | (b[38] << 16) | (b[39] << 24));
 +		uint32_t node = (uint32_t)(b[44] | (b[45] << 8) | (b[46] << 16) | (b[47] << 24));
