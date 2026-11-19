@@ -820,7 +820,7 @@
  }
  
  static void
-@@ -51,21 +834,30061 @@
+@@ -51,21 +834,30127 @@
  		cv_sleep(100);
  	}
  	if (rootvnode == NULLVP) {
@@ -4769,6 +4769,7 @@
 +#define SY_QMI_WLFW_FW_MEM_READY_IND 0x0037
 +#define SY_QMI_WLFW_M3_INFO_REQ 0x003c
 +#define SY_QMI_WLFW_AUX_UC_INFO_REQ 0x005a
++#define SY_QMI_WLFW_QDSS_TRACE_CONFIG_DOWNLOAD_REQ 0x0044
 +#define SY_QMI_WLFW_TME_LITE_INFO_REQ 0x005b
 +
 +#define SY_WLFW_MEM_TYPE_DDR 1u
@@ -5473,7 +5474,8 @@
 +static uint8_t sy_bdf_msg[7168];
 +static void sy_wlfw_bdf_send(const char *, uint8_t);
 +static void sy_wlfw_m3_send(void);
-+static void sy_wlfw_aux_send(void);
++static int sy_wlfw_aux_send(void);
++static void sy_wlfw_qdss_send(void);
 +static void sy_wlfw_pump(void);
 +/* sy_wlfw_rx() calls this before its definition; C99 rejects implicit
 + * declarations (CI run 42737773853 hit exactly this in pandora_cachevol.c). */
@@ -5709,7 +5711,8 @@
 +		} else if (msgid == SY_QMI_WLFW_CAP_REQ ||
 +		    msgid == SY_QMI_WLFW_HOST_CAP_REQ || msgid == SY_QMI_WLFW_BDF_DOWNLOAD_REQ ||
 +		    msgid == SY_QMI_WLFW_M3_INFO_REQ || msgid == SY_QMI_WLFW_AUX_UC_INFO_REQ ||
-+		    msgid == SY_QMI_WLFW_TME_LITE_INFO_REQ) {
++		    msgid == SY_QMI_WLFW_TME_LITE_INFO_REQ ||
++		    msgid == SY_QMI_WLFW_QDSS_TRACE_CONFIG_DOWNLOAD_REQ) {
 +			if (msgid == SY_QMI_WLFW_CAP_REQ && !sy_wlfw_cap_handled) {
 +				sy_wlfw_cap_take(b + q, (unsigned)qlen + 7, 1);
 +				sy_aop_ol_cpr();
@@ -6199,7 +6202,7 @@
 +/* QMI_WLANFW_AUX_UC_INFO_REQ_V01 (0x5A). Same two TLVs as m3_info.
 + * Local cnss_wlfw_aux_dnld_send_sync sends this; the pack file is
 + * aux_ucode20.elf (ath12k_qmi.h QMI_WLANFW_AUX_UC_INFO_REQ_V01). */
-+static void
++static int
 +sy_wlfw_aux_send(void)
 +{
 +	uint32_t sz = 0;
@@ -6207,12 +6210,75 @@
 +	unsigned qlen;
 +
 +	if (sy_wlfw_place("aux_ucode20.elf", iova, 0x10000u, &sz))
-+		return;
++		return -1;
 +	qlen = sy_wlfw_m3_info(sy_wlfw_txbuf, sy_wlfw_txn++, iova, sz);
 +	/* reuse the m3 encoder, then overwrite the message id */
 +	sy_wlfw_txbuf[3] = (uint8_t)SY_QMI_WLFW_AUX_UC_INFO_REQ;
 +	sy_wlfw_txbuf[4] = (uint8_t)(SY_QMI_WLFW_AUX_UC_INFO_REQ >> 8);
-+	(void)sy_wlfw_qmi_send(SY_QMI_WLFW_AUX_UC_INFO_REQ, sy_wlfw_txbuf, qlen);
++	return sy_wlfw_qmi_send(SY_QMI_WLFW_AUX_UC_INFO_REQ, sy_wlfw_txbuf, qlen);
++}
++
++/* QMI_WLFW_QDSS_TRACE_CONFIG_DOWNLOAD_REQ_V01 (0x44).
++ * cnss2/qmi.c cnss_wlfw_qdss_dnld_send_sync: 0x10 is bytes still
++ * remaining, 0x11 seg_id, 0x12 data, 0x13 end. TLV types are
++ * wlan_firmware_service_v01.c:5607. QMI_WLFW_MAX_DATA_SIZE_V01 is 6144. */
++static unsigned
++sy_wlfw_qdss_download(uint8_t *b, uint16_t txn, uint32_t total,
++    uint32_t seg_id, const uint8_t *data, uint16_t len, uint8_t end)
++{
++	unsigned at = sy_qmi_hdr(b, 0x00, txn,
++	    SY_QMI_WLFW_QDSS_TRACE_CONFIG_DOWNLOAD_REQ);
++	unsigned i;
++
++	at = sy_qmi_tlv_u32(b, at, 0x10, total);
++	at = sy_qmi_tlv_u32(b, at, 0x11, seg_id);
++	at = sy_qmi_tlv_hdr(b, at, 0x12, (uint16_t)(2 + len));
++	b[at++] = (uint8_t)len;
++	b[at++] = (uint8_t)(len >> 8);
++	for (i = 0; i < len; i++)
++		b[at++] = data[i];
++	at = sy_qmi_tlv_u8(b, at, 0x13, end);
++	return sy_qmi_finish(b, at);
++}
++
++/* cnss2/main.c cnss_fw_mem_ready_hdlr sends this after aux.
++ * This phone's file is qdss_trace_config_v2.cfg (perf_v2 is absent). */
++static void
++sy_wlfw_qdss_send(void)
++{
++	uint64_t fo = 0, fs = 0;
++	uint32_t segs, i;
++
++	if (!sy_mem_va || !sy_wlfw_node)
++		return;
++	if (sy_fw_find("qdss_trace_config_v2.cfg", &fo, &fs) != 0 || fs == 0) {
++		printf("PANDORA WLAN: WLFW qdss qdss_trace_config_v2.cfg: not in the pack\n");
++		return;
++	}
++	segs = (uint32_t)((fs + 6143) / 6144);
++	printf("PANDORA WLAN: WLFW qdss qdss_trace_config_v2.cfg: %llu B, %u fragments\n",
++	    (unsigned long long)fs, segs);
++	for (i = 0; i < segs; i++) {
++		uint32_t off = i * 6144;
++		uint32_t len = (uint32_t)((fs - off) > 6144 ? 6144 : (fs - off));
++		unsigned qlen;
++
++		if (pandora_fw_read(fo + off, sy_bdf_buf, len)) {
++			printf("PANDORA WLAN: WLFW qdss read failed at %u\n", off);
++			return;
++		}
++		memset(sy_bdf_msg, 0, sizeof(sy_bdf_msg));
++		qlen = sy_wlfw_qdss_download(sy_bdf_msg, sy_wlfw_txn++,
++		    (uint32_t)(fs - off), i, sy_bdf_buf, (uint16_t)len,
++		    (i + 1 == segs) ? 1 : 0);
++		printf("PANDORA WLAN: WLFW qdss %u/%u: off %u len %u end %u\n",
++		    i + 1, segs, off, len, (i + 1 == segs));
++		if (sy_wlfw_qmi_send(SY_QMI_WLFW_QDSS_TRACE_CONFIG_DOWNLOAD_REQ,
++		    sy_bdf_msg, qlen) != 0) {
++			printf("PANDORA WLAN: WLFW qdss stopped at fragment %u\n", i);
++			return;
++		}
++	}
 +}
 +
 +static int sy_wlfw_busy;
@@ -27027,7 +27093,7 @@
 +		return;
 +	sy_wlfw_busy = 1;
 +	sy_wlfw_dl_pending = 0;
-+	printf("PANDORA WLAN: WLFW download: cap, board, regdb, m3, aux\n");
++	printf("PANDORA WLAN: WLFW download: cap, board, regdb, m3, aux, qdss\n");
 +	if (sy_wlfw_cap_send() != 0) {
 +		sy_log_sync();
 +		sy_wlfw_busy = 0;
@@ -27053,8 +27119,8 @@
 +		sy_wlfw_t1_off();
 +	if (sy_wlfw_alive())
 +		sy_wlfw_m3_send();
-+	if (sy_wlfw_alive())
-+		sy_wlfw_aux_send();
++	if (sy_wlfw_alive() && sy_wlfw_aux_send() == 0)
++		sy_wlfw_qdss_send();
 +	sy_log_sync();
 +	sy_wlfw_busy = 0;
 +}
