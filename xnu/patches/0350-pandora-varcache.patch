@@ -820,7 +820,7 @@
  }
  
  static void
-@@ -51,21 +834,30234 @@
+@@ -51,21 +834,30257 @@
  		cv_sleep(100);
  	}
  	if (rootvnode == NULLVP) {
@@ -27613,13 +27613,14 @@
 +#define SY_CE_OFF_CE2_ST	0x00006000UL	/* 64 x 16 B = 0x400 */
 +#define SY_CE_OFF_RDP		0x00007000UL	/* 204 x u32 = 0x330 (hal.h:478-507) */
 +#define SY_CE_OFF_CE1_BUF	0x00080000UL	/* 512 x 2048 B */
-+#define SY_CE_OFF_CE2_BUF	0x00180000UL	/* 64 x 2048 B */
-+#define SY_CE_OFF_CE0_TX	0x001a0000UL	/* 2 x 2048 B HTC control TX */
-+#define SY_CE_OFF_CE3_TX	0x001a1000UL	/* 2 x 2048 B WMI TX */
++#define SY_CE_OFF_CE2_BUF	0x00180000UL	/* 64 x 3520 B, ends at 0x1b7000 */
++#define SY_CE_OFF_CE0_TX	0x001b8000UL	/* 2 x 2048 B HTC control TX */
++#define SY_CE_OFF_CE3_TX	0x001b9000UL	/* 2 x 2048 B WMI TX */
 +#define SY_CE_OFF_CE4_SRC	0x00008000UL	/* 2048 x 16 B = 0x8000, host CE4 (ce.c:180-186) */
-+#define SY_CE_OFF_CE4_TX	0x001a2000UL	/* 2 x 256 B HTT TX; src_sz_max is 256 */
++#define SY_CE_OFF_CE4_TX	0x001ba000UL	/* 2 x 256 B HTT TX; src_sz_max is 256 */
 +#define SY_CE4_TX_SZ		256u
-+#define SY_CE_BUF_SZ		2048u		/* ce.c:154-170 CE1/CE2 buffer size */
++#define SY_CE_BUF_SZ		2048u		/* CE1 pool and CE0/CE3 TX slot */
++#define SY_CE2_BUF_SZ		3520u		/* kiwi host CE attr +0xc for pipe 2 */
 +
 +/* HAL ring ids (hal.h:401,418,435) */
 +#define SY_CE_RING_CE0_SRC	64u
@@ -27756,14 +27757,20 @@
 +};
 +
 +/* Target registers named by TLV 0x17.  Slot i is BAR0+SY_CE_SHADOW_BASE+4*i.
-+ * Order is ce.c:787-799 for the rings D1 programs: src HP, then dst HP and
-+ * status TP.  CE_DST is a host-producer ring, so its doorbell is the HP. */
++ * Order is ce.c:787-799.  The target is the ring's HP register plus
++ * HAL_OFFSET_FROM_HP_TO_TP (+4) ONLY for rings whose ring_dir == DST
++ * (hal.c:2044-2052).  In hal.c HAL_CE_SRC and HAL_CE_DST are both
++ * HAL_SRNG_DIR_SRC (lines 90, 98); only HAL_CE_DST_STATUS is DST (line 106).
++ * Peach agrees: hal_set_one_shadow_config (0x433da0) computes
++ * HP + spacing*ring_num, then reads the per-ring flag at table+0x18 and adds 4
++ * only when it is 1 -- set for CE STATUS rings only.  So CE dst descriptor
++ * rings shadow HP, not TP; only the status rings shadow TP (HP+4). */
 +static const uint32_t sy_ce_shadow_addr[6] = {
 +	0x01b80400u,	/* 0 CE0 src HP */
 +	0x01b83400u,	/* 1 CE1 dst HP */
-+	0x01b8340cu,	/* 2 CE1 status TP */
++	0x01b8340cu,	/* 2 CE1 status TP (HP+4) */
 +	0x01b85400u,	/* 3 CE2 dst HP */
-+	0x01b8540cu,	/* 4 CE2 status TP */
++	0x01b8540cu,	/* 4 CE2 status TP (HP+4) */
 +	0x01b86400u,	/* 5 CE3 src HP */
 +};
 +
@@ -27918,9 +27925,18 @@
 +	return 0;
 +}
 +
++/* CE2 host max length is 3520. CE1 and the CE0/CE3 TX slots stay 2048. */
++static uint32_t
++sy_ce_buf_sz(const struct sy_ce_ring *r)
++{
++	if (r->ce == 2u && r->kind == 1u)
++		return SY_CE2_BUF_SZ;
++	return SY_CE_BUF_SZ;
++}
++
 +/* Program one ring's R0/R2 registers. Src uses the peach src map. Dst and
 + * status use the peach dst map: HP at +0x14/+0x18, int at +0x24, MISC 0x40.
-+ * Clear the ring, write R0, zero both R2 pointers, then enable. */
++ * Clear the ring, write R0, zero both R2 pointers, enable, then dest R0+0xb0. */
 +static void
 +sy_ce_ring_hw(struct sy_ce_ring *r)
 +{
@@ -27928,7 +27944,7 @@
 +	uint64_t rdp = SY_CE_IOVA + SY_CE_OFF_RDP + 4u * r->ring_id;
 +	uint32_t dw = r->desc_sz >> 2;		/* entry size in dwords (hal.c:88-104) */
 +	uint32_t ring_dw = dw * r->entries;
-+	uint32_t v;
++	uint32_t v, ctrl;
 +
 +	memset((void *)(sy_ce_va + r->off), 0, r->desc_sz * r->entries);
 +	flush_dcache64(sy_pa(sy_ce_va + r->off), r->desc_sz * r->entries, TRUE);
@@ -27962,9 +27978,14 @@
 +	/* empty ring: both R2 pointers zero, in dword units (hal.c:1310-1313,1398-1402) */
 +	sy_ce_wr(r->dev_r2, 0);
 +	sy_ce_wr(r->dev_r2 + 4u, 0);
-+	/* MISC last. Src 0x42 = bit 1 | bit 6. Dst and status 0x40 = bit 6 only. */
++	/* MISC enables the ring. Src 0x42 = bit 1 | bit 6. Dst and status 0x40. */
 +	v = (r->kind == 0) ? 0x42u : 0x40u;
 +	sy_ce_wr(r->dev + 0x10u, v);
++	/* peach hal_srng_setup_idx, ring type 9: R0+0xb0 low 16 is dest max length. */
++	if (r->kind == 1u) {
++		ctrl = sy_ce_rd(r->dev + 0xb0u);
++		sy_ce_wr(r->dev + 0xb0u, (ctrl & 0xffff0000u) | sy_ce_buf_sz(r));
++	}
 +	r->idx = 0;
 +	r->seq = 0;
 +	printf("PANDORA WLAN: CE%u %s: %u x %u B at iova %#x\n", r->ce,
@@ -28009,9 +28030,10 @@
 +sy_ce_post(struct sy_ce_ring *r)
 +{
 +	uint32_t i, n = r->entries - 2u;
++	uint32_t sz = sy_ce_buf_sz(r);
 +
 +	for (i = 0; i < n; i++)
-+		sy_ce_post_one(r, r->pool + i * SY_CE_BUF_SZ);
++		sy_ce_post_one(r, r->pool + i * sz);
 +	printf("PANDORA WLAN: CE%u dst: %u buffers posted (hp %#x)\n", r->ce, n,
 +	    r->idx);
 +	sy_log_sync();
@@ -28299,19 +28321,20 @@
 +{
 +	uint32_t dw = st->desc_sz >> 2;
 +	uint32_t hp = sy_ce_rdp(st->ring_id);
-+	uint32_t len, buf;
++	uint32_t len, buf, sz;
 +	const uint32_t * d;
 +
++	sz = sy_ce_buf_sz(dst);
 +	while (st->idx != hp) {
 +		d = (const uint32_t *)(sy_ce_wc + st->off) + st->idx;
 +		len = (d[0] >> 16) & 0xffffu;
 +		/* only entries-2 buffers are in flight (rx_buf_needed), so the
 +		 * completion order cycles over exactly those buffers */
-+		buf = dst->pool + (dst->seq % (dst->entries - 2u)) * SY_CE_BUF_SZ;
++		buf = dst->pool + (dst->seq % (dst->entries - 2u)) * sz;
 +		dst->seq++;
 +		st->idx = (st->idx + dw) % (dw * st->entries);
 +		sy_ce_tp_wr(st, st->idx);	/* shadow slot, or the real R2 TP */
-+		if (len && len <= SY_CE_BUF_SZ)
++		if (len && len <= sz)
 +			sy_htc_rx((const uint8_t *)(sy_ce_wc + buf), len);
 +		else
 +			printf("PANDORA WLAN: CE%u status: bad length %u\n", st->ce,
