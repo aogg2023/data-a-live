@@ -27597,12 +27597,12 @@
 + *    0x310c is logged and not selected.
 + *
 + * Design choices for this first pass, stated so a later stage can change them:
-+ *  1. Shadow doorbells: WLAN_CFG TLV 0x17 lists 38 addresses.  The host
-+ *     writes BAR0+0x8fc+4*index.  That add is in qca_cld3_peach_v2.ko
-+ *     hal_set_one_shadow_config at file offset 0x6b71b0.  CE rings occupy
-+ *     indices 27-37, so the CE2 dst doorbell is slot 30 (0x974), not slot 3.
-+ *     Ring init still clears the real R2 pair.  Status HP is still read from
-+ *     the RDP page.
++ *  1. Host doorbells are the real R2 pair: HP at dev_r2, TP at dev_r2+4.
++ *     CE2 dst HP is 0x01b85400 and CE7 dst HP is 0x01b8f400.  TLV 0x17
++ *     still sends the 38 shadow_reg_v3 addresses for firmware to program.
++ *     The host does not write BAR0+0x8fc+4*index.  Ring init still clears
++ *     the real R2 pair.  Status HP is still read from the RDP page.
++ *     Snap prints still read the shadow slots for comparison.
 + *  2. No interrupts: the CE status rings are polled, like the existing MHI
 + *     stages; this driver tree has no interrupt handler yet.
 + *  3. Device-written memory (status descriptors, RDP indices, received buffers)
@@ -28117,17 +28117,17 @@
 +	    r->entries, r->desc_sz, (unsigned)(SY_CE_IOVA + r->off));
 +}
 +
-+/* Host doorbell.  Every programmed ring writes its v3 slot. */
++/* Host doorbell.  Every programmed ring writes its real R2 register. */
 +static void
 +sy_ce_hp_wr(struct sy_ce_ring *r, uint32_t val)
 +{
-+	sy_ce_wr(r->shadow ? r->shadow : r->dev_r2, val);
++	sy_ce_wr(r->dev_r2, val);
 +}
 +
 +static void
 +sy_ce_tp_wr(struct sy_ce_ring *r, uint32_t val)
 +{
-+	sy_ce_wr(r->shadow ? r->shadow : r->dev_r2 + 4u, val);
++	sy_ce_wr(r->dev_r2 + 4u, val);
 +}
 +
 +/* Submit one receive buffer to a destination ring and publish the new HP. */
@@ -28147,7 +28147,7 @@
 +	    r->desc_sz, TRUE);
 +	__asm__ volatile("dsb sy" ::: "memory");
 +	r->idx = (r->idx + dw) % (dw * r->entries);
-+	sy_ce_hp_wr(r, r->idx);	/* shadow slot, or the real R2 HP */
++	sy_ce_hp_wr(r, r->idx);	/* real R2 HP */
 +}
 +
 +/* nentries-1.  hif_config_ce_by_id at 0x948c, then init_buffer_count which is ret.
@@ -28458,7 +28458,7 @@
 +		buf = dst->pool + (dst->seq % (dst->entries - 1u)) * sz;
 +		dst->seq++;
 +		st->idx = (st->idx + dw) % (dw * st->entries);
-+		sy_ce_tp_wr(st, st->idx);	/* shadow slot, or the real R2 TP */
++		sy_ce_tp_wr(st, st->idx);	/* real R2 TP */
 +		if (len && len <= sz)
 +			sy_htc_rx((const uint8_t *)((dst->ce == 2u)
 +			    ? (sy_ce2_wc + buf) : (sy_ce_wc + buf)), len);
