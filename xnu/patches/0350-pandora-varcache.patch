@@ -820,7 +820,7 @@
  }
  
  static void
-@@ -51,21 +834,30539 @@
+@@ -51,21 +834,30601 @@
  		cv_sleep(100);
  	}
  	if (rootvnode == NULLVP) {
@@ -27740,12 +27740,14 @@
 +#define SY_HTC_FLAG_TRAILER	0x02u
 +#define SY_HTC_SVC_WMI_CONTROL	0x0100u
 +
-+/* WMI constants (wmi.h:302,675-676,1184-1232) */
++/* WMI constants (wmi.h:302,675-677,1179,1184-1232) */
 +#define SY_WMI_INIT_CMDID	0x00000001u
 +#define SY_WMI_SERVICE_READY_EVENTID	0x00000001u
 +#define SY_WMI_READY_EVENTID	0x00000002u
++#define SY_WMI_SERVICE_AVAILABLE_EVENTID	0x00000003u
 +#define SY_WMI_SERVICE_READY_EXT_EVENTID	0x00004009u
 +#define SY_WMI_SERVICE_READY_EXT2_EVENTID	0x00004022u
++#define SY_WMI_TAG_ARRAY_UINT32	16u
 +#define SY_WMI_TAG_ARRAY_STRUCT	18u
 +#define SY_WMI_TAG_SERVICE_READY	32u
 +#define SY_WMI_TAG_READY_EVENT	35u
@@ -28329,6 +28331,53 @@
 +		}
 +		return;
 +	}
++	if (cmd == SY_WMI_SERVICE_AVAILABLE_EVENTID) {
++		/* Ext2 service bitmap is the ARRAY_UINT32 in this event
++		 * (wmi.c:6286-6295). Bit 281 is word 0 bit 25 (281-256).
++		 * Print only; cfg[68] stays 0 until this word is read. */
++		uint32_t off;
++		uint32_t word0;
++		uint32_t n;
++		uint32_t show;
++		unsigned saw;
++
++		n = len - 4u;
++		show = n > 64u ? 64u : n;
++		word0 = 0;
++		saw = 0;
++		printf("PANDORA WLAN: WMI 0x3 payload %u B\n", n);
++		for (off = 0; off < show; off += 16u) {
++			printf("PANDORA WLAN: WMI 0x3 %04x:", off);
++			for (i = 0; i < 16u && off + i < show; i++)
++				printf(" %02x", b[4u + off + i]);
++			printf("\n");
++		}
++		at = 4u;
++		while (at + 4u <= len) {
++			hdr = (uint32_t)(b[at] | (b[at + 1] << 8) |
++			    (b[at + 2] << 16) | (b[at + 3] << 24));
++			tag = hdr >> 16;
++			tl = hdr & 0xffffu;
++			if (at + 4u + tl > len)
++				break;
++			printf("PANDORA WLAN: WMI 0x3 tlv tag %u len %u\n",
++			    tag, tl);
++			if (tag == SY_WMI_TAG_ARRAY_UINT32 && tl >= 4u && !saw) {
++				p = b + at + 4u;
++				word0 = (uint32_t)(p[0] | (p[1] << 8) |
++				    (p[2] << 16) | (p[3] << 24));
++				saw = 1;
++				printf("PANDORA WLAN: WMI 0x3 array words %u "
++				    "word0 %#x bit281 %u\n",
++				    tl >> 2, word0, (word0 >> 25) & 1u);
++			}
++			at += 4u + tl;
++		}
++		if (!saw)
++			printf("PANDORA WLAN: WMI 0x3 array absent\n");
++		sy_log_sync();
++		return;
++	}
 +	if (cmd != SY_WMI_READY_EVENTID)
 +		return;
 +	at = 4u;
@@ -28689,31 +28738,34 @@
 +	return 0;
 +}
 +
-+/* Build the WMI_INIT payload (wmi.c:3270-3376; values wmi.c:231-275 and field order
-+ * wmi.h:2400-2471).  The 72 resource fields are written in struct order, with the
-+ * chain masks patched from SERVICE_READY. */
++/* Build the WMI_INIT payload (wmi.c:3270-3376; field order wmi.h:2400-2471).
++ * Resource words are the peach WMI_INIT trace: wmi_init_trace2.txt TLV 75
++ * length 0x15c = 87 words, same bytes in wmi_init_trace.txt through offset 336.
++ * Chain masks are still patched from SERVICE_READY. */
 +static unsigned
 +sy_wmi_init_frame(uint8_t *b)
 +{
-+	static const uint32_t cfg[72] = {
-+		/* 0..8: vdevs, peers, offload peers/buffs, peer keys, tids, skid, chains */
-+		4, 16, 3, 3, 2, 32, 16, 2, 2,
-+		/* 9..17: rx timeout pri 0..2 low, pri 3 high, decap, scan, bmiss, roam vdev/profiles */
-+		100, 100, 100, 40, 1, 4, 3, 3, 8,
-+		/* 18..27: mcast groups/table/mode, tx dbg log, wds, dma burst, mac aggr, rx skip, vow, gtk */
-+		0, 0, 0, 1024, 0, 0, 0, 0, 0, 2,
-+		/* 28..36: msdu desc, frag, tdls vdevs/table, beacon offload, mcast filter, wow, keep alive 0/1 */
-+		0x400, 0xa, 1, 8, 2, 0x20, 0x16, 0, 0,
-+		/* 37..44: keep alive size, tdls sleep/buffer, wmi separate, ocb vdevs/channels/schedules, flag1 */
++	static const uint32_t cfg[87] = {
++		/* 0..8: vdevs, peers, offload, reorder, keys, tids, skid, chains */
++		5, 17, 3, 3, 2, 34, 16, 3, 3,
++		/* 9..17: rx timeout, decap, scan, bmiss, roam vdev/profiles */
++		100, 100, 100, 40, 2, 8, 4, 3, 8,
++		/* 18..27: mcast, tx dbg, wds, dma, mac aggr, rx skip, vow, gtk */
++		0, 0, 0, 1024, 0, 0, 0, 0, 0, 3,
++		/* 28..36: msdu, frag, tdls, beacon, mcast filter, wow, keep alive */
++		0x420, 2, 2, 8, 3, 0x20, 0xc, 6, 0,
++		/* 37..44: tdls sleep/buf, wmi separate, ocb, flag1, smart ant */
++		1, 1, 0, 1, 2, 2, 0x800c0600u, 0,
++		/* 45..52: free lists, ns tuples, bpf, bssid filters */
 +		0, 0, 0, 0, 0, 0, 0, 0,
-+		/* 45..52: smart ant, free lists, ns tuples, bpf size, bssid filters */
-+		0, 0, 0, 0, 0, 0, 0, 0,
-+		/* 53..57: use_pdev_id, dbs duty, group keys, peer map version, sched */
-+		1, 0, 0, 1, 0,
-+		/* 58..64: twt pdev/sta, nlo ssids, pkt filters, sta vdevs, bssid indicator */
-+		0, 0, 0, 0, 0, 0, 0,
-+		/* 65..71: ul resp, msdu overrides, flags2, host svc flags, rnr, ema */
-+		0, 0, 0, 0, 0, 0, 0
++		/* 53..57: use_pdev_id, dbs, group keys, peer map, sched */
++		1, 7, 0x10, 0x32, 0,
++		/* 58..64: twt, nlo, pkt filters, sta vdevs, bssid indicator, ul */
++		2, 0x20, 0, 0xffffffffu, 4, 5, 0,
++		/* 65..71: msdu overrides, flags2, host svc, rnr, ema */
++		0, 0, 0x013040e0u, 0x0002807bu, 0x10, 0, 0,
++		/* 72..86: peach tail past ath12k's 72-word struct */
++		8, 1, 0, 0, 0, 0, 0, 0, 4, 2, 0, 0, 1, 0, 0
 +	};
 +	uint32_t at = 0;
 +	uint32_t v;
@@ -28732,19 +28784,29 @@
 +	b[at++] = (uint8_t)(v >> 8);
 +	b[at++] = (uint8_t)(v >> 16);
 +	b[at++] = (uint8_t)(v >> 24);
-+	for (i = 0; i < 7u; i++) {	/* 24 B abi version + num_host_mem_chunks = 0 */
-+		b[at++] = 0;
-+		b[at++] = 0;
-+		b[at++] = 0;
-+		b[at++] = 0;
++	/* host_abi_vers from peach WMI_INIT. Both traces agree:
++	 * wmi_init_trace2.txt:59-62 and wmi_init_trace.txt:52-55.
++	 * wi_0 0x1000000004a001c, wi_8 0x5f414351000006ba,
++	 * wi_16 0x4c4d, wi_24 0. 24 B then num_host_mem_chunks = 0. */
++	static const uint32_t abi[6] = {
++		0x00000001u, 0x000006bau, 0x5f414351u, 0x00004c4du, 0, 0
++	};
++	for (i = 0; i < 6u; i++) {
++		v = abi[i];
++		b[at++] = (uint8_t)v;
++		b[at++] = (uint8_t)(v >> 8);
++		b[at++] = (uint8_t)(v >> 16);
++		b[at++] = (uint8_t)(v >> 24);
 +	}
-+	/* TLV 75 RESOURCE_CONFIG: 292-byte struct, the length field is size-4 */
-+	v = (SY_WMI_TAG_RESOURCE_CONFIG << 16) | 288u;
++	for (i = 0; i < 4u; i++)
++		b[at++] = 0;
++	/* TLV 75 RESOURCE_CONFIG: peach length 0x15c, 87 words. */
++	v = (SY_WMI_TAG_RESOURCE_CONFIG << 16) | 348u;
 +	b[at++] = (uint8_t)v;
 +	b[at++] = (uint8_t)(v >> 8);
 +	b[at++] = (uint8_t)(v >> 16);
 +	b[at++] = (uint8_t)(v >> 24);
-+	for (i = 0; i < 72u; i++) {
++	for (i = 0; i < 87u; i++) {
 +		v = cfg[i];
 +		if (i == 7u || i == 8u)
 +			v = chain;
