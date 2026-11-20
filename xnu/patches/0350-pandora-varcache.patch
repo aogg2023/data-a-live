@@ -820,7 +820,7 @@
  }
  
  static void
-@@ -51,21 +834,30423 @@
+@@ -51,21 +834,30472 @@
  		cv_sleep(100);
  	}
  	if (rootvnode == NULLVP) {
@@ -3039,6 +3039,51 @@
 +	sy_log_sync();
 +}
 +
++/* boot.c:135-146. MHICTRL is BAR0+0x38 (common.h:22). The state field is
++ * bits[15:8] (common.h:111). MHI_STATE_SYS_ERR is 0xFF (mhi.h:168).
++ * Bit 1 is RESET (common.h:112); this write clears it. MHI_EE_RDDM is 3
++ * (mhi.h:132-136). The 200 ms bound is boot.c's rddm_timeout_us. */
++static void
++sy_rddm_enter(void)
++{
++	static int once;
++	uint32_t ee, ctrl, st, i;
++	uint32_t *p;
++
++	if (once || !sy_rddm_armed || !sy_rddm_va || !sy_bar_va ||
++	    !sy_bhie_off || !sy_bhi_off)
++		return;
++	if ((sy_bhi_off & 3u) || sy_bhi_off + 0x28u > 0x1000u ||
++	    (sy_bhie_off & 3u) || sy_bhie_off + 0x78u > 0x1000u)
++		return;
++	once = 1;
++	st = sy_rd(sy_bar_va, sy_bhie_off + 0x78);
++	p = (uint32_t *)sy_rddm_va;
++	ee = sy_rd(sy_bar_va, sy_bhi_off + 0x28);
++	printf("PANDORA WLAN: RDDM before: ee %#x rxvec %#x head %#x %#x %#x %#x\n",
++	    ee, st, p[0], p[1], p[2], p[3]);
++	sy_log_sync();
++	if (ee != 0x3u) {
++		ctrl = sy_rd(sy_bar_va, 0x38);
++		sy_wr(sy_bar_va, 0x38, (ctrl & ~(0xffu << 8) & ~2u) | (0xffu << 8));
++		__asm__ volatile("dsb sy" ::: "memory");
++		printf("PANDORA WLAN: RDDM SYS_ERR: ctrl %#x -> %#x\n",
++		    ctrl, sy_rd(sy_bar_va, 0x38));
++		sy_log_sync();
++		for (i = 0; i < 200u; i++) {
++			ee = sy_rd(sy_bar_va, sy_bhi_off + 0x28);
++			if (ee == 0x3u)
++				break;
++			delay(1000);
++		}
++		printf("PANDORA WLAN: RDDM EE %#x after %u ms\n", ee, i);
++		sy_log_sync();
++		if (ee != 0x3u)
++			return;
++	}
++	sy_rddm_collect();
++}
++
 +static void
 +sy_bhi_sbl(void)
 +{
@@ -4022,6 +4067,8 @@
 +		ptr = (uint64_t)sy_rd(e, 0) | ((uint64_t)sy_rd(e, 4) << 32);
 +		d0 = sy_rd(e, 8); d1 = sy_rd(e, 12);
 +		type = (d1 >> 16) & 0xffu;
++		if (type == 0x20u && (d0 >> 24) == 255u)
++			sy_rddm_enter();
 +		if (type == 0x21) {		/* command completion; not under the print cap */
 +			uint32_t code = d0 >> 24, ch = d1 >> 24;
 +			vm_offset_t tre;
@@ -4410,22 +4457,24 @@
 +
 +			printf("PANDORA WLAN: MHI poll %u ms: state %u ee %#x events %u\n",
 +			    (k + 1), (sy_rd(sy_bar_va, 0x48) >> 8) & 0xff, ee, shown);
-+			/* Once, after EE is RDDM, before any later reset. common.h 54-57. */
-+			if (ee == 0x3 && !fault_seen && sy_bhi_off &&
-+			    (sy_bhi_off & 3u) == 0 && sy_bhi_off + 0x40u <= 0x1000u) {
++			/* State 0xFF is SYS_ERR. EE 3 is RDDM. Enter does not require EE
++			 * to already be RDDM. boot.c:135-146. Bit 1 of MHICTRL stays clear. */
++			if (!fault_seen && (ee == 0x3u ||
++			    ((sy_rd(sy_bar_va, 0x48) >> 8) & 0xffu) == 255u)) {
 +				fault_seen = 1;
-+				printf("PANDORA WLAN: MHI fault: errcode %#x errdbg %#x/%#x/%#x\n",
-+				    sy_rd(sy_bar_va, sy_bhi_off + 0x30),
-+				    sy_rd(sy_bar_va, sy_bhi_off + 0x34),
-+				    sy_rd(sy_bar_va, sy_bhi_off + 0x38),
-+				    sy_rd(sy_bar_va, sy_bhi_off + 0x3c));
++				if (sy_bhi_off && (sy_bhi_off & 3u) == 0 &&
++				    sy_bhi_off + 0x40u <= 0x1000u) {
++					printf("PANDORA WLAN: MHI fault: errcode %#x errdbg %#x/%#x/%#x\n",
++					    sy_rd(sy_bar_va, sy_bhi_off + 0x30),
++					    sy_rd(sy_bar_va, sy_bhi_off + 0x34),
++					    sy_rd(sy_bar_va, sy_bhi_off + 0x38),
++					    sy_rd(sy_bar_va, sy_bhi_off + 0x3c));
++				} else {
++					printf("PANDORA WLAN: MHI fault: bhio %#x not readable\n",
++					    sy_bhi_off);
++				}
 +				sy_log_sync();
-+				sy_rddm_collect();
-+			} else if (ee == 0x3 && !fault_seen) {
-+				fault_seen = 1;
-+				printf("PANDORA WLAN: MHI fault: bhio %#x not readable\n",
-+				    sy_bhi_off);
-+				sy_log_sync();
++				sy_rddm_enter();
 +			}
 +		}
 +		delay(1000);
