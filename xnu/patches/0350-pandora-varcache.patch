@@ -820,7 +820,7 @@
  }
  
  static void
-@@ -51,21 +834,30497 @@
+@@ -51,21 +834,30539 @@
  		cv_sleep(100);
  	}
  	if (rootvnode == NULLVP) {
@@ -5789,10 +5789,11 @@
 +				sy_aop_ol_cpr();
 +			}
 +			sy_wlfw_response(b + q, (unsigned)qlen + 7, msgid);
-+		} else if (msgid == 0x0022 || msgid == 0x0023) {
-+			/* D1: QMI_WLANFW_WLAN_MODE_REQ (0x22) / WLAN_CFG_REQ (0x23) */
-+			printf("PANDORA WLAN: WLFW wlan %s response\n",
-+			    msgid == 0x0022 ? "mode" : "cfg");
++		} else if (msgid == 0x0022 || msgid == 0x0023 || msgid == 0x0033) {
++			/* D1: WLAN_MODE 0x22, WLAN_CFG 0x23, MAC_ADDR 0x33 */
++			if (msgid != 0x0033)
++				printf("PANDORA WLAN: WLFW wlan %s response\n",
++				    msgid == 0x0022 ? "mode" : "cfg");
 +			sy_wlfw_response(b + q, (unsigned)qlen + 7, msgid);
 +		}
 +	}
@@ -27672,7 +27673,7 @@
 +#define SY_CE_SHADOW_SLOT(i)	(SY_CE_SHADOW_BASE + 4u * (i))
 +/* BAR0+0x3000 page offset of the window register.  0x278 is BAR0+0x3278,
 + * the register hif_*_mb_reg_window in qca_cld3_peach_v2.ko writes. */
-+#define SY_CE_IOVA	0xB0800000UL	/* L2 row 388 of the installed SMMU tables */
++#define SY_CE_IOVA	0x1A000000UL	/* sy_mem_l2 row 208, after mem rows 192-207 */
 +#define SY_CE_SIZE	0x00200000UL	/* 2 MiB = one L3 page (512 x 4 KiB) */
 +
 +/* ring placement inside the CE region (the same offsets are VA and IOVA offsets) */
@@ -27696,7 +27697,7 @@
 +#define SY_CE2_BUF_SZ		3520u		/* kiwi host CE attr +0xc for pipe 2 */
 +#define SY_CE2_N		256u		/* kiwi host CE attr +0x10 for pipe 2 */
 +#define SY_CE2_POST		(SY_CE2_N - 1u)	/* ko 0x948c: dest_nentries - 1 */
-+#define SY_CE2_BUF_IOVA	0xB0A00000UL	/* L2 row 389; row 388 is the CE window */
++#define SY_CE2_BUF_IOVA	0x1A200000UL	/* sy_mem_l2 row 209; window is 0x1A000000 */
 +#define SY_CE2_BUF_MAP		(((SY_CE2_POST * SY_CE2_BUF_SZ) + 0xfffu) & ~0xfffu)
 +/* host_ce_config_wlan_kiwi and _direct_link pipe 7: +0xc = 0x800, +0x10 = 0x20.
 + * hif_config_ce_by_id 0x948c subtracts 1 and calls init_buffer_count (0x13210),
@@ -27717,6 +27718,10 @@
 +_Static_assert(SY_CE7_POST == 31u, "ce7 post");
 +_Static_assert(SY_CE_OFF_CE7_BUF + SY_CE7_N * SY_CE7_BUF_SZ == 0x190000u, "ce7 end");
 +_Static_assert(0x1b8000u - (SY_CE_OFF_CE7_BUF + SY_CE7_N * SY_CE7_BUF_SZ) == 0x28000u, "ce7 gap");
++_Static_assert((SY_CE_IOVA >> 30) == (SY_MEM_IOVA >> 30), "ce same l1");
++_Static_assert((SY_CE_IOVA >> 21) == ((SY_MEM_IOVA >> 21) + (SY_MEM_SIZE >> 21)), "ce after mem");
++_Static_assert(SY_CE2_BUF_IOVA == SY_CE_IOVA + SY_CE_SIZE, "ce2 next row");
++_Static_assert(SY_CE2_BUF_IOVA + SY_CE2_BUF_MAP < 0xb0010000UL, "ce inside host cap");
 +
 +/* HAL ring ids (hal.h:401,418,435) */
 +#define SY_CE_RING_CE0_SRC	64u
@@ -27750,6 +27755,7 @@
 +/* QMI WLFW messages needed before the CE rings come up (qmi.h:513-520) */
 +#define SY_QMI_WLFW_WLAN_MODE_REQ	0x0022
 +#define SY_QMI_WLFW_WLAN_CFG_REQ	0x0023
++#define SY_QMI_WLFW_MAC_ADDR_REQ	0x0033
 +#define SY_WLFW_FW_MODE_NORMAL		0u	/* core.h:111-113 */
 +
 +struct sy_ce_ring {
@@ -27813,7 +27819,7 @@
 +static vm_offset_t sy_ce_l3;		/* one 4 KiB L3 table for the 2 MiB window */
 +static vm_offset_t sy_ce2_va;		/* CE2 receive buffers, separate from the 2 MiB window */
 +static vm_offset_t sy_ce2_wc;
-+static vm_offset_t sy_ce2_l3;		/* L3 for IOVA 0xB0A00000, L2 row 389 */
++static vm_offset_t sy_ce2_l3;		/* L3 for IOVA 0x1A200000, sy_mem_l2 row 209 */
 +static vm_offset_t sy_ce_wreg;		/* BAR0+0x3000 page holding the window reg */
 +static vm_offset_t sy_ce_win;		/* BAR0+0x80000, length 0x80000 */
 +static uint32_t sy_ce_win_off = 0x00000278u;
@@ -28001,14 +28007,14 @@
 +		printf("PANDORA WLAN: CE2: L3 alloc failed %d\n", kr);
 +		return 1;
 +	}
-+	((uint64_t *)sy_l2)[(SY_CE2_BUF_IOVA >> 21) & 511] = sy_pa(sy_ce2_l3) | 3ull;
++	((uint64_t *)sy_mem_l2)[(SY_CE2_BUF_IOVA >> 21) & 511] = sy_pa(sy_ce2_l3) | 3ull;
 +	for (i = 0; i < (SY_CE2_BUF_MAP >> 12); i++) {
 +		pa = sy_pa(sy_ce2_va + ((vm_offset_t)i << 12));
 +		((uint64_t *)sy_ce2_l3)[i] =
 +		    (pa & 0x0000fffffffff000ull) | 0x0060000000000e43ull;
 +	}
 +	flush_dcache64(sy_pa(sy_ce2_l3), (unsigned)PAGE_SIZE, TRUE);
-+	flush_dcache64(sy_pa(sy_l2), (unsigned)PAGE_SIZE, TRUE);
++	flush_dcache64(sy_pa(sy_mem_l2), (unsigned)PAGE_SIZE, TRUE);
 +	__asm__ volatile("dsb sy" ::: "memory");
 +	sy_wr(sy_cb_va, 0x610, 0xffffffffu);
 +	sy_wr(sy_cb_va, 0x7f0, 0xffffffffu);
@@ -28042,7 +28048,7 @@
 +
 +	if (sy_ce_va)
 +		return 0;
-+	if (!sy_l2 || !sy_l3 || !sy_cb_va) {
++	if (!sy_mem_l2 || !sy_l2 || !sy_l3 || !sy_cb_va) {
 +		printf("PANDORA WLAN: CE: page tables or context bank absent\n");
 +		return 1;
 +	}
@@ -28086,15 +28092,16 @@
 +		printf("PANDORA WLAN: CE: L3 table allocation failed %d\n", kr);
 +		return 1;
 +	}
-+	/* one L2 entry (row 388) -> one L3 page -> 512 x 4 KiB */
-+	((uint64_t *)sy_l2)[(SY_CE_IOVA >> 21) & 511] = sy_pa(sy_ce_l3) | 3ull;
++	/* sy_mem_l2 row 208. 0x1A000000 is inside host_cap end 0xb0010000.
++	 * The previous row was 0x7f0000 past that end. */
++	((uint64_t *)sy_mem_l2)[(SY_CE_IOVA >> 21) & 511] = sy_pa(sy_ce_l3) | 3ull;
 +	for (i = 0; i < (SY_CE_SIZE >> 12); i++) {
 +		pa = sy_pa(sy_ce_va + ((vm_offset_t)i << 12));
 +		((uint64_t *)sy_ce_l3)[i & 511] =
 +		    (pa & 0x0000fffffffff000ull) | 0x0060000000000e43ull;
 +	}
 +	flush_dcache64(sy_pa(sy_ce_l3), (unsigned)PAGE_SIZE, TRUE);
-+	flush_dcache64(sy_pa(sy_l2), (unsigned)PAGE_SIZE, TRUE);
++	flush_dcache64(sy_pa(sy_mem_l2), (unsigned)PAGE_SIZE, TRUE);
 +	__asm__ volatile("dsb sy" ::: "memory");
 +	/* the context bank is already translating: drop stale entries (1679-1686) */
 +	sy_wr(sy_cb_va, 0x610, 0xffffffffu);
@@ -28168,7 +28175,11 @@
 +		v = ((0x1000u >> 3) << 16) | dw;	/* 4 ms timer, one-entry batch */
 +		sy_ce_wr(r->dev + 0x24u, v);
 +	} else {
-+		/* dst: HP at +0x14/+0x18, batch at +0x24. peach slots 0x228/0x254. */
++		/* dst: HP at +0x14/+0x18. peach slots 0x228/0x254.
++		 * ce_ring_setup_srng 436d78 stores timer 0 and batch 1.
++		 * dst_hw_init 43f370 writes (timer<<13)&0xffff0000 | (dw*batch).
++		 * That is dw. 436d80 sets low_threshold = entries>>3 and
++		 * flags |= 0x10000; dst_hw_init does not store that word. */
 +		sy_ce_wr(r->dev + 0x14u, (uint32_t)rdp);
 +		sy_ce_wr(r->dev + 0x18u, (uint32_t)(rdp >> 32));
 +		sy_ce_wr(r->dev + 0x24u, dw);
@@ -28179,10 +28190,17 @@
 +	/* MISC enables the ring. Src 0x42 = bit 1 | bit 6. Dst and status 0x40. */
 +	v = (r->kind == 0) ? 0x42u : 0x40u;
 +	sy_ce_wr(r->dev + 0x10u, v);
-+	/* peach hal_srng_setup_idx, ring type 9: R0+0xb0 low 16 is dest max length. */
++	/* peach hal_srng_setup_idx, ring type 9: R0+0xb0 low 16 is dest max length.
++	 * 4358ec then, when srng+0x38 != 0, R0+0x40 low 3 bits |= that word.
++	 * ce_ring_setup_srng 436d90 stores 1. ath12k v66 has no +0x40. */
 +	if (r->kind == 1u) {
 +		ctrl = sy_ce_rd(r->dev + 0xb0u);
 +		sy_ce_wr(r->dev + 0xb0u, (ctrl & 0xffff0000u) | sy_ce_buf_sz(r));
++		ctrl = sy_ce_rd(r->dev + 0x40u);
++		ctrl = (ctrl & ~7u) | 1u;
++		sy_ce_wr(r->dev + 0x40u, ctrl);
++		printf("PANDORA WLAN: CE%u dst +0x40 %#x low %u\n",
++		    r->ce, ctrl, r->entries >> 3);
 +	}
 +	r->idx = 0;
 +	r->seq = 0;
@@ -28564,6 +28582,23 @@
 +	sy_wlfw_pump();
 +}
 +
++/* QMI_WLFW_MAC_ADDR_REQ 0x33. TLV 0x10 is the 6-byte address
++ * (wlan_firmware_service_v01.c, tlv_type 0x10). cnss2 qmi.c:1647-1653
++ * reverses the DMS order. Displayed 3c:7f:6e:01:52:38 is sent as
++ * 38 52 01 6e 7f 3c. main.c:1465 sends this before driver probe. */
++static unsigned
++sy_wlfw_mac(uint8_t *b, uint16_t txn)
++{
++	static const uint8_t mac[6] = { 0x38, 0x52, 0x01, 0x6e, 0x7f, 0x3c };
++	unsigned at = sy_qmi_hdr(b, 0x00, txn, SY_QMI_WLFW_MAC_ADDR_REQ);
++	unsigned i;
++
++	at = sy_qmi_tlv_hdr(b, at, 0x10, 6);
++	for (i = 0; i < 6u; i++)
++		b[at++] = mac[i];
++	return sy_qmi_finish(b, at);
++}
++
 +/* QMI_WLANFW_WLAN_CFG_REQ: host_version, target CE config, service map,
 + * 38 shadow_reg_v3 addresses, and chip_name. */
 +static unsigned
@@ -28828,7 +28863,14 @@
 +		return;
 +	}
 +
-+	/* 2. QMI start: WLAN_CFG (CE/service tables) then WLAN_MODE normal */
++	/* 2. MAC (main.c:1465), then WLAN_CFG, then WLAN_MODE normal */
++	at = sy_wlfw_mac(qmi, sy_wlfw_txn++);
++	if (sy_d1_qmi_send(SY_QMI_WLFW_MAC_ADDR_REQ, qmi, at))
++		return;
++	for (i = 0; i < 30u; i++) {
++		sy_d1_pump_mhi();
++		sy_usleep(10000);
++	}
 +	at = sy_wlfw_wlan_cfg(qmi, sy_wlfw_txn++);
 +	if (sy_d1_qmi_send(SY_QMI_WLFW_WLAN_CFG_REQ, qmi, at))
 +		return;
