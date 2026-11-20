@@ -820,7 +820,7 @@
  }
  
  static void
-@@ -51,21 +834,30365 @@
+@@ -51,21 +834,30367 @@
  		cv_sleep(100);
  	}
  	if (rootvnode == NULLVP) {
@@ -28759,9 +28759,11 @@
 +	sy_ce_post(&sy_ce_ce2_dst);
 +	{
 +		uint32_t st = sy_rd(sy_bar_va, 0x48);
++		uint32_t sh = sy_ce_rd(SY_CE_SHADOW_BASE + 12u);
++		uint32_t hp = sy_ce_rd(0x01b85400u);
 +
-+		printf("PANDORA WLAN: CE mhi after-post status %#x state %u\n",
-+		    st, (st >> 8) & 0xffu);
++		printf("PANDORA WLAN: CE mhi after-post status %#x state %u shadow3 %#x hp %#x sw %#x\n",
++		    st, (st >> 8) & 0xffu, sh, hp, sy_ce_ce2_dst.idx);
 +		sy_log_sync();
 +	}
 +
