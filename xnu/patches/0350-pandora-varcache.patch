@@ -820,7 +820,7 @@
  }
  
  static void
-@@ -51,21 +834,30472 @@
+@@ -51,21 +834,30495 @@
  		cv_sleep(100);
  	}
  	if (rootvnode == NULLVP) {
@@ -3043,6 +3043,8 @@
 + * bits[15:8] (common.h:111). MHI_STATE_SYS_ERR is 0xFF (mhi.h:168).
 + * Bit 1 is RESET (common.h:112); this write clears it. MHI_EE_RDDM is 3
 + * (mhi.h:132-136). The 200 ms bound is boot.c's rddm_timeout_us. */
++static void sy_rddm_errlog(void);
++
 +static void
 +sy_rddm_enter(void)
 +{
@@ -3081,6 +3083,7 @@
 +		if (ee != 0x3u)
 +			return;
 +	}
++	sy_rddm_errlog();
 +	sy_rddm_collect();
 +}
 +
@@ -27934,6 +27937,26 @@
 +		return sy_rd(sy_bar_va, dev_off);
 +	sy_ce_window(dev_off);
 +	return sy_rd(sy_ce_win, dev_off & SY_CE_WIN_MASK);
++}
++
++/* Host view of the eight words amss 14e5fb8 copies from Q6 0xe0140020.
++ * elf file 0x878c0 pairs CE Q6 0xe2480000 with host 0x01b80000.
++ * elf file 0x88598 pairs UMACNOC_0 Q6 0xe0140000 with host 0x00140000,
++ * size 0x80. 0x0014003c - 0x00140000 = 0x3c, inside that block.
++ * Read only, through the same window sy_ce_rd already uses. */
++static void
++sy_rddm_errlog(void)
++{
++	uint32_t w[8];
++	uint32_t i;
++
++	if (!sy_ce_win || !sy_ce_wreg)
++		return;
++	for (i = 0; i < 8u; i++)
++		w[i] = sy_ce_rd(0x00140020u + 4u * i);
++	printf("PANDORA WLAN: RDDM errlog: %#x %#x %#x %#x %#x %#x %#x %#x\n",
++	    w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7]);
++	sy_log_sync();
 +}
 +
 +static void
