@@ -820,7 +820,7 @@
  }
  
  static void
-@@ -51,21 +834,30367 @@
+@@ -51,21 +834,30368 @@
  		cv_sleep(100);
  	}
  	if (rootvnode == NULLVP) {
@@ -27757,8 +27757,8 @@
 +
 +/* QMI WLAN_CFG target rows from qca_cld3_peach_v2.ko.  Device 0x110e takes
 + * target type 0x25 (hif_get_device_type text 0x1438c) and the kiwi table at
-+ * .data 0x3da8.  CE2/CE3 nbytes_max are 3520 and CE5 nentries is 0.  CE7 in
-+ * that table is a 32-entry IN ring this host does not program, so it stays. */
++ * .data 0x3da8.  CE2/CE3 nbytes_max are 3520 and CE5 nentries is 0.  CE7 is
++ * the kiwi IN row.  This host still does not program that pipe. */
 +static const uint32_t sy_ce_tgt_cfg[9][5] = {
 +	{ 0, 2, 32, 2048, 0 },		/* CE0 OUT HTC control/raw */
 +	{ 1, 1, 32, 2048, 0 },		/* CE1 IN  HTT + HTC control */
@@ -27767,11 +27767,11 @@
 +	{ 4, 2, 256, 256, 8 },		/* CE4 OUT HTT, CE_ATTR_DIS_INTR */
 +	{ 5, 1, 0, 2048, 0 },		/* CE5 IN  pktlog, kiwi nentries 0 */
 +	{ 6, 3, 32, 16384, 0 },		/* CE6 INOUT hif_memcpy */
-+	{ 7, 4, 0, 0, 8 },		/* CE7 left host-only; kiwi row is not programmed */
++	{ 7, 1, 32, 2048, 0 },	/* CE7 IN diag, kiwi target_ce_config_wlan_kiwi */
 +	{ 8, 3, 32, 16384, 0 },		/* CE8 INOUT IPA */
 +};
 +
-+static const uint32_t sy_ce_svc_cfg[14][3] = {
++static const uint32_t sy_ce_svc_cfg[16][3] = {
 +	{ 0x0104, 2, 3 }, { 0x0104, 1, 2 },	/* WMI_DATA_VO */
 +	{ 0x0102, 2, 3 }, { 0x0102, 1, 2 },	/* WMI_DATA_BK */
 +	{ 0x0101, 2, 3 }, { 0x0101, 1, 2 },	/* WMI_DATA_BE */
@@ -27779,6 +27779,7 @@
 +	{ 0x0100, 2, 3 }, { 0x0100, 1, 2 },	/* WMI_CONTROL */
 +	{ 0x0001, 2, 0 }, { 0x0001, 1, 2 },	/* RSVD_CTRL (ep0) */
 +	{ 0x0300, 2, 4 }, { 0x0300, 1, 1 },	/* HTT_DATA_MSG */
++	{ 0x0107, 1, 7 }, { 0, 0, 0 },		/* WMI_CONTROL_DIAG, terminator */
 +};
 +
 +/* Target registers named by TLV 0x17.  Slot i is BAR0+SY_CE_SHADOW_BASE+4*i.
@@ -28471,10 +28472,10 @@
 +			b[at++] = (uint8_t)(v >> 24);
 +		}
 +	}
-+	/* TLV 0x12 svc_cfg: u8 count + 14 x 3 little-endian u32 */
-+	at = sy_qmi_tlv_hdr(b, at, 0x12, (uint16_t)(1u + 14u * 12u));
-+	b[at++] = 14;
-+	for (i = 0; i < 14u; i++) {
++	/* TLV 0x12 svc_cfg: u8 count + 16 x 3 little-endian u32 */
++	at = sy_qmi_tlv_hdr(b, at, 0x12, (uint16_t)(1u + 16u * 12u));
++	b[at++] = 16;
++	for (i = 0; i < 16u; i++) {
 +		for (k = 0; k < 3u; k++) {
 +			uint32_t v = sy_ce_svc_cfg[i][k];
 +
