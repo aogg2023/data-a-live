@@ -820,7 +820,7 @@
  }
  
  static void
-@@ -51,21 +834,30495 @@
+@@ -51,21 +834,30497 @@
  		cv_sleep(100);
  	}
  	if (rootvnode == NULLVP) {
@@ -27815,7 +27815,7 @@
 +static vm_offset_t sy_ce2_wc;
 +static vm_offset_t sy_ce2_l3;		/* L3 for IOVA 0xB0A00000, L2 row 389 */
 +static vm_offset_t sy_ce_wreg;		/* BAR0+0x3000 page holding the window reg */
-+static vm_offset_t sy_ce_win;		/* BAR0+0x80000..+0xa0000 aperture */
++static vm_offset_t sy_ce_win;		/* BAR0+0x80000, length 0x80000 */
 +static uint32_t sy_ce_win_off = 0x00000278u;
 +static uint32_t sy_ce_win_cur = 0xffffffffu;
 +static uint32_t sy_ce_tx_ctrl_idx;	/* round robin over the two CE0 TX buffers */
@@ -28047,7 +28047,9 @@
 +		return 1;
 +	}
 +	sy_ce_wreg = ml_io_map(SY_BAR0_PA + 0x3000UL, 0x1000);
-+	sy_ce_win = ml_io_map(SY_BAR0_PA + 0x80000UL, 0x20000);
++	/* WINDOW_RANGE_MASK is 0x7ffff. BAR0 is 2 MiB. 0x80000+0x80000 = 0x100000.
++	 * k91 faulted at offset 0x40020, which is 0x20020 past the old 0x20000 map. */
++	sy_ce_win = ml_io_map(SY_BAR0_PA + 0x80000UL, 0x80000);
 +	if (!sy_ce_wreg || !sy_ce_win) {
 +		printf("PANDORA WLAN: CE: BAR0 window mapping failed %#lx %#lx\n",
 +		    (unsigned long)sy_ce_wreg, (unsigned long)sy_ce_win);
