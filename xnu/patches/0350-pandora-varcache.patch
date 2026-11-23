@@ -820,7 +820,7 @@
  }
  
  static void
-@@ -51,21 +834,30601 @@
+@@ -51,21 +834,30640 @@
  		cv_sleep(100);
  	}
  	if (rootvnode == NULLVP) {
@@ -5789,9 +5789,10 @@
 +				sy_aop_ol_cpr();
 +			}
 +			sy_wlfw_response(b + q, (unsigned)qlen + 7, msgid);
-+		} else if (msgid == 0x0022 || msgid == 0x0023 || msgid == 0x0033) {
-+			/* D1: WLAN_MODE 0x22, WLAN_CFG 0x23, MAC_ADDR 0x33 */
-+			if (msgid != 0x0033)
++		} else if (msgid == 0x0022 || msgid == 0x0023 || msgid == 0x002f ||
++		    msgid == 0x0033) {
++			/* D1: WLAN_MODE 0x22, INI 0x2f, WLAN_CFG 0x23, MAC 0x33 */
++			if (msgid == 0x0022 || msgid == 0x0023)
 +				printf("PANDORA WLAN: WLFW wlan %s response\n",
 +				    msgid == 0x0022 ? "mode" : "cfg");
 +			sy_wlfw_response(b + q, (unsigned)qlen + 7, msgid);
@@ -27757,6 +27758,7 @@
 +/* QMI WLFW messages needed before the CE rings come up (qmi.h:513-520) */
 +#define SY_QMI_WLFW_WLAN_MODE_REQ	0x0022
 +#define SY_QMI_WLFW_WLAN_CFG_REQ	0x0023
++#define SY_QMI_WLFW_INI_REQ		0x002f
 +#define SY_QMI_WLFW_MAC_ADDR_REQ	0x0033
 +#define SY_WLFW_FW_MODE_NORMAL		0u	/* core.h:111-113 */
 +
@@ -28285,6 +28287,7 @@
 +	__asm__ volatile("dsb sy" ::: "memory");
 +	r->idx = next;
 +	sy_ce_hp_wr(r, r->idx);
++	printf("PANDORA WLAN: CE%u send: hp %#x tp %#x\n", r->ce, r->idx, tp);
 +	return 0;
 +}
 +
@@ -28375,6 +28378,23 @@
 +		}
 +		if (!saw)
 +			printf("PANDORA WLAN: WMI 0x3 array absent\n");
++		sy_log_sync();
++		return;
++	}
++	if (cmd == 0x16005u) {
++		uint32_t off;
++		uint32_t n;
++		uint32_t show;
++
++		n = (len > 4u) ? (len - 4u) : 0u;
++		show = n > 12u ? 12u : n;	/* payload bytes 4 through 15 */
++		printf("PANDORA WLAN: WMI 0x16005 payload %u B\n", n);
++		for (off = 0; off < show; off += 16u) {
++			printf("PANDORA WLAN: WMI 0x16005 %04x:", off);
++			for (i = 0; i < 16u && off + i < show; i++)
++				printf(" %02x", b[4u + off + i]);
++			printf("\n");
++		}
 +		sy_log_sync();
 +		return;
 +	}
@@ -28560,9 +28580,9 @@
 +
 +/* Connect the WMI_CONTROL service (htc.c:551-713).  HTT is a separate connect
 + * with recv-alloc 0 and credit flow disabled (htc.c:579-607); D3 does that
-+ * before SETUP_COMPLETE.  WMI gets the whole credit budget because
-+ * wmi_ep_count is 1 (htc.c:458-483).  This phone logged that one credit on
-+ * service 0x100 (android_dmesg.txt:2358-2359). */
++ * before SETUP_COMPLETE.  Android logs alloc 1 on service 0x100
++ * (android_wifi_boot_dmesg.txt:2939).  RECV_ALLOC is that host number
++ * (htc.h:89), not the credit count READY reported. */
 +static int
 +sy_htc_connect(void)
 +{
@@ -28570,12 +28590,11 @@
 +	uint32_t flags;
 +
 +	w[0] = SY_HTC_MSG_CONNECT | (SY_HTC_SVC_WMI_CONTROL << 16);
-+	flags = (sy_htc_credits & 0xffu) << 8;	/* RECV_ALLOC (htc.h:89) */
++	flags = 1u << 8;	/* RECV_ALLOC = 1 (htc.h:89) */
 +	w[1] = flags;
 +	if (sy_htc_send(0, w, 8u))
 +		return -1;
-+	printf("PANDORA WLAN: HTC connect WMI_CONTROL sent (alloc %u)\n",
-+	    sy_htc_credits & 0xffu);
++	printf("PANDORA WLAN: HTC connect WMI_CONTROL sent (alloc %u)\n", 1u);
 +	sy_log_sync();
 +	return 0;
 +}
@@ -28632,19 +28651,31 @@
 +}
 +
 +/* QMI_WLFW_MAC_ADDR_REQ 0x33. TLV 0x10 is the 6-byte address
-+ * (wlan_firmware_service_v01.c, tlv_type 0x10). cnss2 qmi.c:1647-1653
-+ * reverses the DMS order. Displayed 3c:7f:6e:01:52:38 is sent as
-+ * 38 52 01 6e 7f 3c. main.c:1465 sends this before driver probe. */
++ * (wlan_firmware_service_v01.c, tlv_type 0x10). This phone's cnss
++ * log prints the bytes it sends and has no revert line
++ * (ipc-boot2/ipc_cnss.log:463-464): 3c:7f:6e:01:52:38. */
 +static unsigned
 +sy_wlfw_mac(uint8_t *b, uint16_t txn)
 +{
-+	static const uint8_t mac[6] = { 0x38, 0x52, 0x01, 0x6e, 0x7f, 0x3c };
++	static const uint8_t mac[6] = { 0x3c, 0x7f, 0x6e, 0x01, 0x52, 0x38 };
 +	unsigned at = sy_qmi_hdr(b, 0x00, txn, SY_QMI_WLFW_MAC_ADDR_REQ);
 +	unsigned i;
 +
 +	at = sy_qmi_tlv_hdr(b, at, 0x10, 6);
 +	for (i = 0; i < 6u; i++)
 +		b[at++] = mac[i];
++	return sy_qmi_finish(b, at);
++}
++
++/* QMI_WLFW_INI_REQ 0x2f, between MAC and WLAN_CFG (t11_qmi_trace.txt:59-61).
++ * TLV 0x10 is enablefwlog (wlan_firmware_service_v01.c:4052-4072).
++ * This phone logged fw_log_mode 1 (ipc-boot2/ipc_cnss.log:465). */
++static unsigned
++sy_wlfw_ini(uint8_t *b, uint16_t txn)
++{
++	unsigned at = sy_qmi_hdr(b, 0x00, txn, SY_QMI_WLFW_INI_REQ);
++
++	at = sy_qmi_tlv_u8(b, at, 0x10, 1);
 +	return sy_qmi_finish(b, at);
 +}
 +
@@ -28925,9 +28956,16 @@
 +		return;
 +	}
 +
-+	/* 2. MAC (main.c:1465), then WLAN_CFG, then WLAN_MODE normal */
++	/* 2. MAC, INI (fw_log_mode 1), WLAN_CFG, then WLAN_MODE normal */
 +	at = sy_wlfw_mac(qmi, sy_wlfw_txn++);
 +	if (sy_d1_qmi_send(SY_QMI_WLFW_MAC_ADDR_REQ, qmi, at))
++		return;
++	for (i = 0; i < 30u; i++) {
++		sy_d1_pump_mhi();
++		sy_usleep(10000);
++	}
++	at = sy_wlfw_ini(qmi, sy_wlfw_txn++);
++	if (sy_d1_qmi_send(SY_QMI_WLFW_INI_REQ, qmi, at))
 +		return;
 +	for (i = 0; i < 30u; i++) {
 +		sy_d1_pump_mhi();
@@ -29043,7 +29081,8 @@
 +			return;
 +	}
 +	printf("PANDORA WLAN: D1: HTC setup complete sent\n");
-+	sy_htc_tx_credits = sy_htc_credits;
++	/* Same 1 that RECV_ALLOC asked the target to reserve for WMI. */
++	sy_htc_tx_credits = 1u;
 +
 +	/* 7. SERVICE_READY then EXT then EXT2.  WMI_INIT waits for EXT2. */
 +	for (i = 0; i < 500u && !sy_wmi_service_ready; i++) {
