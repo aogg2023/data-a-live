@@ -820,7 +820,7 @@
  }
  
  static void
-@@ -51,21 +834,30654 @@
+@@ -51,21 +834,30661 @@
  		cv_sleep(100);
  	}
  	if (rootvnode == NULLVP) {
@@ -27868,18 +27868,18 @@
 + * .data 0x3da8.  CE2/CE3 nbytes_max are 3520 and CE5 nentries is 0.  CE7 is
 + * the kiwi IN row.  The host programs that pipe below. */
 +static const uint32_t sy_ce_tgt_cfg[9][5] = {
-+	{ 0, 2, 8, 2048, 0 },		/* CE0 OUT HTC control/raw, qmi23 nentries 8 */
++	{ 0, 2, 32, 2048, 0 },		/* CE0 OUT HTC control/raw */
 +	{ 1, 1, 32, 2048, 0 },		/* CE1 IN  HTT + HTC control */
 +	{ 2, 1, 32, 3520, 0 },		/* CE2 IN  WMI */
 +	{ 3, 2, 32, 3520, 0 },		/* CE3 OUT WMI */
 +	{ 4, 2, 256, 256, 8 },		/* CE4 OUT HTT, CE_ATTR_DIS_INTR */
-+	{ 5, 1, 16, 256, 0 },		/* CE5 IN  pktlog, qmi23 nentries 16 nbytes 256 */
++	{ 5, 1, 0, 2048, 0 },		/* CE5 IN  pktlog, kiwi nentries 0 */
 +	{ 6, 3, 32, 16384, 0 },		/* CE6 INOUT hif_memcpy */
 +	{ 7, 1, 32, 2048, 0 },	/* CE7 IN diag, kiwi target_ce_config_wlan_kiwi */
 +	{ 8, 3, 32, 16384, 0 },		/* CE8 INOUT IPA */
 +};
 +
-+static const uint32_t sy_ce_svc_cfg[18][3] = {
++static const uint32_t sy_ce_svc_cfg[16][3] = {
 +	{ 0x0104, 2, 3 }, { 0x0104, 1, 2 },	/* WMI_DATA_VO */
 +	{ 0x0102, 2, 3 }, { 0x0102, 1, 2 },	/* WMI_DATA_BK */
 +	{ 0x0101, 2, 3 }, { 0x0101, 1, 2 },	/* WMI_DATA_BE */
@@ -27887,9 +27887,7 @@
 +	{ 0x0100, 2, 3 }, { 0x0100, 1, 2 },	/* WMI_CONTROL */
 +	{ 0x0001, 2, 0 }, { 0x0001, 1, 2 },	/* RSVD_CTRL (ep0) */
 +	{ 0x0300, 2, 4 }, { 0x0300, 1, 1 },	/* HTT_DATA_MSG */
-+	{ 0x0107, 1, 7 },			/* WMI_CONTROL_DIAG */
-+	{ 0x0700, 2, 0 }, { 0x0700, 1, 5 },	/* 0x0700 from qmi23_trace */
-+	{ 0, 0, 0 },				/* terminator */
++	{ 0x0107, 1, 7 }, { 0, 0, 0 },		/* WMI_CONTROL_DIAG, terminator */
 +};
 +
 +/* TLV 0x17 from qmi23_trace.txt.  Count byte 38, payload 153 = 1+38*4.
@@ -28302,6 +28300,15 @@
 +	r->idx = next;
 +	sy_ce_hp_wr(r, r->idx);
 +	printf("PANDORA WLAN: CE%u send: hp %#x tp %#x\n", r->ce, r->idx, tp);
++	/* DIAG: does the firmware actually DMA-consume the WMI_INIT on CE3? */
++	if (r->ce == 3u) {
++		int k;
++		for (k = 0; k < 10; k++) {
++			delay(1000);
++			printf("PANDORA WLAN: CE3 POST-BELL t=%dms rdp_tp %#x (hp %#x)\n",
++			    k + 1, sy_ce_rdp(r->ring_id), r->idx);
++		}
++	}
 +	return 0;
 +}
 +
@@ -28720,10 +28727,10 @@
 +			b[at++] = (uint8_t)(v >> 24);
 +		}
 +	}
-+	/* TLV 0x12 svc_cfg: u8 count + 18 x 3 little-endian u32 */
-+	at = sy_qmi_tlv_hdr(b, at, 0x12, (uint16_t)(1u + 18u * 12u));
-+	b[at++] = 18;
-+	for (i = 0; i < 18u; i++) {
++	/* TLV 0x12 svc_cfg: u8 count + 16 x 3 little-endian u32 */
++	at = sy_qmi_tlv_hdr(b, at, 0x12, (uint16_t)(1u + 16u * 12u));
++	b[at++] = 16;
++	for (i = 0; i < 16u; i++) {
 +		for (k = 0; k < 3u; k++) {
 +			uint32_t v = sy_ce_svc_cfg[i][k];
 +
