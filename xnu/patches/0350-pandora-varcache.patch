@@ -28786,10 +28786,10 @@
 +	b[at++] = (uint8_t)(v >> 24);
 +	/* host_abi_vers from peach WMI_INIT. Both traces agree:
 +	 * wmi_init_trace2.txt:59-62 and wmi_init_trace.txt:52-55.
-+	 * wi_0 0x1000000004a001c, wi_8 0x5f414351000006ba,
++	 * wi_0 high half is abi[0] 0x01000000, then wi_8 0x5f414351000006ba,
 +	 * wi_16 0x4c4d, wi_24 0. 24 B then num_host_mem_chunks = 0. */
 +	static const uint32_t abi[6] = {
-+		0x00000001u, 0x000006bau, 0x5f414351u, 0x00004c4du, 0, 0
++		0x01000000u, 0x000006bau, 0x5f414351u, 0x00004c4du, 0, 0
 +	};
 +	for (i = 0; i < 6u; i++) {
 +		v = abi[i];
