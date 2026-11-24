@@ -820,7 +820,7 @@
  }
  
  static void
-@@ -51,21 +834,30769 @@
+@@ -51,21 +834,30787 @@
  		cv_sleep(100);
  	}
  	if (rootvnode == NULLVP) {
@@ -27979,6 +27979,24 @@
 +	printf("PANDORA WLAN: RDDM errlog: %#x %#x %#x %#x %#x %#x %#x %#x\n",
 +	    w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7]);
 +	sy_log_sync();
++	/* SNOC error record. amss file 0x1160a4 is host 0x01e80000,
++	 * size 0xa000, Q6 0xe3980000. Q6 0xe3980600 is host 0x01e80600.
++	 * 0x600 is inside the 0xa000 window. 20 words are that 0x50 block. */
++	{
++		uint32_t s[20];
++
++		for (i = 0; i < 20u; i++)
++			s[i] = sy_ce_rd(0x01e80600u + 4u * i);
++		printf("PANDORA WLAN: RDDM snoc:"
++		    " %#x %#x %#x %#x %#x %#x %#x %#x %#x %#x\n",
++		    s[0], s[1], s[2], s[3], s[4],
++		    s[5], s[6], s[7], s[8], s[9]);
++		printf("PANDORA WLAN: RDDM snoc+:"
++		    " %#x %#x %#x %#x %#x %#x %#x %#x %#x %#x\n",
++		    s[10], s[11], s[12], s[13], s[14],
++		    s[15], s[16], s[17], s[18], s[19]);
++		sy_log_sync();
++	}
 +}
 +
 +static void
