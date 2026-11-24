@@ -820,7 +820,7 @@
  }
  
  static void
-@@ -51,21 +834,31036 @@
+@@ -51,21 +834,31050 @@
  		cv_sleep(100);
  	}
  	if (rootvnode == NULLVP) {
@@ -976,6 +976,7 @@
 +#define GCC_BCR_PCIE	0x0006b000UL	/* pcie_0 core reset (vendor gcc-canoe BCR page) */
 +#define GCC_BCR_PHY	0x0006c01cUL	/* pcie_0 phy reset */
 +#define GCC_BCR_PHY_NOCSR	0x0006c028UL	/* gcc-canoe: PCIE_0_PHY_NOCSR_COM_PHY_BCR */
++#define GCC_BCR_LINK_DOWN	0x0006c014UL	/* gcc-canoe.c:3825 GCC_PCIE_0_LINK_DOWN_BCR */
 +#define GCC_VOTE_RSCC	0x00052010UL	/* pcie_rscc cfg_ahb / xo votes */
 +#define GCC_VOTE_BRANCH	0x00052008UL	/* slv_axi mstr_axi cfg_ahb aux q2a cnoc_sf + pipe */
 +#define GCC_VOTE_BRANCH2 0x00052000UL	/* aggre_noc ddrss_sf phy_rchng */
@@ -998,6 +999,7 @@
 +/* ---- PCIe controller (pci-msm.c) ---- */
 +#define PARF_LTSSM	0x000001b0UL
 +#define PARF_LTSSM_EN	0x00000100UL
++#define PARF_LTSSM_SW_CLR_FLUSH	0x00000400UL	/* pci-msm.c:95 SW_CLR_FLUSH_MODE BIT(10) */
 +#define PARF_SYS_CTRL	0x00000000UL
 +#define PARF_PHY_CTRL	0x00000040UL
 +#define PARF_DEVICE_TYPE 0x00001000UL
@@ -27215,7 +27217,7 @@
 +		return;
 +	sy_wlfw_busy = 1;
 +	sy_wlfw_dl_pending = 0;
-+	printf("PANDORA WLAN: WLFW download: cap, board, regdb, m3, aux, qdss\n");
++	printf("PANDORA WLAN: WLFW download: cap, regdb, board, m3, aux, qdss\n");
 +	if (sy_wlfw_cap_send() != 0) {
 +		sy_log_sync();
 +		sy_wlfw_busy = 0;
@@ -27227,11 +27229,11 @@
 +		sy_wlfw_busy = 0;
 +		return;
 +	}
-+	sy_wlfw_bdf_send("bd_songyuan.elf", 1);
-+	sy_wlfw_t1_base_dump("after elf");
++	sy_wlfw_bdf_send("regdb_xiaomi.bin", 4);
++	sy_wlfw_t1_base_dump("after regdb");
 +	if (sy_wlfw_alive()) {
-+		sy_wlfw_bdf_send("regdb_xiaomi.bin", 4);
-+		sy_wlfw_t1_base_dump("after regdb");
++		sy_wlfw_bdf_send("bd_songyuan.elf", 1);
++		sy_wlfw_t1_base_dump("after elf");
 +	}
 +	if (sy_wlfw_alive())
 +		sy_wlfw_cal_image();
@@ -29218,6 +29220,18 @@
 +	    sy_gcc_rd(0x6c014), sy_gcc_rd(0x6b000), sy_gcc_rd(0x6c01c),
 +	    sy_rd(parf, PARF_PHY_CTRL), sy_rd(phy, PHY_STATUS),
 +	    sy_rd(phy, 0x1400), sy_rd(phy, 0x1444));
++	/* pci-msm.c:7459 writes SW_CLR_FLUSH_MODE. handle_sbr_func at 6778
++	 * pulses the linkdown resets, waits 1 ms, releases them in reverse,
++	 * then sets LTSSM_EN. gcc-canoe.c:3825 is the link-down BCR;
++	 * gcc-canoe.c:3828 is the phy nocsr BCR. */
++	sy_wr(parf, PARF_LTSSM, sy_rd(parf, PARF_LTSSM) | PARF_LTSSM_SW_CLR_FLUSH);
++	sy_gcc_wr(GCC_BCR_LINK_DOWN, sy_gcc_rd(GCC_BCR_LINK_DOWN) | 1);
++	sy_gcc_wr(GCC_BCR_PHY_NOCSR, sy_gcc_rd(GCC_BCR_PHY_NOCSR) | 1);
++	delay_for_interval(1, NSEC_PER_MSEC);
++	sy_gcc_wr(GCC_BCR_PHY_NOCSR, sy_gcc_rd(GCC_BCR_PHY_NOCSR) & ~1UL);
++	sy_gcc_wr(GCC_BCR_LINK_DOWN, sy_gcc_rd(GCC_BCR_LINK_DOWN) & ~1UL);
++	printf("PANDORA WLAN: CBC: linkdown reset released ltssm %#x link-down %#x nocsr %#x\n",
++	    sy_rd(parf, PARF_LTSSM), sy_gcc_rd(GCC_BCR_LINK_DOWN), sy_gcc_rd(GCC_BCR_PHY_NOCSR));
 +	printf("PANDORA WLAN: LTSSM before enable %#x (information only)\n",
 +	    sy_rd(parf, PARF_LTSSM));
 +	sy_wr(parf, PARF_LTSSM, sy_rd(parf, PARF_LTSSM) | PARF_LTSSM_EN);	/* vendor enable_link L896-899 */
