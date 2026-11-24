@@ -820,7 +820,7 @@
  }
  
  static void
-@@ -51,21 +834,30790 @@
+@@ -51,21 +834,30872 @@
  		cv_sleep(100);
  	}
  	if (rootvnode == NULLVP) {
@@ -5549,6 +5549,8 @@
 +static uint32_t sy_wlfw_ul_wp;
 +static uint32_t sy_wlfw_node, sy_wlfw_port;
 +static unsigned sy_wlfw_state;
++static int sy_wlfw_cal_done;
++static uint64_t sy_wlfw_cal_upload;
 +static int sy_wlfw_cap_sent;
 +static uint16_t sy_wlfw_wait_msg;
 +static int sy_wlfw_wait_result;
@@ -5811,6 +5813,36 @@
 +				printf("PANDORA WLAN: WLFW wlan %s response\n",
 +				    msgid == 0x0022 ? "mode" : "cfg");
 +			sy_wlfw_response(b + q, (unsigned)qlen + 7, msgid);
++		} else if (msgid == 0x0026) {
++			sy_wlfw_response(b + q, (unsigned)qlen + 7, msgid);
++		} else if (msgid == 0x003E) {
++			unsigned p = q + 7;
++			unsigned end = q + 7u + qlen;
++			uint64_t up = 0;
++			unsigned have = 0;
++
++			if (end > len)
++				end = len;
++			while (p + 3 <= end) {
++				uint8_t type = b[p];
++				uint16_t tl = (uint16_t)(b[p + 1] | (b[p + 2] << 8));
++
++				if (p + 3u + tl > end)
++					break;
++				if (type == 0x10 && tl >= 8) {
++					unsigned k;
++
++					up = 0;
++					for (k = 0; k < 8; k++)
++						up |= (uint64_t)b[p + 3 + k] << (8 * k);
++					have = 1;
++				}
++				p = p + 3u + tl;
++			}
++			sy_wlfw_cal_done = 1;
++			sy_wlfw_cal_upload = up;
++			printf("PANDORA WLAN: WLFW cal done kind %u upload %u size %#llx\n",
++			    b[q], have, (unsigned long long)up);
 +		}
 +	}
 +}
@@ -27773,9 +27805,12 @@
 +/* QMI WLFW messages needed before the CE rings come up (qmi.h:513-520) */
 +#define SY_QMI_WLFW_WLAN_MODE_REQ	0x0022
 +#define SY_QMI_WLFW_WLAN_CFG_REQ	0x0023
++#define SY_QMI_WLFW_CAL_REPORT_REQ	0x0026
 +#define SY_QMI_WLFW_INI_REQ		0x002f
 +#define SY_QMI_WLFW_MAC_ADDR_REQ	0x0033
++#define SY_QMI_WLFW_CAL_DONE_IND	0x003E
 +#define SY_WLFW_FW_MODE_NORMAL		0u	/* core.h:111-113 */
++#define SY_WLFW_FW_MODE_CALIBRATION	7u	/* QMI_WLFW_CALIBRATION_V01 */
 +
 +struct sy_ce_ring {
 +	uint32_t ce;		/* pipe number 0..8 */
@@ -28792,6 +28827,19 @@
 +	return sy_qmi_finish(b, at);
 +}
 +
++/* cnss_wlfw_cal_report_req_send_sync leaves meta_data_len at 0 and sets only
++ * optional TLV 0x12, cal_file_download_size. First boot has no cal file. */
++static unsigned
++sy_wlfw_cal_report(uint8_t *b, uint16_t txn, uint64_t size)
++{
++	unsigned at = sy_qmi_hdr(b, 0x00, txn, SY_QMI_WLFW_CAL_REPORT_REQ);
++
++	at = sy_qmi_tlv_hdr(b, at, 0x01, 1);
++	b[at++] = 0;
++	at = sy_qmi_tlv_u64(b, at, 0x12, size);
++	return sy_qmi_finish(b, at);
++}
++
 +/* Wrap a QMI message in a QRTR DATA frame and put it on MHI channel 20, the path
 + * the WLFW handshake already uses (sy_wlfw_run, sy_wlfw_bdf_send). */
 +static int
@@ -29104,6 +29152,40 @@
 +		sy_log_sync();
 +		return;
 +	}
++
++	/* First power-up is cold boot calibration. cnss_fw_ready_hdlr sends
++	 * cal report then mode 7 and does not probe. Mode 0 and WMI_INIT stay
++	 * below this return until a later boot sees indication 0x3E. */
++	sy_wlfw_cal_done = 0;
++	sy_wlfw_cal_upload = 0;
++	at = sy_wlfw_cal_report(qmi, sy_wlfw_txn++, 0);
++	if (sy_d1_qmi_send(SY_QMI_WLFW_CAL_REPORT_REQ, qmi, at))
++		return;
++	for (i = 0; i < 100u; i++) {
++		sy_d1_pump_mhi();
++		sy_usleep(10000);
++	}
++	at = sy_wlfw_wlan_mode(qmi, sy_wlfw_txn++, SY_WLFW_FW_MODE_CALIBRATION);
++	if (sy_d1_qmi_send(SY_QMI_WLFW_WLAN_MODE_REQ, qmi, at))
++		return;
++	printf("PANDORA WLAN: D1: WLAN calibration mode 7 requested\n");
++	sy_log_sync();
++	for (i = 0; i < 1200u && !sy_wlfw_cal_done; i++) {
++		uint32_t st = sy_rd(sy_bar_va, 0x48);
++
++		if (((st >> 8) & 0xffu) == 255u) {
++			printf("PANDORA WLAN: D1: MHI status %#x during calibration at %u ms\n",
++			    st, i * 10u);
++			sy_log_sync();
++			break;
++		}
++		sy_d1_pump_mhi();
++		sy_usleep(10000);
++	}
++	printf("PANDORA WLAN: D1: cal done %d after %u ms upload %#llx\n",
++	    sy_wlfw_cal_done, i * 10u, (unsigned long long)sy_wlfw_cal_upload);
++	sy_log_sync();
++	return;
 +
 +	/* 2. MAC, INI (fw_log_mode 1), WLAN_CFG, then WLAN_MODE normal */
 +	at = sy_wlfw_mac(qmi, sy_wlfw_txn++);
