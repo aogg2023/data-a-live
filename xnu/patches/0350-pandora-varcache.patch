@@ -820,7 +820,7 @@
  }
  
  static void
-@@ -51,21 +834,30787 @@
+@@ -51,21 +834,30790 @@
  		cv_sleep(100);
  	}
  	if (rootvnode == NULLVP) {
@@ -4791,13 +4791,16 @@
 +		}
 +		prev = pa;
 +		((uint64_t *)(sy_mem_l3 + (((vm_offset_t)i >> 9) << 12)))[i & 0x1ff] =
-+		    (pa & 0x0000fffffffff000ull) | 0x0060000000000e47ull;
++		    (pa & 0x0000fffffffff000ull) | 0x0060000000000e43ull;
 +	}
 +	for (i = 0; i < 16; i++)
 +		flush_dcache64(sy_pa(sy_mem_l3 + ((vm_offset_t)i << 12)),
 +		    (unsigned)PAGE_SIZE, TRUE);
 +	flush_dcache64(sy_pa(sy_mem_l2), (unsigned)PAGE_SIZE, TRUE);
 +	flush_dcache64(sy_pa(sy_l1), (unsigned)PAGE_SIZE, TRUE);
++	for (i = 0; i < (SY_MEM_SIZE >> 12); i++)
++		flush_dcache64(sy_pa(sy_mem_va + ((vm_offset_t)i << 12)),
++		    (unsigned)PAGE_SIZE, TRUE);
 +	__asm__ volatile("dsb sy" ::: "memory");
 +	if (sy_cb_va && sy_smmu_asid) {
 +		sy_wr(sy_cb_va, 0x610, sy_smmu_asid);
@@ -4812,7 +4815,7 @@
 +	}
 +	printf("PANDORA WLAN: MEM: %u MiB at iova %#x pte %#llx (va %#lx l2 %#lx l3 %#lx)\n",
 +	    SY_MEM_SIZE >> 20, (unsigned)SY_MEM_IOVA,
-+	    (unsigned long long)0x0060000000000e47ull, (unsigned long)sy_mem_va,
++	    (unsigned long long)0x0060000000000e43ull, (unsigned long)sy_mem_va,
 +	    (unsigned long)sy_mem_l2, (unsigned long)sy_mem_l3);
 +	printf("PANDORA WLAN: MEM: phys gaps %u first %#llx %#llx\n",
 +	    gaps, (unsigned long long)gap_a, (unsigned long long)gap_b);
