@@ -820,7 +820,7 @@
  }
  
  static void
-@@ -51,21 +834,30872 @@
+@@ -51,21 +834,31036 @@
  		cv_sleep(100);
  	}
  	if (rootvnode == NULLVP) {
@@ -1078,6 +1078,8 @@
 +static uint32_t sy_bhie_off;
 +static int sy_keep_alive;
 +static int sy_wlfw_on;
++static int sy_cbc_mission;
++static int sy_cbc_suppress_after;
 +static int sy_m0_mode;		/* 0 wait for device M0, 1 force at once, 2 force after 500 ms */
 +static int sy_bhie_clear = 1;	/* official ath12k_mhi_clear_vector behaviour */
 +static int sy_erdb_init;	/* parsed; the init ERDB write does not depend on it */
@@ -2292,20 +2294,20 @@
 +		/* stage 22: D2 - WMI after READY: hw mode, pdev params, vdev, scan,
 +		 * and the connection commands up to VDEV_START.  sy_d2_run() checks
 +		 * sy_wmi_ready itself because that flag is declared further down. */
-+		if (sy_step >= 22 && sy_sbl_ok && sy_keep_alive && sy_wlfw_on &&
++		if (sy_step >= 22 && !sy_cbc_suppress_after && sy_sbl_ok && sy_keep_alive && sy_wlfw_on &&
 +		    (sy_mhi_m0_ok || sy_chan_force)) {
 +			sy_d2_run();	/* D2: WMI after READY */
 +		}
 +		/* stage 23: D3 - HTT peer-map (the service itself is connected
 +		 * in D1, before SETUP_COMPLETE) plus assoc, peer assoc, vdev up. */
-+		if (sy_step >= 23 && sy_sbl_ok && sy_keep_alive && sy_wlfw_on &&
++		if (sy_step >= 23 && !sy_cbc_suppress_after && sy_sbl_ok && sy_keep_alive && sy_wlfw_on &&
 +		    (sy_mhi_m0_ok || sy_chan_force)) {
 +			sy_d3_run();
 +		}
 +		/* stage 24: E - TCL/REO/WBM rings, RXDMA via HTT, buffers.
 +		 * CE pipes stay the D1 rings; their device addresses match
 +		 * hw_srng_table_peach. */
-+		if (sy_step >= 24 && sy_sbl_ok && sy_keep_alive && sy_wlfw_on &&
++		if (sy_step >= 24 && !sy_cbc_suppress_after && sy_sbl_ok && sy_keep_alive && sy_wlfw_on &&
 +		    (sy_mhi_m0_ok || sy_chan_force)) {
 +			sy_e_run();
 +		}
@@ -27811,6 +27813,7 @@
 +#define SY_QMI_WLFW_CAL_DONE_IND	0x003E
 +#define SY_WLFW_FW_MODE_NORMAL		0u	/* core.h:111-113 */
 +#define SY_WLFW_FW_MODE_CALIBRATION	7u	/* QMI_WLFW_CALIBRATION_V01 */
++#define SY_WLFW_FW_MODE_OFF		4u	/* QMI_WLFW_OFF_V01 */
 +
 +struct sy_ce_ring {
 +	uint32_t ce;		/* pipe number 0..8 */
@@ -29118,6 +29121,150 @@
 +	sy_log_sync();
 +}
 +
++static void
++sy_cbc_reenum(void)
++{
++	printf("PANDORA WLAN: CBC: power cycle, then the mission WLFW\n");
++	sy_log_sync();
++	sy_sbl_ok = 0;
++	sy_keep_alive = 0;
++	sy_mhi_m0_ok = 0;
++	sy_mhi_ipcr_ok = 0;
++	sy_wlfw_state = 0;
++	sy_wlfw_node = 0;
++	sy_wlfw_port = 0;
++	sy_wlfw_cap_sent = 0;
++	sy_wlfw_cap_handled = 0;
++	sy_wlfw_dl_pending = 0;
++	sy_wlfw_busy = 0;
++	sy_wlfw_ul_wp = 0;
++	sy_mhi_dl_hi = 0;
++	sy_mhi_dl5_hi = 0;
++	sy_mhi_hi[0] = 0;
++	sy_mhi_hi[1] = 0;
++	sy_mhi_wp_off[0] = SY_MHI_ER0_LEN - 16u;
++	sy_mhi_wp_off[1] = SY_MHI_ER1_LEN - 16u;
++	sy_mhi_cmd_hi = 0;
++	sy_mhi_cmd_wait_ch = 0xffffffffu;
++	sy_link_up = 0;
++	if (parf)
++		sy_wr(parf, PARF_LTSSM, sy_rd(parf, PARF_LTSSM) & ~PARF_LTSSM_EN);
++	sy_platform_poweroff();
++	delay_for_interval(100, NSEC_PER_MSEC);	/* POWER_RESET_MIN_DELAY_MS */
++	printf("PANDORA WLAN: step %u: the card's enable, root port, PERST release\n", sy_step);
++	sy_pin_level(PIN_WLAN_EN, IO_HIGH);
++	delay_for_interval(1, NSEC_PER_MSEC);		/* cnss_power_on_device(): udelay(1000) */
++	sy_pin_ctl(PIN_CLKREQ, CTL_CLKREQ_FUNC);
++	sy_pin_ctl(PIN_WAKE, CTL_IN_PULL_UP);
++	sy_diag_regs("after the PHY, before PERST");
++	printf("PANDORA WLAN: sw-ctrl pins read %u %u\n",
++	    (unsigned)(*(volatile uint32_t *)sy_pin_reg(18, 4) & 1),
++	    (unsigned)(*(volatile uint32_t *)sy_pin_reg(19, 4) & 1));
++	/* PCIe CEM TPVPERL: wait while PERST is still asserted, then release it. Vendor
++	 * msm_pcie_config_perst.c drives raw 0 to assert and 1 - on to de-assert; v2m
++	 * msm_pcie_enable_link.c waits perst_delay_us (1 ms default) after de-assert and
++	 * only then writes PARF+0x1b0 |= 0x100 (LTSSM_EN, L896-899). */
++	/* Vendor msm_pcie_enable_link.c L6130-6160, before PERST is released:
++	 * root-port class code, PARF_CFG_BITS_3 (clear bit0, set bit8) and
++	 * LANE_SKEW_OFF bit5. */
++	if (sy_rd(dbi, 0) != 0xffffffffUL) {
++		uint32_t v;
++
++		sy_wr(dbi, 0x8BCu, sy_rd(dbi, 0x8BCu) | 1);		/* DBI_RO_WR_EN */
++		v = sy_rd(dbi, 0x08u);
++		sy_wr(dbi, 0x08u, (v & 0xFFUL) | (0x060400UL << 8));	/* class: PCI bridge */
++		sy_wr(dbi, 0x8BCu, sy_rd(dbi, 0x8BCu) & ~1UL);
++		sy_wr(parf, 0x2C4u, sy_rd(parf, 0x2C4u) & ~1UL);	/* fal10_veto override off */
++		sy_wr(parf, 0x2C4u, sy_rd(parf, 0x2C4u) | 0x100UL);	/* width upscaling support */
++		sy_wr(dbi, 0x714u, sy_rd(dbi, 0x714u) & ~0x20UL);	/* LANE_SKEW_OFF bit5 */
++	}
++	delay_for_interval(100, NSEC_PER_MSEC);
++	sy_pin_level(PIN_PERST, IO_HIGH);		/* vendor msm_pcie_config_perst: deassert = 1 - on (high) */
++	delay_for_interval(1, NSEC_PER_MSEC);	/* vendor perst_delay_us 1000-1005, enabled after */
++	/* Vendor msm_pcie_enable_link.c (L673-792): after PERST release it programs the
++	 * GEN3/link-speed registers through DBI (dm_core+0x80C speed field, DBI_RO_WR_EN
++	 * around Link Control 2) and only then writes PARF+0x1b0 |= 0x100. DBI is readable
++	 * now, so reproduce that minimum before enabling LTSSM. */
++	if (sy_rd(dbi, 0) != 0xffffffffUL) {
++		uint32_t gen3 = sy_rd(dbi, 0x80Cu);
++		uint32_t lnk2;
++
++		/* Initial training is Gen1 (vendor msm_pcie_enable_link.c writes 0x100 right
++		 * after PERST release); the DT target-link-speed=3 speed change comes later. */
++		sy_wr(dbi, 0x80Cu, (gen3 & 0xFFFFE0FFUL) | (1UL << 8));	/* speed field: Gen1 */
++		sy_wr(dbi, 0x8BCu, sy_rd(dbi, 0x8BCu) | 1);		/* DBI_RO_WR_EN */
++		lnk2 = sy_rd(dbi, 0xA0u);
++		/* WCN7850 (17cb:110e) known issue: Gen3 equalization programming makes the link
++		 * fail to train (LKML: X1E80100 Surface Pro 11; forcing max-link-speed=<1> makes
++		 * the same card train and probe). Train Gen1 only here; the DT
++		 * target-link-speed speed change belongs after the link is up. */
++		sy_wr(dbi, 0xA0u, (lnk2 & ~0xFUL) | 1);			/* Link Control 2: Gen1 only */
++		{
++			uint32_t dcs = sy_rd(dbi, 0x78u);
++
++			sy_wr(dbi, 0x78u, (dcs & ~0x7000UL) | (5UL << 12));	/* TLP read size 0x5 */
++		}
++		/* Gen3 EQ / preset programming is deliberately skipped. */
++		sy_wr(dbi, 0x8BCu, sy_rd(dbi, 0x8BCu) & ~1UL);
++		printf("PANDORA WLAN: link speed config: 0x80C %#x 0xA0 %#x (vendor order)\n",
++		    sy_rd(dbi, 0x80Cu), sy_rd(dbi, 0xA0u));
++	} else {
++		printf("PANDORA WLAN: DBI not readable; link speed config skipped\n");
++	}
++	/* Read-only sampling before LTSSM_EN: what the pins and resets really hold. */
++	printf("PANDORA WLAN: pre-EN: perst cfg %#x io %#x; gcc link-down %#x core-bcr %#x phy-bcr %#x; parf phy-ctrl %#x; phy status %#x 1400 %#x 1444 %#x\n",
++	    *(volatile uint32_t *)sy_pin_reg(PIN_PERST, 0),
++	    *(volatile uint32_t *)sy_pin_reg(PIN_PERST, 4),
++	    sy_gcc_rd(0x6c014), sy_gcc_rd(0x6b000), sy_gcc_rd(0x6c01c),
++	    sy_rd(parf, PARF_PHY_CTRL), sy_rd(phy, PHY_STATUS),
++	    sy_rd(phy, 0x1400), sy_rd(phy, 0x1444));
++	printf("PANDORA WLAN: LTSSM before enable %#x (information only)\n",
++	    sy_rd(parf, PARF_LTSSM));
++	sy_wr(parf, PARF_LTSSM, sy_rd(parf, PARF_LTSSM) | PARF_LTSSM_EN);	/* vendor enable_link L896-899 */
++	printf("PANDORA WLAN: after PERST: parf ltssm %#x sys %#x (information only)\n",
++	    sy_rd(parf, PARF_LTSSM), sy_rd(parf, PARF_SYS_CTRL));
++	/* Plan SS6 (L218-220): sm-debug, PARF LTSSM and DBI values are logged only and
++	 * never gate anything; the single outbound config read is the only pass test.
++	 * Vendor msm_pcie_confirm_linkup() and K90 poll DBI+0x80 bit29 (LINK_ACTIVE):
++	 * log it here for up to ~1 s, purely as evidence. */
++	{
++		unsigned i, up = 0;
++		uint32_t st = 0;
++
++		for (i = 0; i < 100; i++) {
++			uint32_t elbi;
++
++			st = sy_rd(dbi, 0x80u);
++			elbi = sy_rd(dbi, 0xF28u);	/* ELBI_SYS_STTS, XMLH_LINK_UP=0x400 */
++			if ((elbi & 0x400UL) || (st != 0xffffffffUL && (st & (1UL << 29)))) {
++				up = 1;
++				break;
++			}
++			if ((i % 10) == 0)
++				printf("PANDORA WLAN: sample %u ms: elbi %#x dbi80 %#x ltssm %#x\n",
++				    i * 10, elbi, st, sy_rd(parf, PARF_LTSSM));
++			delay_for_interval(10, NSEC_PER_MSEC);
++		}
++		sy_link_up = up;
++		printf("PANDORA WLAN: link poll: after %u ms dbi80 %#x elbi %#x active %u\n",
++		    i * 10, st, sy_rd(dbi, 0xF28u), up);
++	}
++	printf("PANDORA WLAN: link setup done: parf %#x sm-debug %#x dbi0 %#x dbi80 %#x (log only)\n",
++	    sy_rd(parf, PARF_LTSSM), sy_rd(pcism, 0x1090), sy_rd(dbi, 0), sy_rd(dbi, 0x80));
++	sy_sm_state("after link setup");
++	if (!sy_link_up) {
++		printf("PANDORA WLAN: CBC: link did not return\n");
++		sy_log_sync();
++		return;
++	}
++	sy_iatu_ecam();
++	if (sy_config_read())
++		printf("PANDORA WLAN: CBC: second enumeration answered 17cb:110e\n");
++	else
++		printf("PANDORA WLAN: CBC: second enumeration did not see 17cb:110e\n");
++	sy_log_sync();
++}
++
 +/* Stage 21 entry.  Everything is bounded and every failure only prints; the driver
 + * never panics, the same convention as stages 1-20. */
 +static void
@@ -29153,40 +29300,57 @@
 +		return;
 +	}
 +
-+	/* First power-up is cold boot calibration. cnss_fw_ready_hdlr sends
-+	 * cal report then mode 7 and does not probe. Mode 0 and WMI_INIT stay
-+	 * below this return until a later boot sees indication 0x3E. */
-+	sy_wlfw_cal_done = 0;
-+	sy_wlfw_cal_upload = 0;
-+	at = sy_wlfw_cal_report(qmi, sy_wlfw_txn++, 0);
-+	if (sy_d1_qmi_send(SY_QMI_WLFW_CAL_REPORT_REQ, qmi, at))
-+		return;
-+	for (i = 0; i < 100u; i++) {
-+		sy_d1_pump_mhi();
-+		sy_usleep(10000);
-+	}
-+	at = sy_wlfw_wlan_mode(qmi, sy_wlfw_txn++, SY_WLFW_FW_MODE_CALIBRATION);
-+	if (sy_d1_qmi_send(SY_QMI_WLFW_WLAN_MODE_REQ, qmi, at))
-+		return;
-+	printf("PANDORA WLAN: D1: WLAN calibration mode 7 requested\n");
-+	sy_log_sync();
-+	for (i = 0; i < 1200u && !sy_wlfw_cal_done; i++) {
-+		uint32_t st = sy_rd(sy_bar_va, 0x48);
-+
-+		if (((st >> 8) & 0xffu) == 255u) {
-+			printf("PANDORA WLAN: D1: MHI status %#x during calibration at %u ms\n",
-+			    st, i * 10u);
-+			sy_log_sync();
-+			break;
++	/* Pass 0 is cold boot calibration. cnss_cold_boot_cal_done_hdlr then
++	 * sends mode 4, shuts the device down, and the driver load is a second
++	 * power-up. Pass 1 is that mission WLFW. */
++	if (!sy_cbc_mission) {
++		sy_wlfw_cal_done = 0;
++		sy_wlfw_cal_upload = 0;
++		at = sy_wlfw_cal_report(qmi, sy_wlfw_txn++, 0);
++		if (sy_d1_qmi_send(SY_QMI_WLFW_CAL_REPORT_REQ, qmi, at))
++			return;
++		for (i = 0; i < 100u; i++) {
++			sy_d1_pump_mhi();
++			sy_usleep(10000);
 +		}
-+		sy_d1_pump_mhi();
-+		sy_usleep(10000);
-+	}
-+	printf("PANDORA WLAN: D1: cal done %d after %u ms upload %#llx\n",
-+	    sy_wlfw_cal_done, i * 10u, (unsigned long long)sy_wlfw_cal_upload);
-+	sy_log_sync();
-+	return;
++		at = sy_wlfw_wlan_mode(qmi, sy_wlfw_txn++, SY_WLFW_FW_MODE_CALIBRATION);
++		if (sy_d1_qmi_send(SY_QMI_WLFW_WLAN_MODE_REQ, qmi, at))
++			return;
++		printf("PANDORA WLAN: D1: WLAN calibration mode 7 requested\n");
++		sy_log_sync();
++		for (i = 0; i < 1200u && !sy_wlfw_cal_done; i++) {
++			uint32_t st = sy_rd(sy_bar_va, 0x48);
 +
++			if (((st >> 8) & 0xffu) == 255u) {
++				printf("PANDORA WLAN: D1: MHI status %#x during calibration at %u ms\n",
++				    st, i * 10u);
++				sy_log_sync();
++				break;
++			}
++			sy_d1_pump_mhi();
++			sy_usleep(10000);
++		}
++		printf("PANDORA WLAN: D1: cal done %d after %u ms upload %#llx\n",
++		    sy_wlfw_cal_done, i * 10u, (unsigned long long)sy_wlfw_cal_upload);
++		sy_log_sync();
++		if (!sy_wlfw_cal_done)
++			return;
++		at = sy_wlfw_wlan_mode(qmi, sy_wlfw_txn++, SY_WLFW_FW_MODE_OFF);
++		(void)sy_d1_qmi_send(SY_QMI_WLFW_WLAN_MODE_REQ, qmi, at);
++		printf("PANDORA WLAN: D1: WLAN mode 4 (off) requested\n");
++		sy_log_sync();
++		for (i = 0; i < 100u; i++) {
++			sy_d1_pump_mhi();
++			sy_usleep(10000);
++		}
++		sy_cbc_mission = 1;
++		sy_cbc_reenum();
++		sy_cbc_suppress_after = 1;
++		return;
++	}
++
++	printf("PANDORA WLAN: D1: mission WLFW pass\n");
++	sy_log_sync();
 +	/* 2. MAC, INI (fw_log_mode 1), WLAN_CFG, then WLAN_MODE normal */
 +	at = sy_wlfw_mac(qmi, sy_wlfw_txn++);
 +	if (sy_d1_qmi_send(SY_QMI_WLFW_MAC_ADDR_REQ, qmi, at))
