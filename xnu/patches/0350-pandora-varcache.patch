@@ -820,7 +820,7 @@
  }
  
  static void
-@@ -51,21 +834,31506 @@
+@@ -51,21 +834,31507 @@
  		cv_sleep(100);
  	}
  	if (rootvnode == NULLVP) {
@@ -4922,6 +4922,8 @@
 +static uint16_t sy_wlfw_hang_len;
 +static int sy_wlfw_hang_off_ok;
 +static int sy_wlfw_hang_len_ok;
++/* Declared here: the cap parser assigns it before the later static block. */
++static uint32_t sy_wlfw_time_freq;
 +
 +static unsigned
 +sy_qmi_hdr(uint8_t *b, uint8_t kind, uint16_t txn, uint16_t msgid)
@@ -5602,7 +5604,6 @@
 +static int sy_wlfw_cap_sent;
 +static uint16_t sy_wlfw_wait_msg;
 +static int sy_wlfw_wait_result;
-+static uint32_t sy_wlfw_time_freq;
 +static uint32_t sy_qdss_source, sy_qdss_total, sy_qdss_dlen;
 +static uint8_t sy_qdss_end;
 +static int sy_qdss_ind, sy_qdss_resp;
