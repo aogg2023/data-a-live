@@ -820,7 +820,7 @@
  }
  
  static void
-@@ -51,21 +834,31133 @@
+@@ -51,21 +834,31506 @@
  		cv_sleep(100);
  	}
  	if (rootvnode == NULLVP) {
@@ -1129,10 +1129,32 @@
 +#define SY_RDDM_SIZE	0x780000u
 +#define SY_RDDM_SEG	0x80000u
 +#define SY_RDDM_NSEGS	(SY_RDDM_SIZE / SY_RDDM_SEG)
-+#define SY_RDDM_IOVA	(SY_IOVA_BASE + SY_FW_BUF)
++/* dtsi:81 smmu_iova_ipa is 0xb0000000/0x10000, the last 64 KiB of host_cap
++ * (0x18000000 + 0x98010000 = 0xb0010000). GSI doorbell page is
++ * 0x03e04000 + 0x24000. CONS ch 3 offset 0x18, PROD ch 16 offset 0x80.
++ * RDDM starts after this window. These addresses are not QMI segments. */
++#define SY_IPA_IOVA	(SY_IOVA_BASE + SY_FW_BUF)
++#define SY_IPA_LEN	0x10000u
++#define SY_GSI_DB_PAGE	0x03e28000ull
++#define SY_IPA_DB_CONS	(SY_IPA_IOVA + 0x18u)
++#define SY_IPA_DB_PROD	(SY_IPA_IOVA + 0x1000u + 0x80u)
++#define SY_REO3_BASE	(0x00a38500u + 3u * 0x78u)
++#define SY_REO3_HP	(SY_REO3_BASE + 0x14u)
++#define SY_REO3_HP_HI	(SY_REO3_BASE + 0x18u)
++#define SY_RDDM_IOVA	(SY_IPA_IOVA + SY_IPA_LEN)
 +#define SY_RDDM_VECB	(SY_RDDM_NSEGS * 16u)
 +#define SY_RDDM_ALLOC	0x784000u	/* 0x780000 plus one 16 KiB XNU page for the vector */
 +#define SY_RDDM_FBLK	2048u	/* ioslog.img block, after the 4 MiB ring and fbdump slot */
++_Static_assert(SY_IPA_IOVA == 0xb0000000ul, "ipa iova");
++_Static_assert(SY_IPA_LEN == 0x10000u, "ipa len");
++_Static_assert(SY_GSI_DB_PAGE == 0x03e04000ull + 0x24000ull, "gsi db page");
++_Static_assert(SY_IPA_DB_CONS == 0xb0000018ul, "cons db");
++_Static_assert(SY_IPA_DB_PROD == 0xb0001080ul, "prod db");
++_Static_assert(SY_REO3_HP == 0x00a3867cu, "reo3 hp");
++_Static_assert(SY_REO3_HP_HI == 0x00a38680u, "reo3 hp hi");
++_Static_assert(SY_RDDM_IOVA == 0xb0010000ul, "rddm after ipa");
++_Static_assert(((SY_RDDM_IOVA - SY_IOVA_BASE) >> 12) + (SY_RDDM_ALLOC >> 12) <=
++    (SY_FW_BUF >> 12) + 4u * 512u, "rddm fits the four L2 slots");
 +static vm_offset_t sy_rddm_va;
 +static int sy_rddm_armed;
 +extern int pandora_log_store(uint64_t file_block, const void *src, uint32_t len);
@@ -2468,9 +2490,10 @@
 +		((uint64_t *)(sy_l3 + ((i >> 9) << 12)))[i & 0x1ff] =
 +		    (pa & 0x0000fffffffff000ull) | 0x0060000000000e43ull;
 +	}
-+	/* Same PTE as the firmware window. RDDM starts at 0xB0000000, inside
-+	 * the cnss_pci0 window (0xB0000000, size 0x50000000). SY_MEM_IOVA is the
-+	 * other gigabyte (L1 index 0), so these L2 slots do not overlap it. */
++	/* Same PTE as the firmware window. The 64 KiB at 0xB0000000 is
++	 * smmu_iova_ipa. Two PTEs map GSI page 0x03E28000 there. RDDM starts
++	 * at 0xB0010000, still inside cnss_pci0 (0xB0000000, size 0x50000000).
++	 * SY_MEM_IOVA is the other gigabyte (L1 index 0). */
 +	sy_rddm_va = 0;
 +	if (sy_buf_size == SY_FW_BUF && l3s + 4 <= 16) {
 +		kr = kmem_alloc_contig(kernel_map, &sy_rddm_va, SY_RDDM_ALLOC, PAGE_MASK,
@@ -2484,8 +2507,18 @@
 +			for (r = 0; r < 4; r++)
 +				((uint64_t *)sy_l2)[(((SY_IOVA_BASE >> 21) + l3s + r) & 511)] =
 +				    sy_pa(sy_l3 + ((vm_offset_t)(l3s + r) << 12)) | 3ull;
++			{
++				uint32_t ipa = (uint32_t)((SY_IPA_IOVA - SY_IOVA_BASE) >> 12);
++				uint64_t pte = (SY_GSI_DB_PAGE & 0x0000fffffffff000ull) |
++				    0x0060000000000e43ull;
++				unsigned p;
++
++				for (p = 0; p < 2u; p++)
++					((uint64_t *)(sy_l3 + (((ipa + p) >> 9) << 12)))[(ipa + p) & 0x1ff] =
++					    pte;
++			}
 +			for (r = 0; r < (SY_RDDM_ALLOC >> 12); r++) {
-+				uint32_t idx = (SY_FW_BUF >> 12) + r;
++				uint32_t idx = (uint32_t)((SY_RDDM_IOVA - SY_IOVA_BASE) >> 12) + r;
 +
 +				pa = sy_pa(sy_rddm_va + ((vm_offset_t)r << 12));
 +				((uint64_t *)(sy_l3 + ((idx >> 9) << 12)))[idx & 0x1ff] =
@@ -4861,6 +4894,7 @@
 +#define SY_QMI_WLFW_AUX_UC_INFO_REQ 0x005a
 +#define SY_QMI_WLFW_QDSS_TRACE_CONFIG_DOWNLOAD_REQ 0x0044
 +#define SY_QMI_WLFW_TME_LITE_INFO_REQ 0x005b
++#define SY_QMI_WLFW_SUBSYS_RESTART_LEVEL_REQ 0x0055
 +
 +#define SY_WLFW_MEM_TYPE_DDR 1u
 +#define SY_WLFW_MEM_TYPE_BDF 2u
@@ -5361,6 +5395,14 @@
 +			printf("PANDORA WLAN: WLFW cap 0x1f at %u %02x %02x\n",
 +			    at + 3, b[at + 3], b[at + 4]);
 +		}
++		if (type == 0x17 && tl == 4) {
++			sy_wlfw_time_freq = (uint32_t)b[at + 3] |
++			    ((uint32_t)b[at + 4] << 8) |
++			    ((uint32_t)b[at + 5] << 16) |
++			    ((uint32_t)b[at + 6] << 24);
++			printf("PANDORA WLAN: WLFW cap time_freq %u Hz\n",
++			    sy_wlfw_time_freq);
++		}
 +		if (type == 0x11 && tl >= 4) {
 +			sy_wlfw_board_id = (uint32_t)b[at + 3] |
 +			    ((uint32_t)b[at + 4] << 8) |
@@ -5560,6 +5602,10 @@
 +static int sy_wlfw_cap_sent;
 +static uint16_t sy_wlfw_wait_msg;
 +static int sy_wlfw_wait_result;
++static uint32_t sy_wlfw_time_freq;
++static uint32_t sy_qdss_source, sy_qdss_total, sy_qdss_dlen;
++static uint8_t sy_qdss_end;
++static int sy_qdss_ind, sy_qdss_resp;
 +static int sy_wlfw_dl_pending;
 +static uint8_t sy_wlfw_txbuf[SY_WLFW_TX_MAX];
 +static uint8_t sy_bdf_buf[6144];
@@ -5813,8 +5859,10 @@
 +			}
 +			sy_wlfw_response(b + q, (unsigned)qlen + 7, msgid);
 +		} else if (msgid == 0x0022 || msgid == 0x0023 || msgid == 0x002f ||
-+		    msgid == 0x0033) {
-+			/* D1: WLAN_MODE 0x22, INI 0x2f, WLAN_CFG 0x23, MAC 0x33 */
++		    msgid == 0x0033 ||
++		    msgid == SY_QMI_WLFW_SUBSYS_RESTART_LEVEL_REQ) {
++			/* D1: WLAN_MODE 0x22, INI 0x2f, WLAN_CFG 0x23, MAC 0x33,
++			 * SUBSYS_RESTART_LEVEL 0x55 */
 +			if (msgid == 0x0022 || msgid == 0x0023)
 +				printf("PANDORA WLAN: WLFW wlan %s response\n",
 +				    msgid == 0x0022 ? "mode" : "cfg");
@@ -5849,6 +5897,50 @@
 +			sy_wlfw_cal_upload = up;
 +			printf("PANDORA WLAN: WLFW cal done kind %u upload %u size %#llx\n",
 +			    b[q], have, (unsigned long long)up);
++		} else if (msgid == 0x0041 || msgid == 0x0042) {
++			unsigned p = q + 7;
++			unsigned endp = q + 7u + qlen;
++			uint32_t u0 = 0, u1 = 0, dlen = 0;
++			uint8_t endf = 0;
++
++			if (endp > len)
++				endp = len;
++			while (p + 3 <= endp) {
++				uint8_t type = b[p];
++				uint16_t tl = (uint16_t)(b[p + 1] | (b[p + 2] << 8));
++
++				if (p + 3u + tl > endp)
++					break;
++				if (tl >= 4 && (type == 0x01 || type == 0x02 ||
++				    type == 0x10)) {
++					uint32_t v = (uint32_t)b[p + 3] |
++					    ((uint32_t)b[p + 4] << 8) |
++					    ((uint32_t)b[p + 5] << 16) |
++					    ((uint32_t)b[p + 6] << 24);
++					if (type == 0x01)
++						u0 = v;
++					else if (type == 0x02)
++						u1 = v;
++				}
++				if (msgid == 0x0042 && type == 0x12 && tl >= 2)
++					dlen = (uint32_t)tl - 2u;
++				if (msgid == 0x0042 && type == 0x13 && tl >= 1)
++					endf = b[p + 3];
++				p = p + 3u + tl;
++			}
++			if (msgid == 0x0041) {
++				sy_qdss_source = u0;
++				sy_qdss_total = u1;
++				sy_qdss_ind = 1;
++				printf("PANDORA WLAN: QMI 0x41 source %u total %u\n",
++				    u0, u1);
++			} else {
++				sy_qdss_dlen = dlen;
++				sy_qdss_end = endf;
++				sy_qdss_resp = 1;
++				printf("PANDORA WLAN: QMI 0x42 resp result %u data %u end %u\n",
++				    u1 & 0xffffu, dlen, endf);
++			}
 +		}
 +	}
 +}
@@ -27681,14 +27773,14 @@
 + *      +0x30/+0x34 consumer int (src). Dst MISC is 0x40; src MISC is 0x42.
 + *      R2 +0x400 HP, +0x404 TP (hal.h:196-197; the status ring R2 pair is at
 + *      dst block + 0x408).
-+ *  - Rings: CE0 src 16 x 16 B (HTC control UL), CE1 512 x 8 B dst + 512 x 16 B
++ *  - Rings: CE0 src 32 x 16 B (0x0700 UL), CE1 512 x 8 B dst + 512 x 16 B
 + *    status, CE2 64 x 8 B dst + 64 x 16 B status (HTC/WMI DL), CE3 32 x 16 B src
 + *    (WMI UL) (ce.c:145-220, hw.c:245-336).
 + *  - HTC frame header is 8 bytes (htc.h:58-61), CONNECT_SERVICE 8 B and its
 + *    response 12 B (htc.h:109-118), READY 8 B (htc.h:99-102).  WMI commands go
 + *    over the WMI_CONTROL endpoint (0x0100) whose UL pipe is CE3 and DL pipe is
 + *    CE2 (hw.c:453-532); ep0 (RSVD_CTRL 0x0001) is the local HTC control endpoint
-+ *    whose UL pipe is CE0 and DL pipe is CE2.
++ *    whose UL pipe is CE4 and DL pipe is CE2.
 + *  - WMI_INIT is a 332-byte WMI payload (wmi.c:3290-3335: 4 B command id added
 + *    by the send path + INIT_CMD struct 32 B + RESOURCE_CONFIG struct 292 B
 + *    + one empty ARRAY_STRUCT header).  ath12k_wmi_alloc_skb() only rounds the
@@ -27731,7 +27823,7 @@
 +#define SY_CE_SIZE	0x00200000UL	/* 2 MiB = one L3 page (512 x 4 KiB) */
 +
 +/* ring placement inside the CE region (the same offsets are VA and IOVA offsets) */
-+#define SY_CE_OFF_CE0_SRC	0x00000000UL	/* 16 x 16 B = 0x100 */
++#define SY_CE_OFF_CE0_SRC	0x00000000UL	/* 32 x 16 B = 0x200 */
 +#define SY_CE_OFF_CE3_SRC	0x00001000UL	/* 32 x 16 B = 0x200 */
 +#define SY_CE_OFF_CE1_DST	0x00002000UL	/* 512 x 8 B = 0x1000 */
 +#define SY_CE_OFF_CE1_ST	0x00003000UL	/* 512 x 16 B = 0x2000 */
@@ -27741,7 +27833,7 @@
 +#define SY_CE_OFF_CE1_BUF	0x00080000UL	/* 512 x 2048 B */
 +/* CE2 buffers are not in this window. 255 x 3520 = 897600 = 0xdb240.
 + * 0x180000 + 0xdb240 = 0x25b240, which is 0x5b240 past 0x200000. */
-+#define SY_CE_OFF_CE0_TX	0x001b8000UL	/* 2 x 2048 B HTC control TX */
++#define SY_CE_OFF_CE0_TX	0x001b8000UL	/* 2 x 2048 B, not used for HTC */
 +#define SY_CE_OFF_CE3_TX	0x001b9000UL	/* 2 x 2048 B WMI TX */
 +#define SY_CE_OFF_CE4_SRC	0x00008000UL	/* 256 x 16 B = 0x1000, ends 0x9000 */
 +#define SY_CE_OFF_CE4_TX	0x001ba000UL	/* 2 x 256 B HTT TX; src_sz_max is 256 */
@@ -27764,11 +27856,25 @@
 +#define SY_CE_OFF_CE7_DST	0x00009000UL	/* 32 x 8 B = 0x100, ends 0x9100 */
 +#define SY_CE_OFF_CE7_ST	0x0000a000UL	/* 32 x 16 B = 0x200, ends 0xa200 */
 +#define SY_CE_OFF_CE7_BUF	0x00180000UL	/* ends 0x190000 */
++/* direct_link host CE5: dest 32, buffer 256. Descriptors sit after CE7
++ * status (ends 0xa200). The pool uses the gap before CE0 TX. */
++#define SY_CE5_N		32u
++#define SY_CE5_POST		(SY_CE5_N - 1u)
++#define SY_CE5_BUF_SZ		256u
++#define SY_CE_OFF_CE5_DST	0x0000b000UL	/* 32 x 8 B = 0x100 */
++#define SY_CE_OFF_CE5_ST	0x0000c000UL	/* 32 x 16 B = 0x200 */
++#define SY_CE_OFF_CE5_BUF	0x00190000UL	/* 32 x 256 B, ends 0x192000 */
 +_Static_assert(SY_CE_SHADOW_SLOT(27) == 0x968u, "ce0 slot");
 +_Static_assert(SY_CE_SHADOW_SLOT(30) == 0x974u, "ce2 slot");
 +_Static_assert(SY_CE_SHADOW_SLOT(33) == 0x980u, "ce4 slot");
 +_Static_assert(SY_CE_SHADOW_SLOT(36) == 0x98cu, "ce7 dst slot");
++_Static_assert(SY_CE_SHADOW_SLOT(34) == 0x984u, "ce5 dst slot");
++_Static_assert(SY_CE_SHADOW_SLOT(35) == 0x988u, "ce5 status slot");
 +_Static_assert(SY_CE_SHADOW_SLOT(37) == 0x990u, "ce7 status slot");
++_Static_assert(SY_CE5_POST == 31u, "ce5 post");
++_Static_assert(SY_CE_OFF_CE5_BUF == 0x190000u, "ce5 buf");
++_Static_assert(SY_CE_OFF_CE5_BUF + SY_CE5_N * SY_CE5_BUF_SZ == 0x192000u, "ce5 end");
++_Static_assert(0x1b8000u - 0x192000u == 0x26000u, "ce5 gap");
 +_Static_assert(SY_CE7_POST == 31u, "ce7 post");
 +_Static_assert(SY_CE_OFF_CE7_BUF + SY_CE7_N * SY_CE7_BUF_SZ == 0x190000u, "ce7 end");
 +_Static_assert(0x1b8000u - (SY_CE_OFF_CE7_BUF + SY_CE7_N * SY_CE7_BUF_SZ) == 0x28000u, "ce7 gap");
@@ -27783,6 +27889,8 @@
 +#define SY_CE_RING_CE1_ST	101u
 +#define SY_CE_RING_CE2_DST	83u
 +#define SY_CE_RING_CE2_ST	102u
++#define SY_CE_RING_CE5_DST	86u		/* 81+5, hal.h CE5_DST */
++#define SY_CE_RING_CE5_ST	105u		/* 100+5, hal.h CE5_DST_STATUS */
 +#define SY_CE_RING_CE7_DST	88u		/* 81+7, same enum as CE1_DST 82 */
 +#define SY_CE_RING_CE7_ST	107u		/* 100+7, same enum as CE1_ST 101 */
 +
@@ -27835,7 +27943,7 @@
 +};
 +
 +static struct sy_ce_ring sy_ce_ce0_src = {
-+	0, 0, 16, 16, SY_CE_OFF_CE0_SRC, 0, 0x01b80000UL, 0x01b80400UL,
++	0, 0, 32, 16, SY_CE_OFF_CE0_SRC, 0, 0x01b80000UL, 0x01b80400UL,
 +	SY_CE_RING_CE0_SRC, SY_CE_SHADOW_SLOT(27), 0, 0
 +};
 +static struct sy_ce_ring sy_ce_ce3_src = {
@@ -27863,6 +27971,16 @@
 +	4, 0, SY_CE4_N, 16, SY_CE_OFF_CE4_SRC, 0, 0x01b88000UL, 0x01b88400UL,
 +	68, SY_CE_SHADOW_SLOT(33), 0, 0
 +};
++/* CE5 dst/status. Shadow index 34 is 0x01b8b400, so R0 is 0x01b8b000.
++ * Status R0 is +0x58 and status HP is +0x408. Index 35 is that HP+4. */
++static struct sy_ce_ring sy_ce_ce5_dst = {
++	5, 1, SY_CE5_N, 8, SY_CE_OFF_CE5_DST, SY_CE_OFF_CE5_BUF, 0x01b8b000UL,
++	0x01b8b400UL, SY_CE_RING_CE5_DST, SY_CE_SHADOW_SLOT(34), 0, 0
++};
++static struct sy_ce_ring sy_ce_ce5_st = {
++	5, 2, SY_CE5_N, 16, SY_CE_OFF_CE5_ST, 0, 0x01b8b058UL, 0x01b8b408UL,
++	SY_CE_RING_CE5_ST, SY_CE_SHADOW_SLOT(35), 0, 0
++};
 +/* CE7 dst/status.  Shadow index 36 is 0x01b8f400, so the R0 block is
 + * 0x01b8f400-0x400 = 0x01b8f000.  Status R0 is +0x58, status HP is +0x408,
 + * and index 37 is that HP+4. */
@@ -27885,9 +28003,8 @@
 +static vm_offset_t sy_ce_win;		/* BAR0+0x80000, length 0x80000 */
 +static uint32_t sy_ce_win_off = 0x00000278u;
 +static uint32_t sy_ce_win_cur = 0xffffffffu;
-+static uint32_t sy_ce_tx_ctrl_idx;	/* round robin over the two CE0 TX buffers */
 +static uint32_t sy_ce_tx_wmi_idx;	/* round robin over the two CE3 TX buffers */
-+static uint32_t sy_ce_tx_htt_idx;
++static uint32_t sy_ce_tx_htt_idx;	/* two CE4 slots: HTC control and HTT */
 +
 +/* HTC/WMI state (the endpoint ids are assigned by firmware, htc.c:658-679) */
 +static unsigned sy_htc_ready;		/* HTC READY control message seen */
@@ -27899,6 +28016,8 @@
 +static unsigned sy_htc_wmi_max_msg;
 +static uint32_t sy_htc_htt_eid = 0xffffffffu;
 +static unsigned sy_htc_htt_ok;
++static uint32_t sy_htc_lpass_eid = 0xffffffffu;
++static unsigned sy_htc_lpass_ok;
 +static unsigned sy_wmi_svc_base;	/* WMI_SERVICE_READY seen */
 +static unsigned sy_wmi_svc_ext;		/* WMI_SERVICE_READY_EXT seen */
 +static unsigned sy_wmi_service_ready;	/* EXT2 seen: WMI_INIT is allowed */
@@ -27908,31 +28027,32 @@
 +static uint8_t sy_wmi_mac[6];
 +static uint32_t sy_wmi_abi[6];
 +
-+/* QMI WLAN_CFG target rows from qca_cld3_peach_v2.ko.  Device 0x110e takes
-+ * target type 0x25 (hif_get_device_type text 0x1438c) and the kiwi table at
-+ * .data 0x3da8.  CE2/CE3 nbytes_max are 3520 and CE5 nentries is 0.  CE7 is
-+ * the kiwi IN row.  The host programs that pipe below. */
++/* QMI WLAN_CFG from target_ce_config_wlan_kiwi_direct_link (.data 0x3cd0).
++ * hif_ce_prepare_config selects it when pld_is_direct_link_supported is 1.
++ * CE0 target nentries is 8. The host src ring is 32. Those two differ. */
 +static const uint32_t sy_ce_tgt_cfg[9][5] = {
-+	{ 0, 2, 32, 2048, 0 },		/* CE0 OUT HTC control/raw */
++	{ 0, 2, 8, 2048, 0 },		/* CE0 OUT, direct_link target nentries 8 */
 +	{ 1, 1, 32, 2048, 0 },		/* CE1 IN  HTT + HTC control */
 +	{ 2, 1, 32, 3520, 0 },		/* CE2 IN  WMI */
 +	{ 3, 2, 32, 3520, 0 },		/* CE3 OUT WMI */
-+	{ 4, 2, 256, 256, 8 },		/* CE4 OUT HTT, CE_ATTR_DIS_INTR */
-+	{ 5, 1, 0, 2048, 0 },		/* CE5 IN  pktlog, kiwi nentries 0 */
++	{ 4, 2, 256, 256, 8 },		/* CE4 OUT HTT and HTC control */
++	{ 5, 1, 16, 256, 0 },		/* CE5 IN, direct_link nentries 16 nbytes 256 */
 +	{ 6, 3, 32, 16384, 0 },		/* CE6 INOUT hif_memcpy */
 +	{ 7, 1, 32, 2048, 0 },	/* CE7 IN diag, kiwi target_ce_config_wlan_kiwi */
 +	{ 8, 3, 32, 16384, 0 },		/* CE8 INOUT IPA */
 +};
 +
-+static const uint32_t sy_ce_svc_cfg[16][3] = {
++static const uint32_t sy_ce_svc_cfg[18][3] = {
 +	{ 0x0104, 2, 3 }, { 0x0104, 1, 2 },	/* WMI_DATA_VO */
 +	{ 0x0102, 2, 3 }, { 0x0102, 1, 2 },	/* WMI_DATA_BK */
 +	{ 0x0101, 2, 3 }, { 0x0101, 1, 2 },	/* WMI_DATA_BE */
 +	{ 0x0103, 2, 3 }, { 0x0103, 1, 2 },	/* WMI_DATA_VI */
 +	{ 0x0100, 2, 3 }, { 0x0100, 1, 2 },	/* WMI_CONTROL */
-+	{ 0x0001, 2, 0 }, { 0x0001, 1, 2 },	/* RSVD_CTRL (ep0) */
++	{ 0x0001, 2, 4 }, { 0x0001, 1, 2 },	/* RSVD_CTRL OUT is pipe 4 */
 +	{ 0x0300, 2, 4 }, { 0x0300, 1, 1 },	/* HTT_DATA_MSG */
-+	{ 0x0107, 1, 7 }, { 0, 0, 0 },		/* WMI_CONTROL_DIAG, terminator */
++	{ 0x0107, 1, 7 },			/* WMI_CONTROL_DIAG */
++	{ 0x0700, 2, 0 }, { 0x0700, 1, 5 },	/* direct_link service, pipe 0 and 5 */
++	{ 0, 0, 0 },				/* terminator */
 +};
 +
 +/* TLV 0x17 from qmi23_trace.txt.  Count byte 38, payload 153 = 1+38*4.
@@ -28071,6 +28191,23 @@
 +	}
 +	sy_ce_window(dev_off);
 +	sy_wr(sy_ce_win, dev_off & SY_CE_WIN_MASK, val);
++}
++
++/* hal_srng_set_msi_config: address at ring+0x48, (addr bits 39:32 | 0x100)
++ * at +0x4c, data word at +0x50. hal_peach_attach 0x43e65c stores 0x48/0x4c
++ * and 0x43e650 stores 0x50 for both ring directions. The address and data
++ * are this host's MSI capability: sink SY_IOVA_BASE+0x7FE000, data 0. */
++static void
++sy_ring_msi(uint32_t dev)
++{
++	uint32_t addr = (uint32_t)(SY_IOVA_BASE + 0x7FE000u);
++
++	sy_ce_wr(dev + 0x48u, addr);
++	sy_ce_wr(dev + 0x4cu, 0x100u);
++	sy_ce_wr(dev + 0x50u, 0);
++	printf("PANDORA WLAN: MSI dev %#x addr %#x flag %#x data %#x\n",
++	    dev, sy_ce_rd(dev + 0x48u), sy_ce_rd(dev + 0x4cu),
++	    sy_ce_rd(dev + 0x50u));
 +}
 +
 +/* Hardware writes the consumer index of src-direction rings, and the producer
@@ -28221,18 +28358,23 @@
 +	printf("PANDORA WLAN: CE7: %u of %u x %u B at iova %#x\n",
 +	    SY_CE7_POST, SY_CE7_N, SY_CE7_BUF_SZ,
 +	    (unsigned)(SY_CE_IOVA + SY_CE_OFF_CE7_BUF));
++	printf("PANDORA WLAN: CE5: %u of %u x %u B at iova %#x\n",
++	    SY_CE5_POST, SY_CE5_N, SY_CE5_BUF_SZ,
++	    (unsigned)(SY_CE_IOVA + SY_CE_OFF_CE5_BUF));
 +	sy_log_sync();
 +	if (sy_ce2_buf_map())
 +		return 1;
 +	return 0;
 +}
 +
-+/* CE2 host max length is 3520. CE1 and the CE0/CE3 TX slots stay 2048. */
++/* CE2 host max length is 3520. CE5 is 256. CE1 and CE3 TX stay 2048. */
 +static uint32_t
 +sy_ce_buf_sz(const struct sy_ce_ring *r)
 +{
 +	if (r->ce == 2u && r->kind == 1u)
 +		return SY_CE2_BUF_SZ;
++	if (r->ce == 5u && r->kind == 1u)
++		return SY_CE5_BUF_SZ;
 +	return SY_CE_BUF_SZ;
 +}
 +
@@ -28287,6 +28429,7 @@
 +	/* MISC enables the ring. Src 0x42 = bit 1 | bit 6. Dst and status 0x40. */
 +	v = (r->kind == 0) ? 0x42u : 0x40u;
 +	sy_ce_wr(r->dev + 0x10u, v);
++	sy_ring_msi(r->dev);
 +	/* peach hal_srng_setup_idx, ring type 9: R0+0xb0 low 16 is dest max length.
 +	 * 4358ec then, when srng+0x38 != 0, R0+0x40 low 3 bits |= that word.
 +	 * ce_ring_setup_srng 436d90 stores 1. ath12k v66 has no +0x40. */
@@ -28578,6 +28721,9 @@
 +			if (svc == 0x0300u) {
 +				sy_htc_htt_eid = eid_asg;
 +				sy_htc_htt_ok = (status == 0u);
++			} else if (svc == 0x0700u) {
++				sy_htc_lpass_eid = eid_asg;
++				sy_htc_lpass_ok = (status == 0u);
 +			} else {
 +				sy_htc_wmi_eid = eid_asg;
 +				sy_htc_wmi_max_msg = max_msg;
@@ -28613,8 +28759,9 @@
 +		printf("PANDORA WLAN: HTC tx: payload %u too long\n", len);
 +		return -1;
 +	}
-+	/* HTT has credit flow disabled and a 256-byte CE4 (htc.c:602-607, ce.c:180-186). */
-+	if (eid == sy_htc_htt_eid) {
++	/* direct_link puts RSVD_CTRL OUT and HTT OUT on pipe 4. The two
++	 * 256-byte slots are shared (host_ce_config_wlan_kiwi_direct_link). */
++	if (eid == 0 || eid == sy_htc_htt_eid) {
 +		uint32_t hoff = SY_CE_OFF_CE4_TX + (sy_ce_tx_htt_idx & 1u) * SY_CE4_TX_SZ;
 +
 +		if (8u + len > SY_CE4_TX_SZ)
@@ -28637,16 +28784,9 @@
 +		printf("PANDORA WLAN: HTC tx: eid %u %u B on CE4\n", eid, 8u + len);
 +		return 0;
 +	}
-+	if (eid == 0) {
-+		r = (void *)&sy_ce_ce0_src;
-+		ce = 0;
-+		idxp = &sy_ce_tx_ctrl_idx;
-+		off = SY_CE_OFF_CE0_TX;
-+	} else {
-+		r = (void *)&sy_ce_ce3_src;
-+		idxp = &sy_ce_tx_wmi_idx;
-+		off = SY_CE_OFF_CE3_TX;
-+	}
++	r = (void *)&sy_ce_ce3_src;
++	idxp = &sy_ce_tx_wmi_idx;
++	off = SY_CE_OFF_CE3_TX;
 +	/* credit accounting of htc.c:90-93: frame bytes / target credit size */
 +	if (eid != 0 && sy_htc_credit_size) {
 +		need = (8u + len + sy_htc_credit_size - 1u) / sy_htc_credit_size;
@@ -28721,7 +28861,10 @@
 +		dst->seq++;
 +		st->idx = (st->idx + dw) % (dw * st->entries);
 +		sy_ce_tp_wr(st, st->idx);	/* real R2 TP */
-+		if (len && len <= sz)
++		if (dst->ce == 5u) {
++			if (len && len <= sz && dst->seq <= 4u)
++				printf("PANDORA WLAN: CE5 rx %u B\n", len);
++		} else if (len && len <= sz)
 +			sy_htc_rx((const uint8_t *)((dst->ce == 2u)
 +			    ? (sy_ce2_wc + buf) : (sy_ce_wc + buf)), len);
 +		else
@@ -28736,6 +28879,7 @@
 +{
 +	sy_ce_poll(&sy_ce_ce1_st, &sy_ce_ce1_dst);
 +	sy_ce_poll(&sy_ce_ce2_st, &sy_ce_ce2_dst);
++	sy_ce_poll(&sy_ce_ce5_st, &sy_ce_ce5_dst);
 +}
 +
 +/* Pump the MHI event rings while D1 waits for QMI responses: the WLFW receive
@@ -28750,6 +28894,21 @@
 +	sy_mhi_ev_walk(0, &shown);
 +	sy_mhi_ev_walk(1, &shown);
 +	sy_wlfw_pump();
++}
++
++/* QMI_WLFW_SUBSYS_RESTART_LEVEL_REQ 0x55. TLV 0x10 is one byte,
++ * restart_level_type (wlan_firmware_service_v01.c:7249-7268).
++ * init writes the recovery node before FW ready; the send is after
++ * FW init done. Both passes logged status 1 and req 55 success
++ * (ipc_cnss.log:280-281 and :460-461). TLV is 4 bytes, frame is 11. */
++static unsigned
++sy_wlfw_restart_level(uint8_t *b, uint16_t txn)
++{
++	unsigned at = sy_qmi_hdr(b, 0x00, txn,
++	    SY_QMI_WLFW_SUBSYS_RESTART_LEVEL_REQ);
++
++	at = sy_qmi_tlv_u8(b, at, 0x10, 1);
++	return sy_qmi_finish(b, at);
 +}
 +
 +/* QMI_WLFW_MAC_ADDR_REQ 0x33. TLV 0x10 is the 6-byte address
@@ -28808,10 +28967,10 @@
 +			b[at++] = (uint8_t)(v >> 24);
 +		}
 +	}
-+	/* TLV 0x12 svc_cfg: u8 count + 16 x 3 little-endian u32 */
-+	at = sy_qmi_tlv_hdr(b, at, 0x12, (uint16_t)(1u + 16u * 12u));
-+	b[at++] = 16;
-+	for (i = 0; i < 16u; i++) {
++	/* TLV 0x12 svc_cfg: u8 count + 18 x 3 little-endian u32 */
++	at = sy_qmi_tlv_hdr(b, at, 0x12, (uint16_t)(1u + 18u * 12u));
++	b[at++] = 18;
++	for (i = 0; i < 18u; i++) {
 +		for (k = 0; k < 3u; k++) {
 +			uint32_t v = sy_ce_svc_cfg[i][k];
 +
@@ -28840,15 +28999,28 @@
 +	return sy_qmi_finish(b, at);
 +}
 +
-+/* QMI_WLANFW_WLAN_MODE_REQ (qmi.c:2576-2620): only TLV 0x01, mode 0 = NORMAL. */
++/* QMI_WLANFW_WLAN_MODE_REQ. Mode 0 also sends TLV 0x14 and 0x15
++ * (platform_cnss2_qmi.c:2379-2383), only when the mode is MISSION.
++ * on_time is mach absolute time in microseconds. off_time is 0 because
++ * this boot sends mode 7, then 4, then 0, and cnss records off_time only
++ * when leaving MISSION (platform_cnss2_main.c:1039). */
 +static unsigned
 +sy_wlfw_wlan_mode(uint8_t *b, uint16_t txn, uint32_t mode)
 +{
 +	unsigned at = sy_qmi_hdr(b, 0x00, txn, SY_QMI_WLFW_WLAN_MODE_REQ);
++	uint64_t ns;
 +
 +	at = sy_qmi_tlv_u32(b, at, 0x01, mode);
-+	/* qmi.c:2603-2604 always sends optional TLV 0x10, value 0 (qmi.c:1693-1700) */
++	/* hw_debug, TLV 0x10, is sent on every mode with value 0. */
 +	at = sy_qmi_tlv_u8(b, at, 0x10, 0);
++	if (mode == SY_WLFW_FW_MODE_NORMAL) {
++		ns = 0;
++		absolutetime_to_nanoseconds(mach_absolute_time(), &ns);
++		at = sy_qmi_tlv_u64(b, at, 0x14, ns / 1000ull);
++		at = sy_qmi_tlv_u64(b, at, 0x15, 0);
++		printf("PANDORA WLAN: D1: mode 0 on_time %llx us off_time 0\n",
++		    (unsigned long long)(ns / 1000ull));
++	}
 +	return sy_qmi_finish(b, at);
 +}
 +
@@ -29299,6 +29471,133 @@
 +	sy_log_sync();
 +}
 +
++/* HTC connect for service 0x700. dp_direct_link_init stores 0x800700
++ * at the request start and calls htc_connect_service. The handler
++ * reads the low half with ldrh, so the service id is 0x700 and the
++ * flags half is 0x8. The on-wire word is the same shape as HTT:
++ * message 2, service in the high half, flags in the low byte.
++ * htc_get_credit_allocation returns 0 when the service is not in its
++ * table, so the credit byte stays 0. The two callbacks only print. */
++static void
++sy_htc_lpass_connect(void)
++{
++	uint32_t w[2];
++	unsigned i;
++
++	w[0] = SY_HTC_MSG_CONNECT | (0x0700u << 16);
++	w[1] = 0x8u;
++	sy_htc_lpass_ok = 0;
++	if (sy_htc_send(0, w, 8u))
++		return;
++	printf("PANDORA WLAN: HTC connect LPASS 0x700 sent\n");
++	sy_log_sync();
++	for (i = 0; i < 100u && !sy_htc_lpass_ok; i++) {
++		sy_ce_pump();
++		sy_usleep(10000);
++	}
++	printf("PANDORA WLAN: HTC connect LPASS %s eid %u\n",
++	    sy_htc_lpass_ok ? "ok" : "no response", sy_htc_lpass_eid);
++	sy_log_sync();
++}
++
++/* Host us minus device us. pci.c:3200 reads PCIE_MHI_TIME at 0xA28/0xA2C
++ * on peach, divides ticks by (time_freq_hz/100000), then multiplies by 10
++ * (pci.c:3209-3211). time_freq_hz is cap TLV 0x17. Peach returns before
++ * writing the counter enable (pci.c:3221). The two registers are the next
++ * shadow slots after the count this host sent: 0x8fc + n*4 (pci.c:3264). */
++static void
++sy_host_time_sync(void)
++{
++	uint32_t freq = sy_wlfw_time_freq;
++	uint32_t lo, hi, reg;
++	uint64_t ticks, div, host_ns, host_us, dev_us, off;
++	unsigned n;
++
++	if (freq < 100000u) {
++		printf("PANDORA WLAN: time sync skipped, freq %u\n", freq);
++		return;
++	}
++	lo = sy_ce_rd(0xA28u);
++	hi = sy_ce_rd(0xA2Cu);
++	ticks = ((uint64_t)hi << 32) | lo;
++	div = (uint64_t)freq / 100000u;
++	ticks /= div;
++	dev_us = ticks * 10ull;
++	host_ns = 0;
++	absolutetime_to_nanoseconds(mach_absolute_time(), &host_ns);
++	host_us = host_ns / 1000ull;
++	if (host_us < dev_us) {
++		printf("PANDORA WLAN: time sync host %llu us < device %llu us\n",
++		    (unsigned long long)host_us, (unsigned long long)dev_us);
++		return;
++	}
++	off = host_us - dev_us;
++	n = (unsigned)(sizeof(sy_ce_shadow_addr) / sizeof(sy_ce_shadow_addr[0]));
++	reg = 0x8fcu + n * 4u;
++	sy_ce_wr(reg, (uint32_t)off);
++	sy_ce_wr(reg + 4u, (uint32_t)(off >> 32));
++	printf("PANDORA WLAN: time sync host %llu us device %llu us offset %llu us [%x]=%x [%x]=%x\n",
++	    (unsigned long long)host_us, (unsigned long long)dev_us,
++	    (unsigned long long)off, reg, sy_ce_rd(reg), reg + 4u,
++	    sy_ce_rd(reg + 4u));
++	sy_log_sync();
++}
++
++/* QMI 0x42. The request is TLV 0x01 seg_id, starting at 0.
++ * total_size and source come from indication 0x41. source 1 is the
++ * trace pull. Stop on end or when the remaining count is 0. */
++static void
++sy_qdss_pull(void)
++{
++	uint8_t qmi[32];
++	unsigned at, i, w, round;
++	uint32_t left, seg;
++
++	for (round = 0; round < 4u; round++) {
++	for (i = 0; i < 50u && !sy_qdss_ind; i++) {
++		sy_d1_pump_mhi();
++		sy_ce_pump();
++		sy_usleep(10000);
++	}
++	if (!sy_qdss_ind || sy_qdss_source != 1u || sy_qdss_total == 0)
++		return;
++	left = sy_qdss_total;
++	sy_qdss_ind = 0;
++	seg = 0;
++	printf("PANDORA WLAN: D1: qdss pull total %u\n", left);
++	sy_log_sync();
++	while (left && seg < 64u) {
++		at = sy_qmi_hdr(qmi, 0x00, sy_wlfw_txn++, 0x0042);
++		at = sy_qmi_tlv_u32(qmi, at, 0x01, seg);
++		at = sy_qmi_finish(qmi, at);
++		sy_qdss_resp = 0;
++		sy_qdss_end = 0;
++		sy_qdss_dlen = 0;
++		if (sy_d1_qmi_send(0x0042, qmi, at))
++			return;
++		for (w = 0; w < 20u && !sy_qdss_resp; w++) {
++			sy_d1_pump_mhi();
++			sy_ce_pump();
++			sy_usleep(10000);
++		}
++		if (!sy_qdss_resp) {
++			printf("PANDORA WLAN: D1: qdss seg %u no response\n", seg);
++			sy_log_sync();
++			return;
++		}
++		if (sy_qdss_dlen > left)
++			sy_qdss_dlen = left;
++		left -= sy_qdss_dlen;
++		printf("PANDORA WLAN: D1: qdss seg %u data %u left %u end %u\n",
++		    seg, sy_qdss_dlen, left, sy_qdss_end);
++		sy_log_sync();
++		if (sy_qdss_end)
++			break;
++		seg++;
++	}
++	}
++}
++
 +/* Stage 21 entry.  Everything is bounded and every failure only prints; the driver
 + * never panics, the same convention as stages 1-20. */
 +static void
@@ -29333,6 +29632,12 @@
 +		sy_log_sync();
 +		return;
 +	}
++
++	/* 0x55 after every FW init done, before cal report and before MAC.
++	 * ipc_cnss.log:280 then the cal report, and :460 then MAC. */
++	at = sy_wlfw_restart_level(qmi, sy_wlfw_txn++);
++	if (sy_d1_qmi_send(SY_QMI_WLFW_SUBSYS_RESTART_LEVEL_REQ, qmi, at))
++		return;
 +
 +	/* Pass 0 is cold boot calibration. cnss_cold_boot_cal_done_hdlr then
 +	 * sends mode 4, shuts the device down, and the driver load is a second
@@ -29494,6 +29799,8 @@
 +	sy_ce_ring_hw(&sy_ce_ce2_dst);
 +	sy_ce_ring_hw(&sy_ce_ce2_st);
 +	sy_ce_ring_hw(&sy_ce_ce4_src);
++	sy_ce_ring_hw(&sy_ce_ce5_dst);
++	sy_ce_ring_hw(&sy_ce_ce5_st);
 +	sy_ce_ring_hw(&sy_ce_ce7_dst);
 +	sy_ce_ring_hw(&sy_ce_ce7_st);
 +	{
@@ -29515,6 +29822,7 @@
 +	}
 +	sy_ce_post(&sy_ce_ce1_dst);
 +	sy_ce_post(&sy_ce_ce2_dst);
++	sy_ce_post(&sy_ce_ce5_dst);
 +	sy_ce_post(&sy_ce_ce7_dst);
 +	{
 +		uint32_t st = sy_rd(sy_bar_va, 0x48);
@@ -29595,6 +29903,17 @@
 +	if (sy_htc_send(sy_htc_wmi_eid, wmi, at))
 +		return;
 +
++	/* IPA doorbell. ipc_cnss.log:519-524 maps at 15.108523, ready is
++	 * 15.148280. Second iova goes to REO dest index 3 HP address, the
++	 * write in dp_ipa_set_doorbell_paddr after the two maps. Attribute
++	 * is MAIR idx0 NC: this host's PCIe master rejects cacheable. */
++	sy_ce_wr(SY_REO3_HP, (uint32_t)SY_IPA_DB_PROD);
++	sy_ce_wr(SY_REO3_HP_HI, 0);
++	printf("PANDORA WLAN: D1: IPA db cons %#x prod %#x reo hp %#x\n",
++	    (unsigned)SY_IPA_DB_CONS, (unsigned)SY_IPA_DB_PROD,
++	    sy_ce_rd(SY_REO3_HP));
++	sy_log_sync();
++
 +	/* 9. WMI_READY (wmi.c:518-525, 5568-5582) */
 +	sy_snoc_sample(0);
 +	for (i = 0; i < 500u && !sy_wmi_ready; i++) {
@@ -29613,6 +29932,11 @@
 +	} else {
 +		printf("PANDORA WLAN: D1: WMI READY did not arrive (5 s)\n");
 +		sy_wmi_ready_hwdiag();
++	}
++	if (sy_wmi_ready) {
++		sy_host_time_sync();
++		sy_htc_lpass_connect();
++		sy_qdss_pull();
 +	}
 +	sy_log_sync();
 +}
@@ -31040,6 +31364,23 @@
 +#define SY_E_OFF_RXHP		0x0001c200u
 +#define SY_E_OFF_TXBUF		0x0001d000u
 +#define SY_E_OFF_RXBUF		0x00020000u
++/* TX monitor ring. Phone log android_dmesg.txt:2361 printed 4096.
++ * Entry is 16 B (peach table type 24, u16 at +6 is 4, <<2). htt id 9,
++ * top byte 1, pdev 1 when dp_pdev_lmac_ring stays 0 (add w25,w23,#1).
++ * dword3 bit 25 is w27. R0/R2 of this ring type are 0: HTT carries it. */
++#define SY_E_OFF_TXMON		0x00030000u
++#define SY_E_OFF_TXMON_HP	0x00040000u
++#define SY_E_TXMON_N		4096u
++#define SY_E_TXMON_SZ		16u
++#define SY_E_TXMON_D0		0x0109010bu
++#define SY_E_TXMON_D3		0x02044000u
++_Static_assert(SY_E_OFF_RXBUF + 32u * 2048u == SY_E_OFF_TXMON, "txmon after rx");
++_Static_assert(SY_E_OFF_TXMON + SY_E_TXMON_N * SY_E_TXMON_SZ == SY_E_OFF_TXMON_HP, "txmon end");
++_Static_assert(SY_E_OFF_TXMON_HP + 8u <= 0x00200000u, "txmon in ce window");
++_Static_assert(SY_E_TXMON_N >= 16u && SY_E_TXMON_N <= 8192u, "txmon range");
++_Static_assert(SY_E_TXMON_D0 == (0x0bu | (1u << 8) | (9u << 16) | (1u << 24)), "txmon d0");
++_Static_assert(SY_E_TXMON_D3 == ((4096u * 4u) | (4u << 16) | 0x02000000u), "txmon d3");
++_Static_assert(SY_IOVA_BASE + 0x7FE000u == 0xafffe000ul, "msi sink");
 +#define SY_E_HTT_SRING		0x0bu	/* dp.h HTT_H2T_MSG_TYPE_SRING_SETUP */
 +#define SY_E_SW_TO_SW		2u	/* dp.h HTT_SW_TO_SW_RING; ko stores 2<<24 */
 +#define SY_E_HOST1_RXBUF	5u	/* dp.h HTT_HOST1_TO_FW_RXBUF_RING */
@@ -31092,6 +31433,7 @@
 +	sy_ce_wr(dev_r2, 0);
 +	sy_ce_wr(dev_r2 + 4u, 0);
 +	sy_ce_wr(dev + 0x10u, v);
++	sy_ring_msi(dev);
 +	printf("PANDORA WLAN: E: ring id %u %s %u x %u at %#x, base read %#x misc %#x\n",
 +	    ring_id, dst ? "dst" : "src", entries, desc_sz, (unsigned)base,
 +	    sy_ce_rd(dev), sy_ce_rd(dev + 0x10u));
@@ -31223,6 +31565,37 @@
 +	for (i = 0; i < 100u; i++) {
 +		sy_ce_pump();
 +		sy_usleep(10000);
++	}
++	{
++		uint32_t tm[13];
++		uint64_t base = SY_CE_IOVA + SY_E_OFF_TXMON;
++		uint64_t hp = SY_CE_IOVA + SY_E_OFF_TXMON_HP;
++		uint64_t tp = hp + 4u;
++
++		memset((void *)(sy_ce_va + SY_E_OFF_TXMON), 0,
++		    SY_E_TXMON_N * SY_E_TXMON_SZ);
++		memset((void *)(sy_ce_va + SY_E_OFF_TXMON_HP), 0, 8);
++		flush_dcache64(sy_pa(sy_ce_va + SY_E_OFF_TXMON),
++		    SY_E_TXMON_N * SY_E_TXMON_SZ, TRUE);
++		flush_dcache64(sy_pa(sy_ce_va + SY_E_OFF_TXMON_HP), 8, TRUE);
++		__asm__ volatile("dsb sy" ::: "memory");
++		memset(tm, 0, sizeof(tm));
++		tm[0] = SY_E_TXMON_D0;
++		tm[1] = (uint32_t)base;
++		tm[2] = (uint32_t)(base >> 32);
++		tm[3] = SY_E_TXMON_D3;
++		tm[4] = (uint32_t)hp;
++		tm[5] = (uint32_t)(hp >> 32);
++		tm[6] = (uint32_t)tp;
++		tm[7] = (uint32_t)(tp >> 32);
++		if (sy_htc_send(sy_htc_htt_eid, tm, sizeof(tm))) {
++			printf("PANDORA WLAN: E: TXMON send failed\n");
++			sy_log_sync();
++			return;
++		}
++		printf("PANDORA WLAN: E: TXMON htt 9 entries %u dword0 %#x dword3 %#x\n",
++		    SY_E_TXMON_N, tm[0], tm[3]);
++		sy_log_sync();
 +	}
 +	(void)sy_e_tx(NULL, 0);
 +	printf("PANDORA WLAN: E DONE tcl %u reo %u wbm %u idle hp %#x rx hp %#x "
