@@ -29957,7 +29957,7 @@
 +		sy_wmi_ready_hwdiag();
 +	}
 +	if (sy_wmi_ready) {
-+		sy_host_time_sync();
++		printf("PANDORA WLAN: host time sync not called\n");
 +		printf("PANDORA WLAN: HTC connect LPASS skipped\n");
 +		sy_qdss_pull();
 +	}
