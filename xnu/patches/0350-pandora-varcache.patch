@@ -29958,7 +29958,7 @@
 +	}
 +	if (sy_wmi_ready) {
 +		sy_host_time_sync();
-+		sy_htc_lpass_connect();
++		printf("PANDORA WLAN: HTC connect LPASS skipped\n");
 +		sy_qdss_pull();
 +	}
 +	sy_log_sync();
