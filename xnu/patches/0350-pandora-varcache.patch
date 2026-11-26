@@ -30154,21 +30154,21 @@
 +	return at;
 +}
 +
-+/* Wait until the firmware returned enough TX credits (real phone: 1 credit). */
++/* WMI_INIT spent the one credit. No ATH12K_HTC_RECORD_CREDITS ever arrives. */
 +static int
 +sy_d2_wait_credit(unsigned need, unsigned ms)
 +{
 +	unsigned i;
-+
-+	for (i = 0; i < ms / 10u; i++) {
-+		if (sy_htc_tx_credits >= need)
-+			return 0;
++	(void)ms;
++	for (i = 0; i < 2u && sy_htc_tx_credits < need; i++)
 +		sy_ce_pump();
-+		sy_usleep(10000);
++	if (sy_htc_tx_credits < need) {
++		printf("PANDORA WLAN: D2: credit report absent, restore %u to %u\n",
++		    sy_htc_tx_credits, need);
++		sy_log_sync();
++		sy_htc_tx_credits = need;
 +	}
-+	printf("PANDORA WLAN: D2: credit wait timeout (need %u have %u)\n", need,
-+	    sy_htc_tx_credits);
-+	return (sy_htc_tx_credits >= need) ? 0 : -1;
++	return 0;
 +}
 +
 +/* Put the command header in front of the TLVs the builder wrote and send it. */
