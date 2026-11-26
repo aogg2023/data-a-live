@@ -820,7 +820,7 @@
  }
  
  static void
-@@ -51,21 +834,31507 @@
+@@ -51,21 +834,31520 @@
  		cv_sleep(100);
  	}
  	if (rootvnode == NULLVP) {
@@ -28180,6 +28180,19 @@
 +	printf("PANDORA WLAN: SNOC sample %u ms:"
 +	    " %#x %#x %#x %#x %#x %#x %#x %#x %#x\n",
 +	    ms, s[0], s[1], s[2], s[3], s[4], s[5], s[6], s[7], s[8]);
++	/* 14e5758 sets r2 to 0xe3989e28. Host alias is 0x01e89e28,
++	 * inside the 0x01e80000 window of 0xa000. Offsets are the
++	 * ones copied at 14e56f0-14e5774: +0 +4 +0x18 +0x20 +0x28
++	 * +0x30 +0x38 +0x40 +0x48 +0x50 +0x58. */
++	printf("PANDORA WLAN: SNOC logger %u ms:"
++	    " %#x %#x %#x %#x %#x %#x %#x %#x %#x %#x %#x\n",
++	    ms,
++	    sy_ce_rd(0x01e89e28u), sy_ce_rd(0x01e89e2cu),
++	    sy_ce_rd(0x01e89e40u), sy_ce_rd(0x01e89e48u),
++	    sy_ce_rd(0x01e89e50u), sy_ce_rd(0x01e89e58u),
++	    sy_ce_rd(0x01e89e60u), sy_ce_rd(0x01e89e68u),
++	    sy_ce_rd(0x01e89e70u), sy_ce_rd(0x01e89e78u),
++	    sy_ce_rd(0x01e89e80u));
 +	sy_log_sync();
 +}
 +
