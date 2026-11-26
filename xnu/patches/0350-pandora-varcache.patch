@@ -2488,7 +2488,7 @@
 +	for (i = 0; i < (sy_buf_size >> 12); i++) {
 +		pa = sy_pa(sy_sbl_va + ((vm_offset_t)i << 12));
 +		((uint64_t *)(sy_l3 + ((i >> 9) << 12)))[i & 0x1ff] =
-+		    (pa & 0x0000fffffffff000ull) | 0x0060000000000e43ull;
++		    (pa & 0x0000fffffffff000ull) | 0x0060000000000e47ull;
 +	}
 +	/* Same PTE as the firmware window. The 64 KiB at 0xB0000000 is
 +	 * smmu_iova_ipa. Two PTEs map GSI page 0x03E28000 there. RDDM starts
@@ -2522,7 +2522,7 @@
 +
 +				pa = sy_pa(sy_rddm_va + ((vm_offset_t)r << 12));
 +				((uint64_t *)(sy_l3 + ((idx >> 9) << 12)))[idx & 0x1ff] =
-+				    (pa & 0x0000fffffffff000ull) | 0x0060000000000e43ull;
++				    (pa & 0x0000fffffffff000ull) | 0x0060000000000e47ull;
 +			}
 +			printf("PANDORA WLAN: RDDM: iova %#x size %#x vec %#x pages %u\n",
 +			    (unsigned)SY_RDDM_IOVA, SY_RDDM_SIZE, SY_RDDM_VECB,
@@ -2683,10 +2683,10 @@
 +	printf("PANDORA WLAN: SMMU install: cfg start ttbr %#llx (lemonade-exact CB image)\n",
 +	    (unsigned long long)ttbr);
 +	sy_log_sync();
-+	/* Values copied from the locally proven WCN7850/QCA6490 port
-+	 * (ref/hackios-xnu-kernel bsd/dev/lemonade_wifi.c): Normal non-cacheable
-+	 * MAIR index0, outer-shareable, SCTLR 0x1127. The PCIe master rejects
-+	 * cacheable transactions, and the earlier WB mapping was never proven. */
++	/* MAIR index0 is Normal non-cacheable (0x44). Index1 is write-back (0xff).
++	 * Firmware RAM leaves use index1, low 12 bits 0xe47, matching this card
++	 * on Android. The GSI doorbell page stays index0.
++	 * SCTLR stays 0x1127. */
 +	sy_wr(cbp, 0x00, 0);                                  /* SCTLR.M=0 while configuring */
 +	sy_wr(gr1, 0x800 + 4 * cb, 1);                        /* CBA2R: VA64 */
 +	sy_wr(gr1, 4 * cb, 0x1f300);                          /* CBAR: S1 trans/S2 bypass */
@@ -4830,7 +4830,7 @@
 +		}
 +		prev = pa;
 +		((uint64_t *)(sy_mem_l3 + (((vm_offset_t)i >> 9) << 12)))[i & 0x1ff] =
-+		    (pa & 0x0000fffffffff000ull) | 0x0060000000000e43ull;
++		    (pa & 0x0000fffffffff000ull) | 0x0060000000000e47ull;
 +	}
 +	for (i = 0; i < 16; i++)
 +		flush_dcache64(sy_pa(sy_mem_l3 + ((vm_offset_t)i << 12)),
@@ -4854,7 +4854,7 @@
 +	}
 +	printf("PANDORA WLAN: MEM: %u MiB at iova %#x pte %#llx (va %#lx l2 %#lx l3 %#lx)\n",
 +	    SY_MEM_SIZE >> 20, (unsigned)SY_MEM_IOVA,
-+	    (unsigned long long)0x0060000000000e43ull, (unsigned long)sy_mem_va,
++	    (unsigned long long)0x0060000000000e47ull, (unsigned long)sy_mem_va,
 +	    (unsigned long)sy_mem_l2, (unsigned long)sy_mem_l3);
 +	printf("PANDORA WLAN: MEM: phys gaps %u first %#llx %#llx\n",
 +	    gaps, (unsigned long long)gap_a, (unsigned long long)gap_b);
@@ -28246,7 +28246,7 @@
 +	for (i = 0; i < (SY_CE2_BUF_MAP >> 12); i++) {
 +		pa = sy_pa(sy_ce2_va + ((vm_offset_t)i << 12));
 +		((uint64_t *)sy_ce2_l3)[i] =
-+		    (pa & 0x0000fffffffff000ull) | 0x0060000000000e43ull;
++		    (pa & 0x0000fffffffff000ull) | 0x0060000000000e47ull;
 +	}
 +	flush_dcache64(sy_pa(sy_ce2_l3), (unsigned)PAGE_SIZE, TRUE);
 +	flush_dcache64(sy_pa(sy_mem_l2), (unsigned)PAGE_SIZE, TRUE);
@@ -28333,7 +28333,7 @@
 +	for (i = 0; i < (SY_CE_SIZE >> 12); i++) {
 +		pa = sy_pa(sy_ce_va + ((vm_offset_t)i << 12));
 +		((uint64_t *)sy_ce_l3)[i & 511] =
-+		    (pa & 0x0000fffffffff000ull) | 0x0060000000000e43ull;
++		    (pa & 0x0000fffffffff000ull) | 0x0060000000000e47ull;
 +	}
 +	flush_dcache64(sy_pa(sy_ce_l3), (unsigned)PAGE_SIZE, TRUE);
 +	flush_dcache64(sy_pa(sy_mem_l2), (unsigned)PAGE_SIZE, TRUE);
