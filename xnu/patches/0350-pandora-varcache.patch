@@ -820,7 +820,7 @@
  }
  
  static void
-@@ -51,21 +834,31529 @@
+@@ -51,21 +834,31552 @@
  		cv_sleep(100);
  	}
  	if (rootvnode == NULLVP) {
@@ -29713,7 +29713,12 @@
 +
 +	printf("PANDORA WLAN: D1: mission WLFW pass\n");
 +	sy_log_sync();
-+	/* 2. MAC, INI (fw_log_mode 1), WLAN_CFG, then WLAN_MODE normal */
++	/* 2. MAC, INI, then mode 7 and mode 4, then WLAN_CFG, then mode 0.
++	 * 0x154ba3c is BSS 0. 0x193e998(0) returns 0, so the first mode 0
++	 * takes 0x193efe8 and never calls 0x193e12c. Mode 7 maps to 7.
++	 * After 0x38, 0x154be80 is 0x0b, which 0x193ee38 requires. Mode 4
++	 * accepts the 0x0e that mode 7 stores, and 0x193f188 writes 0x0c
++	 * when memb(0x154b9d0) is 0, so CFG can move that to 0x0d. */
 +	at = sy_wlfw_mac(qmi, sy_wlfw_txn++);
 +	if (sy_d1_qmi_send(SY_QMI_WLFW_MAC_ADDR_REQ, qmi, at))
 +		return;
@@ -29728,6 +29733,24 @@
 +		sy_d1_pump_mhi();
 +		sy_usleep(10000);
 +	}
++	at = sy_wlfw_wlan_mode(qmi, sy_wlfw_txn++, SY_WLFW_FW_MODE_CALIBRATION);
++	if (sy_d1_qmi_send(SY_QMI_WLFW_WLAN_MODE_REQ, qmi, at))
++		return;
++	printf("PANDORA WLAN: D1: mission mode 7 before cfg\n");
++	sy_log_sync();
++	for (i = 0; i < 50u; i++) {
++		sy_d1_pump_mhi();
++		sy_usleep(10000);
++	}
++	at = sy_wlfw_wlan_mode(qmi, sy_wlfw_txn++, SY_WLFW_FW_MODE_OFF);
++	if (sy_d1_qmi_send(SY_QMI_WLFW_WLAN_MODE_REQ, qmi, at))
++		return;
++	printf("PANDORA WLAN: D1: mission mode 4 before cfg\n");
++	sy_log_sync();
++	for (i = 0; i < 50u; i++) {
++		sy_d1_pump_mhi();
++		sy_usleep(10000);
++	}
 +	at = sy_wlfw_wlan_cfg(qmi, sy_wlfw_txn++);
 +	if (sy_d1_qmi_send(SY_QMI_WLFW_WLAN_CFG_REQ, qmi, at))
 +		return;
@@ -29737,7 +29760,7 @@
 +	}
 +
 +	/* songyuan_lpm: A/B control variable for the LPM/RRI init sequence.
-+	 * 0 (default) = current single mission-mode path, no change at all.
++	 * 0 (default) = mode 7 then mode 4 already ran before CFG; this block stays off.
 +	 * 1 = replay the calibration lifecycle inside this enumeration before
 +	 *     mission: CAL_REPORT(0) -> mode 7 -> wait 0x3E -> mode 4 -> mode 0.
 +	 *     The phone does this before mission and finishes LPM/RRI init.
