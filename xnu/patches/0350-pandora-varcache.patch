@@ -3621,9 +3621,9 @@
 +	}
 +	/* 0x190ecac is call 0x1f65138. k117 RDDM said Asserted in:0x190ecb0
 +	 * line 770, and that call does not return, so mode 7 becomes MHI SYS_ERR.
-+	 * amss20.bin in this pack is the ELF. The instruction is file offset 0x1c6cac. */
++	 * amss20.bin starts with an ARM ELF. The instruction is file offset 0x246cac. */
 +	{
-+		uint8_t *ap = (uint8_t *)(sy_sbl_va + 0x1c6cac);
++		uint8_t *ap = (uint8_t *)(sy_sbl_va + 0x246cac);
 +
 +		printf("PANDORA WLAN: BHIe: assert site %02x %02x %02x %02x\n",
 +		    ap[0], ap[1], ap[2], ap[3]);
