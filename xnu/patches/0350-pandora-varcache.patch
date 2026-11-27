@@ -820,7 +820,7 @@
  }
  
  static void
-@@ -51,21 +834,31553 @@
+@@ -51,21 +834,31567 @@
  		cv_sleep(100);
  	}
  	if (rootvnode == NULLVP) {
@@ -3618,6 +3618,20 @@
 +	    (vm_size_t)(fs - SY_SBL_SIZE))) {
 +		printf("PANDORA WLAN: BHIe: image read failed\n");
 +		return;
++	}
++	/* 0x190ecac is call 0x1f65138. k117 RDDM said Asserted in:0x190ecb0
++	 * line 770, and that call does not return, so mode 7 becomes MHI SYS_ERR.
++	 * amss20.bin in this pack is the ELF. The instruction is file offset 0x1c6cac. */
++	{
++		uint8_t *ap = (uint8_t *)(sy_sbl_va + 0x1c6cac);
++
++		printf("PANDORA WLAN: BHIe: assert site %02x %02x %02x %02x\n",
++		    ap[0], ap[1], ap[2], ap[3]);
++		if (ap[0] == 0x46 && ap[1] == 0xf2 && ap[2] == 0xca && ap[3] == 0x5a) {
++			ap[0] = 0x00; ap[1] = 0xc0; ap[2] = 0x00; ap[3] = 0x7f;
++			printf("PANDORA WLAN: BHIe: nop line 770 assert\n");
++		}
++		sy_log_sync();
 +	}
 +	vec = (uint64_t *)(sy_sbl_va + SY_FW_BUF - 0x1000);
 +	for (i = 0; i + 1 < n; i++) {
