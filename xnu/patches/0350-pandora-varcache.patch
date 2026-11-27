@@ -820,7 +820,7 @@
  }
  
  static void
-@@ -51,21 +834,31552 @@
+@@ -51,21 +834,31553 @@
  		cv_sleep(100);
  	}
  	if (rootvnode == NULLVP) {
@@ -29687,6 +29687,7 @@
 +				printf("PANDORA WLAN: D1: MHI status %#x during calibration at %u ms\n",
 +				    st, i * 10u);
 +				sy_log_sync();
++				sy_wmi_ready_hwdiag();
 +				break;
 +			}
 +			sy_d1_pump_mhi();
