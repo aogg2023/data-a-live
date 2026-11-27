@@ -1082,7 +1082,7 @@
 +static int sy_wlfw_on;
 +static int sy_cbc_mission;
 +static int sy_cbc_suppress_after;
-+static int sy_lpm_var;		/* songyuan_lpm: LPM/RRI init-sequence control variable */
++static int sy_lpm_var = 1;		/* songyuan_lpm: default ON - replay cal lifecycle to finish LPM/RRI init before mission */
 +static int sy_m0_mode;		/* 0 wait for device M0, 1 force at once, 2 force after 500 ms */
 +static int sy_bhie_clear = 1;	/* official ath12k_mhi_clear_vector behaviour */
 +static int sy_erdb_init;	/* parsed; the init ERDB write does not depend on it */
