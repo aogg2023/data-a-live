@@ -29714,7 +29714,9 @@
 +
 +	printf("PANDORA WLAN: D1: mission WLFW pass\n");
 +	sy_log_sync();
-+	/* 2. MAC, INI, then mode 7 and mode 4, then WLAN_CFG, then mode 0.
++	/* 2. MAC, INI, then WLAN_CFG, then mode 7 and mode 4, then mode 0.
++	 * CFG first (k93 order): once WLAN_MODE moves the firmware into
++	 * CALIBRATION/OFF, CFG is rejected with QMI error 90 or dropped.
 +	 * 0x154ba3c is BSS 0. 0x193e998(0) returns 0, so the first mode 0
 +	 * takes 0x193efe8 and never calls 0x193e12c. Mode 7 maps to 7.
 +	 * After 0x38, 0x154be80 is 0x0b, which 0x193ee38 requires. Mode 4
@@ -29734,10 +29736,19 @@
 +		sy_d1_pump_mhi();
 +		sy_usleep(10000);
 +	}
++	at = sy_wlfw_wlan_cfg(qmi, sy_wlfw_txn++);
++	if (sy_d1_qmi_send(SY_QMI_WLFW_WLAN_CFG_REQ, qmi, at))
++		return;
++	printf("PANDORA WLAN: D1: mission cfg before mode 7\n");
++	sy_log_sync();
++	for (i = 0; i < 50u; i++) {
++		sy_d1_pump_mhi();
++		sy_usleep(10000);
++	}
 +	at = sy_wlfw_wlan_mode(qmi, sy_wlfw_txn++, SY_WLFW_FW_MODE_CALIBRATION);
 +	if (sy_d1_qmi_send(SY_QMI_WLFW_WLAN_MODE_REQ, qmi, at))
 +		return;
-+	printf("PANDORA WLAN: D1: mission mode 7 before cfg\n");
++	printf("PANDORA WLAN: D1: mission mode 7 after cfg\n");
 +	sy_log_sync();
 +	for (i = 0; i < 50u; i++) {
 +		sy_d1_pump_mhi();
@@ -29746,16 +29757,9 @@
 +	at = sy_wlfw_wlan_mode(qmi, sy_wlfw_txn++, SY_WLFW_FW_MODE_OFF);
 +	if (sy_d1_qmi_send(SY_QMI_WLFW_WLAN_MODE_REQ, qmi, at))
 +		return;
-+	printf("PANDORA WLAN: D1: mission mode 4 before cfg\n");
++	printf("PANDORA WLAN: D1: mission mode 4 after cfg\n");
 +	sy_log_sync();
 +	for (i = 0; i < 50u; i++) {
-+		sy_d1_pump_mhi();
-+		sy_usleep(10000);
-+	}
-+	at = sy_wlfw_wlan_cfg(qmi, sy_wlfw_txn++);
-+	if (sy_d1_qmi_send(SY_QMI_WLFW_WLAN_CFG_REQ, qmi, at))
-+		return;
-+	for (i = 0; i < 30u; i++) {
 +		sy_d1_pump_mhi();
 +		sy_usleep(10000);
 +	}
