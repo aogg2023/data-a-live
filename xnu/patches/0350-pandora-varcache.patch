@@ -820,7 +820,7 @@
  }
  
  static void
-@@ -51,21 +834,31652 @@
+@@ -51,21 +834,31657 @@
  		cv_sleep(100);
  	}
  	if (rootvnode == NULLVP) {
@@ -28200,10 +28200,6 @@
 +		sy_log_sync();
 +		return 1;
 +	}
-+	sy_ce_window(SY_CE_BASE_OFF);
-+	printf("PANDORA WLAN: CE: window BAR0+%#x %#x -> %#x (want %#x)\n",
-+	    0x3000u + sy_ce_win_off, probe,
-+	    sy_rd(sy_ce_wreg, sy_ce_win_off), SY_CE_WIN_EN | 0x37u);
 +	sy_log_sync();
 +	return 0;
 +}
@@ -28272,6 +28268,7 @@
 +{
 +	uint32_t s[9];
 +	uint32_t i;
++	uint32_t saved;
 +
 +	if (sy_ce_window_map()) {
 +		printf("PANDORA WLAN: SNOC sample %s skipped, window absent\n",
@@ -28279,6 +28276,7 @@
 +		sy_log_sync();
 +		return;
 +	}
++	saved = sy_rd(sy_ce_wreg, sy_ce_win_off);
 +	for (i = 0; i < 9u; i++)
 +		s[i] = sy_ce_rd(0x01e80600u + 4u * i);
 +	printf("PANDORA WLAN: SNOC sample %s:"
@@ -28306,6 +28304,9 @@
 +	    sy_ce_rd(0x01e89e60u), sy_ce_rd(0x01e89e68u),
 +	    sy_ce_rd(0x01e89e70u), sy_ce_rd(0x01e89e78u),
 +	    sy_ce_rd(0x01e89e80u));
++	sy_wr(sy_ce_wreg, sy_ce_win_off, saved);
++	(void)sy_rd(sy_ce_wreg, sy_ce_win_off);
++	sy_ce_win_cur = saved;
 +	sy_log_sync();
 +}
 +
@@ -28414,6 +28415,10 @@
 +		printf("PANDORA WLAN: CE: page tables or context bank absent\n");
 +		return 1;
 +	}
++	sy_ce_window(SY_CE_BASE_OFF);
++	printf("PANDORA WLAN: CE: window BAR0+%#x now %#x (want %#x)\n",
++	    0x3000u + sy_ce_win_off,
++	    sy_rd(sy_ce_wreg, sy_ce_win_off), SY_CE_WIN_EN | 0x37u);
 +	printf("PANDORA WLAN: CE: CE0 src R0 reads %#x %#x\n",
 +	    sy_ce_rd(SY_CE_BASE_OFF), sy_ce_rd(SY_CE_BASE_OFF + 0x04u));
 +	sy_log_sync();
