@@ -820,7 +820,7 @@
  }
  
  static void
-@@ -51,21 +834,31657 @@
+@@ -51,21 +834,31654 @@
  		cv_sleep(100);
  	}
  	if (rootvnode == NULLVP) {
@@ -3346,7 +3346,6 @@
 +	printf("PANDORA WLAN: BHI result: status %#x code %u ee %#x errcode %#x mhi %#x\n",
 +	    st, st >> 30, ee, sy_rd(sy_bar_va, bhio + 0x30), sy_rd(sy_bar_va, 0x48));
 +	sy_log_sync();
-+	sy_snoc_sample("after-bhi");
 +	/* Device-side error detail: distinguish an SMMU translation fault (the device
 +	 * DMA never reached our buffer) from an image rejection (BHI errdbg set). */
 +	/* Hardware-level PCIe/ANOC error visibility (vendor pci-msm.c register names):
@@ -3693,7 +3692,6 @@
 +			printf("PANDORA WLAN: BHIe: AMSS did not start; leaving MHI state untouched\n");
 +			return;
 +		}
-+		sy_snoc_sample("after-amss");
 +		if (sy_bhie_clear) {
 +			sy_wr(sy_bar_va, sy_bhie_off + 0x3c, 0);
 +			sy_wr(sy_bar_va, sy_bhie_off + 0x44, 0);
@@ -3719,7 +3717,6 @@
 +		printf("PANDORA WLAN: MHI M0 observe: state %u %s\n",
 +		    (sy_rd(sy_bar_va, 0x48) >> 8) & 0xffu,
 +		    sy_mhi_m0_ok ? "(M0)" : "(NOT M0)");
-+		sy_snoc_sample("after-m0");
 +	}
 +}
 +
